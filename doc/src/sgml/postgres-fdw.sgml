@@ -1,0 +1,434 @@
+<!-- doc/src/sgml/postgres-fdw.sgml -->
+
+<sect1 id="postgres-fdw" xreflabel="postgres_fdw">
+ <title>postgres_fdw</title>
+
+ <indexterm zone="postgres-fdw">
+  <primary>postgres_fdw</primary>
+ </indexterm>
+
+ <para>
+  The <filename>postgres_fdw</filename> module provides a foreign-data
+  wrapper for external <productname>PostgreSQL</productname> servers.
+  With this module, users can access data stored in external
+  <productname>PostgreSQL</productname> via plain SQL statements.
+ </para>
+
+ <para>
+  Default wrapper <literal>postgres_fdw</literal> is created automatically
+  during <command>CREATE EXTENSION</command> command for
+  <application>postgres_fdw</application>, so what you need to do to execute
+  queries are:
+  <orderedlist spacing="compact">
+   <listitem>
+    <para>
+     Create foreign server with <command>CREATE SERVER</command> command for
+     each remote database you want to connect.  You need to specify connection
+     information except <literal>user</literal> and <literal>password</literal>
+     on it.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Create user mapping for servers with
+     <command>CREATE USER MAPPING</command> command for each user you want to
+     allow accessing the foreign server.  You need to specify
+     <literal>user</literal> and <literal>password</literal> on it.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Create foreign table with <command>CREATE FOREIGN TABLE</command> command
+     for each relation you want to access.  If you want to use different name
+     from remote one, you need to specify object name options (see below).
+    </para>
+    <para>
+     It is recommended to use same data types as those of remote columns,
+     though libpq text protocol allows flexible conversions between similar
+     data types.
+    </para>
+   </listitem>
+  </orderedlist>
+ </para>
+
+ <sect2>
+  <title>FDW Options of postgres_fdw</title>
+
+  <sect3>
+   <title>Connection Options</title>
+   <para>
+    A foreign server and user mapping created using this wrapper can have
+    <application>libpq</> connection options, expect below:
+
+    <itemizedlist>
+     <listitem>
+      <para>
+       client_encoding (automatically determined from the local server encoding)
+      </para>
+     </listitem>
+     <listitem>
+      <para>
+       fallback_application_name (fixed to <literal>postgres_fdw</literal>)
+      </para>
+     </listitem>
+     <listitem>
+      <para>
+       replication (never used for foreign-data wrapper connection)
+      </para>
+     </listitem>
+    </itemizedlist>
+
+    For details of <application>libpq</> connection options, see
+    <xref linkend="libpq-connect">.
+   </para>
+   <para>
+    <literal>user</literal> and <literal>password</literal> can be
+    specified on user mappings, and others can be specified on foreign servers.
+   </para>
+   <para>
+    Note that only superusers may connect foreign servers without password
+    authentication, so specify <literal>password</literal> FDW option on
+    corresponding user mappings for non-superusers.
+   </para>
+  </sect3>
+
+  <sect3>
+   <title>Object Name Options</title>
+   <para>
+    Foreign tables which were created using this wrapper, or their columns can
+    have object name options.  These options can be used to specify the names
+    used in SQL statement sent to remote <productname>PostgreSQL</productname>
+    server.  These options are useful when remote objects have different names
+    from corresponding local ones.
+   </para>
+
+   <variablelist>
+
+    <varlistentry>
+     <term><literal>nspname</literal></term>
+     <listitem>
+      <para>
+       This option, which can be specified on a foreign table, is used as a
+       namespace (schema) reference in the SQL statement.  If this options is
+       omitted, <literal>pg_class.nspname</literal> of the foreign table is
+       used.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>relname</literal></term>
+     <listitem>
+      <para>
+       This option, which can be specified on a foreign table, is used as a
+       relation (table) reference in the SQL statement.  If this options is
+       omitted, <literal>pg_class.relname</literal> of the foreign table is
+       used.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>colname</literal></term>
+     <listitem>
+      <para>
+       This option, which can be specified on a column of a foreign table, is
+       used as a column (attribute) reference in the SQL statement.  If this
+       option is omitted, <literal>pg_attribute.attname</literal> of the column
+       of the foreign table is used.
+      </para>
+     </listitem>
+    </varlistentry>
+
+   </variablelist>
+
+  </sect3>
+
+  <sect3>
+   <title>Cost Estimation Options</title>
+   <para>
+    The <application>postgres_fdw</> retrieves foreign data by executing queries
+    against foreign servers, so foreign scans usually cost more than scans done
+    on local side.  To reflect various circumstance of foreign servers,
+    <application>postgres_fdw</> provides some options:
+   </para>
+
+   <variablelist>
+
+    <varlistentry>
+     <term><literal>use_remote_estimate</literal></term>
+     <listitem>
+      <para>
+       This option, which can be specified on a foreign table or a foreign
+       server, is used to control <application>postgres_fdw</>'s behavior about
+       estimation of rows and width.  If this was set to
+       <literal>true</literal>, remote <command>EXPLAIN</command> is
+       executed in the early step of planning.  This would give better estimate
+       of rows and width, but it also introduces some overhead.  This option
+       defaults to <literal>false</literal>.
+      </para>
+      <para>
+       The <application>postgres_fdw</> supports gathering statistics of
+       foreign data from foreign servers and store them on local side via
+       <command>ANALYZE</command>, so we can estimate reasonable rows and width
+       of result of a query from them.  However, if target foreign table is
+       frequently updated, local statistics would be obsolete soon.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>fdw_startup_cost</literal></term>
+     <listitem>
+      <para>
+       This option, which can be specified on a foreign server, is used as
+       additional startup cost per a scan.  If planner overestimates or
+       underestimates startup cost of a foreign scan, change this to reflect
+       the actual overhead.
+      </para>
+      <para>
+       Defaults to <literal>100</literal>.  The default value is groundless,
+       but this would be enough to make most foreign scans to have more cost
+       than local scans, even that foreign scan returns nothing.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry>
+     <term><literal>fdw_tuple_cost</literal></term>
+     <listitem>
+      <para>
+       This option, which can be specified on a foreign server, is used as
+       additional cost per tuple, which reflects overhead of tuple
+       manipulation and transfer between servers.  If a foreign server is far
+       or near in the network, or a foreign server has different performance
+       characteristics, use this option to tell planner that.
+      </para>
+      <para>
+       Defaults to <literal>0.01</literal>.
+      </para>
+     </listitem>
+    </varlistentry>
+
+   </variablelist>
+
+  </sect3>
+
+ </sect2>
+
+ <sect2>
+  <title>Connection Management</title>
+
+  <para>
+   The <application>postgres_fdw</application> establishes a connection to a
+   foreign server in the beginning of the first query which uses a foreign
+   table associated to the foreign server, and reuses the connection following
+   queries and even in following foreign scans in same query.
+
+   You can see the list of active connections via
+   <structname>postgres_fdw_connections</structname> view.  It shows pairs of
+   oid and name of server and local role for each active connections
+   established by <application>postgres_fdw</application>.  For security
+   reason, only superuser can see other role's connections.
+  </para>
+
+  <para>
+   Established connections are kept alive until local role changes or the
+   current transaction aborts or user requests so.
+  </para>
+
+  <para>
+   If role has been changed, active connections established as old local role
+   is kept alive but never be reused until local role has restored to original
+   role.  This kind of situation happens with <command>SET ROLE</command> and
+   <command>SET SESSION AUTHORIZATION</command>.
+  </para>
+
+  <para>
+   If current transaction aborts by error or user request, all active
+   connections are disconnected automatically.  This behavior avoids possible
+   connection leaks on error.
+  </para>
+
+  <para>
+   You can discard persistent connection at arbitrary timing with
+   <function>postgres_fdw_disconnect()</function>.  It takes server oid and
+   user oid as arguments.  This function can handle only connections
+   established in current session; connections established by other backends
+   are not reachable.
+  </para>
+
+  <para>
+   You can discard all active and visible connections in current session with
+   using <structname>postgres_fdw_connections</structname> and
+   <function>postgres_fdw_disconnect()</function> together:
+<synopsis>
+postgres=# SELECT postgres_fdw_disconnect(srvid, usesysid) FROM postgres_fdw_connections;
+ postgres_fdw_disconnect
+-------------------------
+ OK
+ OK
+(2 rows)
+</synopsis>
+  </para>
+ </sect2>
+
+ <sect2>
+  <title>Transaction Management</title>
+  <para>
+   The <application>postgres_fdw</application> begins remote transaction at
+   the beginning of a local query, and terminates it with
+   <command>ABORT</command> at the end of the local query.  This means that all
+   foreign scans on a foreign server in a local query are executed in one
+   transaction.
+  </para>
+  <para>
+   Isolation level of remote transaction is determined from local transaction's
+   isolation level.
+   <table id="postgres-fdw-isolation-level">
+    <title>Isolation Level Mapping</title>
+
+    <tgroup cols="2">
+     <thead>
+      <row>
+       <entry>Local Isolation Level</entry>
+       <entry>Remote Isolation Level</entry>
+      </row>
+     </thead>
+     <tbody>
+      <row>
+       <entry>READ UNCOMMITTED</entry>
+       <entry morerows="2">REPEATABLE READ</entry>
+      </row>
+      <row>
+       <entry>READ COMMITTED</entry>
+      </row>
+      <row>
+       <entry>REPEATABLE READ</entry>
+      </row>
+      <row>
+       <entry>SERIALIZABLE</entry>
+       <entry>SERIALIZABLE</entry>
+      </row>
+     </tbody>
+    </tgroup>
+   </table>
+  </para>
+  <para>
+   <literal>READ UNCOMMITTED</literal> and <literal>READ COMMITTED</literal>
+   are never used for remote transactions, because even
+   <literal>READ COMMITTED</literal> transactions might produce inconsistent
+   results, if remote data has been updated between two remote queries (it
+   can happen in a local query).
+  </para>
+  <para>
+   Note that even if the isolation level of local transaction was
+   <literal>SERIALIZABLE</literal> or <literal>REPEATABLE READ</literal>,
+   executing same query repeatedly might produce different result, because 
+   foreign scans in different local queries are executed in different remote
+   transactions.  For instance, if external data was update between two same
+   queries in a <literal>SERIALIZABLE</literal> local transaction, client
+   receives different results.
+  </para>
+  <para>
+   This restriction might be relaxed in future release.
+  </para>
+ </sect2>
+
+ <sect2>
+  <title>Estimate Costs, Rows and Width</title>
+  <para>
+   The <application>postgres_fdw</application> estimates the costs of a
+   foreign scan in two ways.  In either way, selectivity of restrictions are
+   concerned to give proper estimate.
+  </para>
+  <para>
+   If <literal>use_remote_estimate</literal> was set to
+   <literal>false</literal> (default behavior), <application>postgres_fdw</>
+   assumes that external data have not been changed so much, and uses local
+   statistics as-is.  It is recommended to execute <command>ANALYZE</command>
+   to keep local statistics reflect characteristics of external data.
+   Otherwise, <application>postgres_fdw</> executes remote
+   <command>EXPLAIN</command> in the beginning of a foreign scan to get remote
+   estimate of the remote query.  This would provide better estimate but
+   requires some overhead.
+  </para>
+ </sect2>
+
+ <sect2>
+  <title>Remote Query Optimization</title>
+  <para>
+   The <application>postgres_fdw</> optimizes remote queries to reduce amount
+   of data transferred from foreign servers. 
+   <itemizedlist>
+    <listitem>
+     <para>
+      Restrictions which have same semantics on remote side are pushed down.
+      For example, restrictions which contain elements below might have
+      different semantics on remote side.
+      <itemizedlist spacing="compact">
+       <listitem>
+        <para>
+         User defined objects, such as functions, operators, and types.
+        </para>
+       </listitem>
+       <listitem>
+        <para>
+         Functions defined as <literal>STABLE</literal> or
+         <literal>VOLATILE</literal>, and operators which use such functions.
+        </para>
+       </listitem>
+       <listitem>
+        <para>
+         Collatable types, such as text or varchar, with some exception (see
+         below).
+        </para>
+        <para>
+         Basically we assume that collatable expressions have different
+         semantics, because remote server might has different collation
+         setting, but this assumption causes denying simple and usual
+         expressions, such as <literal>text_col = 'string'</literal> to be
+         pushed down.  So <application>postgres_fdw</application> treats
+         operator <literal>=</literal> and <literal>&lt;&gt;</literal> as safe
+         to push down even if they take collatable types as arguments.
+        </para>
+       </listitem>
+      </itemizedlist>
+     </para>
+    </listitem>
+    <listitem>
+     <para>
+      Unnecessary columns in <literal>SElECT</literal> clause of remote queries
+      are replaced with <literal>NULL</literal> literal.
+     </para>
+    </listitem>
+   </itemizedlist>
+  </para>
+ </sect2>
+
+ <sect2>
+  <title>EXPLAIN Output</title>
+  <para>
+   For each foreign table using <literal>postgres_fdw</>, <command>EXPLAIN</>
+   shows a remote SQL statement which is sent to remote
+   <productname>PostgreSQL</productname> server for a ForeignScan plan node.
+   For example:
+  </para>
+<synopsis>
+postgres=# EXPLAIN SELECT aid FROM pgbench_accounts WHERE abalance < 0;
+                                                        QUERY PLAN                                                        
+--------------------------------------------------------------------------------------------------------------------------
+ Foreign Scan on pgbench_accounts  (cost=100.00..100.11 rows=1 width=97)
+   Remote SQL: SELECT aid, bid, abalance, filler FROM public.pgbench_accounts WHERE ((abalance OPERATOR(pg_catalog.<) 0))
+(2 rows)
+</synopsis>
+ </sect2>
+
+ <sect2>
+  <title>Author</title>
+  <para>
+   Shigeru Hanada <email>shigeru.hanada@gmail.com</email>
+  </para>
+ </sect2>
+
+</sect1>
