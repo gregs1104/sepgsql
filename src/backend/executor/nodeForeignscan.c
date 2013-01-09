@@ -25,6 +25,7 @@
 #include "executor/executor.h"
 #include "executor/nodeForeignscan.h"
 #include "foreign/fdwapi.h"
+#include "nodes/nodeFuncs.h"
 #include "utils/rel.h"
 
 static TupleTableSlot *ForeignNext(ForeignScanState *node);
@@ -93,6 +94,133 @@ ExecForeignScan(ForeignScanState *node)
 					(ExecScanRecheckMtd) ForeignRecheck);
 }
 
+/*
+ * pseudo_column_walker
+ *
+ * helper routine of GetPseudoTupleDesc. It pulls Var nodes that reference
+ * pseudo columns from targetlis of the relation
+ */
+typedef struct
+{
+	Relation	relation;
+	Index		varno;
+	List	   *pcolumns;
+	AttrNumber	max_attno;
+} pseudo_column_walker_context;
+
+static bool
+pseudo_column_walker(Node *node, pseudo_column_walker_context *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		ListCell   *cell;
+
+		if (var->varno == context->varno && var->varlevelsup == 0 &&
+			var->varattno > RelationGetNumberOfAttributes(context->relation))
+		{
+			foreach (cell, context->pcolumns)
+			{
+				Var	   *temp = lfirst(cell);
+
+				if (temp->varattno == var->varattno)
+				{
+					if (!equal(var, temp))
+						elog(ERROR, "asymmetric pseudo column appeared");
+					break;
+				}
+			}
+			if (!cell)
+			{
+				context->pcolumns = lappend(context->pcolumns, var);
+				if (var->varattno > context->max_attno)
+					context->max_attno = var->varattno;
+			}
+		}
+		return false;
+	}
+
+	/* Should not find an unplanned subquery */
+	Assert(!IsA(node, Query));
+
+	return expression_tree_walker(node, pseudo_column_walker,
+								  (void *)context);
+}
+
+/*
+ * GetPseudoTupleDesc
+ *
+ * It generates TupleDesc structure including pseudo-columns if required.
+ */
+static TupleDesc
+GetPseudoTupleDesc(ForeignScan *node, Relation relation)
+{
+	pseudo_column_walker_context context;
+	List	   *target_list = node->scan.plan.targetlist;
+	TupleDesc	tupdesc;
+	AttrNumber	attno;
+	ListCell   *cell;
+	ListCell   *prev;
+	bool		hasoid;
+
+	context.relation = relation;
+	context.varno = node->scan.scanrelid;
+	context.pcolumns = NIL;
+	context.max_attno = -1;
+
+	pseudo_column_walker((Node *)target_list, (void *)&context);
+	Assert(context.max_attno > RelationGetNumberOfAttributes(relation));
+
+	hasoid = RelationGetForm(relation)->relhasoids;
+	tupdesc = CreateTemplateTupleDesc(context.max_attno, hasoid);
+
+	for (attno = 1; attno <= context.max_attno; attno++)
+	{
+		/* case of regular columns */
+		if (attno <= RelationGetNumberOfAttributes(relation))
+		{
+			memcpy(tupdesc->attrs[attno - 1],
+				   RelationGetDescr(relation)->attrs[attno - 1],
+				   ATTRIBUTE_FIXED_PART_SIZE);
+			continue;
+		}
+
+		/* case of pseudo columns */
+		prev = NULL;
+		foreach (cell, context.pcolumns)
+		{
+			Var	   *var = lfirst(cell);
+
+			if (var->varattno == attno)
+			{
+				char		namebuf[NAMEDATALEN];
+
+				snprintf(namebuf, sizeof(namebuf),
+						 "pseudo_column_%d", attno);
+
+				TupleDescInitEntry(tupdesc,
+								   attno,
+								   namebuf,
+								   var->vartype,
+								   var->vartypmod,
+								   0);
+				TupleDescInitEntryCollation(tupdesc,
+											attno,
+											var->varcollid);
+				context.pcolumns
+					= list_delete_cell(context.pcolumns, cell, prev);
+				break;
+			}
+			prev = cell;
+		}
+		if (!cell)
+			elog(ERROR, "pseudo column %d of %s not in target list",
+				 attno, RelationGetRelationName(relation));
+	}
+	return tupdesc;
+}
 
 /* ----------------------------------------------------------------
  *		ExecInitForeignScan
@@ -103,6 +231,7 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 {
 	ForeignScanState *scanstate;
 	Relation	currentRelation;
+	TupleDesc	tupdesc;
 	FdwRoutine *fdwroutine;
 
 	/* check for unsupported flags */
@@ -149,7 +278,12 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	/*
 	 * get the scan type from the relation descriptor.
 	 */
-	ExecAssignScanType(&scanstate->ss, RelationGetDescr(currentRelation));
+	if (node->fsPseudoCol)
+		tupdesc = GetPseudoTupleDesc(node, currentRelation);
+	else
+		tupdesc = RelationGetDescr(currentRelation);
+
+	ExecAssignScanType(&scanstate->ss, tupdesc);
 
 	/*
 	 * Initialize result tuple type and projection info.

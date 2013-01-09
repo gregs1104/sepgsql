@@ -236,7 +236,8 @@ recurse_set_operations(Node *setOp, PlannerInfo *root,
 		 * used for anything here, but it carries the subroot data structures
 		 * forward to setrefs.c processing.
 		 */
-		rel = build_simple_rel(root, rtr->rtindex, RELOPT_BASEREL);
+		rel = build_simple_rel(root, rtr->rtindex, refnames_tlist,
+							   RELOPT_BASEREL);
 
 		/* plan_params should not be in use in current query level */
 		Assert(root->plan_params == NIL);

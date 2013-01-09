@@ -43,7 +43,7 @@ typedef struct ConnCacheEntry
 	Oid				serverid;	/* oid of foreign server */
 	Oid				userid;		/* oid of local user */
 
-	bool			use_tx;		/* true when using remote transaction */
+	int				conntx;		/* one of PGSQL_FDW_CONNTX_* */
 	int				refs;		/* reference counter */
 	PGconn		   *conn;		/* foreign server connection */
 } ConnCacheEntry;
@@ -65,6 +65,8 @@ cleanup_connection(ResourceReleasePhase phase,
 static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user);
 static void begin_remote_tx(PGconn *conn);
 static void abort_remote_tx(PGconn *conn);
+static void commit_remote_tx(PGconn *conn);
+static void deallocate_remote_prepare(PGconn *conn);
 
 /*
  * Get a PGconn which can be used to execute foreign query on the remote
@@ -80,7 +82,7 @@ static void abort_remote_tx(PGconn *conn);
  * FDW object to invalidate already established connections.
  */
 PGconn *
-GetConnection(ForeignServer *server, UserMapping *user, bool use_tx)
+GetConnection(ForeignServer *server, UserMapping *user, int conntx)
 {
 	bool			found;
 	ConnCacheEntry *entry;
@@ -126,7 +128,7 @@ GetConnection(ForeignServer *server, UserMapping *user, bool use_tx)
 	entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
 	if (!found)
 	{
-		entry->use_tx = false;
+		entry->conntx = PGSQL_FDW_CONNTX_NONE;
 		entry->refs = 0;
 		entry->conn = NULL;
 	}
@@ -162,7 +164,7 @@ GetConnection(ForeignServer *server, UserMapping *user, bool use_tx)
 		{
 			/* Clear connection cache entry on error case. */
 			PQfinish(entry->conn);
-			entry->use_tx = false;
+			entry->conntx = PGSQL_FDW_CONNTX_NONE;
 			entry->refs = 0;
 			entry->conn = NULL;
 			PG_RE_THROW();
@@ -182,10 +184,11 @@ GetConnection(ForeignServer *server, UserMapping *user, bool use_tx)
 	 * are in.  We need to remember whether this connection uses remote
 	 * transaction to abort it when this connection is released completely.
 	 */
-	if (use_tx && !entry->use_tx)
+	if (conntx > entry->conntx)
 	{
-		begin_remote_tx(entry->conn);
-		entry->use_tx = use_tx;
+		if (entry->conntx == PGSQL_FDW_CONNTX_NONE)
+			begin_remote_tx(entry->conn);
+		entry->conntx = conntx;
 	}
 
 	return entry->conn;
@@ -355,12 +358,45 @@ abort_remote_tx(PGconn *conn)
 	PQclear(res);
 }
 
+static void
+commit_remote_tx(PGconn *conn)
+{
+	PGresult	   *res;
+
+	elog(DEBUG3, "committing remote transaction");
+
+	res = PQexec(conn, "COMMIT TRANSACTION");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		elog(ERROR, "could not commit transaction: %s", PQerrorMessage(conn));
+	}
+	PQclear(res);
+}
+
+static void
+deallocate_remote_prepare(PGconn *conn)
+{
+	PGresult	   *res;
+
+	elog(DEBUG3, "deallocating remote prepares");
+
+	res = PQexec(conn, "DEALLOCATE PREPARE ALL");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		elog(ERROR, "could not deallocate prepared statement: %s",
+			 PQerrorMessage(conn));
+	}
+	PQclear(res);
+}
+
 /*
  * Mark the connection as "unused", and close it if the caller was the last
  * user of the connection.
  */
 void
-ReleaseConnection(PGconn *conn)
+ReleaseConnection(PGconn *conn, bool is_abort)
 {
 	HASH_SEQ_STATUS		scan;
 	ConnCacheEntry	   *entry;
@@ -412,7 +448,7 @@ ReleaseConnection(PGconn *conn)
 			 PQtransactionStatus(conn) == PQTRANS_INERROR ? "INERROR" :
 			 "UNKNOWN");
 		PQfinish(conn);
-		entry->use_tx = false;
+		entry->conntx = PGSQL_FDW_CONNTX_NONE;
 		entry->refs = 0;
 		entry->conn = NULL;
 		return;
@@ -430,10 +466,16 @@ ReleaseConnection(PGconn *conn)
 	 * If this connection uses remote transaction and there is no user other
 	 * than the caller, abort the remote transaction and forget about it.
 	 */
-	if (entry->use_tx && entry->refs == 0)
+	if (entry->conntx > PGSQL_FDW_CONNTX_NONE && entry->refs == 0)
 	{
-		abort_remote_tx(conn);
-		entry->use_tx = false;
+		if (entry->conntx > PGSQL_FDW_CONNTX_READ_ONLY)
+			deallocate_remote_prepare(conn);
+		if (is_abort || entry->conntx == PGSQL_FDW_CONNTX_READ_ONLY)
+			abort_remote_tx(conn);
+		else
+			commit_remote_tx(conn);
+
+		entry->conntx = PGSQL_FDW_CONNTX_NONE;
 	}
 }
 
@@ -485,7 +527,7 @@ cleanup_connection(ResourceReleasePhase phase,
 		elog(DEBUG3, "discard postgres_fdw connection %p due to resowner cleanup",
 			 entry->conn);
 		PQfinish(entry->conn);
-		entry->use_tx = false;
+		entry->conntx = PGSQL_FDW_CONNTX_NONE;
 		entry->refs = 0;
 		entry->conn = NULL;
 	}
@@ -597,7 +639,7 @@ postgres_fdw_disconnect(PG_FUNCTION_ARGS)
 
 	/* Discard cached connection, and clear reference counter. */
 	PQfinish(entry->conn);
-	entry->use_tx = false;
+	entry->conntx = PGSQL_FDW_CONNTX_NONE;
 	entry->refs = 0;
 	entry->conn = NULL;
 

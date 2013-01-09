@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "catalog/pg_class.h"
@@ -86,9 +87,11 @@ void
 deparseSimpleSql(StringInfo buf,
 				 PlannerInfo *root,
 				 RelOptInfo *baserel,
-				 List *local_conds)
+				 List *local_conds,
+				 AttrNumber anum_rowid)
 {
 	RangeTblEntry *rte;
+	Relation	rel;
 	ListCell   *lc;
 	StringInfoData	foreign_relname;
 	bool		first;
@@ -125,6 +128,24 @@ deparseSimpleSql(StringInfo buf,
 	}
 
 	/*
+	 * XXX - When this foreign table is target relation and RETURNING
+	 * clause reference some column, we have to mark these columns as
+	 * in-use. It is needed to support DELETE command, because INSERT
+	 * and UPDATE implicitly add references to all the regular columns
+	 * on baserel->reltargetlist.
+	 */
+	if (root->parse->resultRelation == baserel->relid &&
+		root->parse->returningList)
+	{
+		List   *attrs;
+
+		attrs = pull_var_clause((Node *) root->parse->returningList,
+								PVC_RECURSE_AGGREGATES,
+                                PVC_RECURSE_PLACEHOLDERS);
+		attr_used = list_union(attr_used, attrs);
+	}
+
+	/*
 	 * deparse SELECT clause
 	 *
 	 * List attributes which are in either target list or local restriction.
@@ -136,9 +157,10 @@ deparseSimpleSql(StringInfo buf,
 	 */
 	appendStringInfo(buf, "SELECT ");
 	rte = root->simple_rte_array[baserel->relid];
+	rel = heap_open(rte->relid, NoLock);
 	attr_used = list_union(attr_used, baserel->reltargetlist);
 	first = true;
-	for (attr = 1; attr <= baserel->max_attr; attr++)
+	for (attr = 1; attr <= RelationGetNumberOfAttributes(rel); attr++)
 	{
 		Var		   *var = NULL;
 		ListCell   *lc;
@@ -167,6 +189,10 @@ deparseSimpleSql(StringInfo buf,
 		else
 			appendStringInfo(buf, "NULL");
 	}
+	if (anum_rowid != InvalidAttrNumber)
+		appendStringInfo(buf, "%sctid", (first ? "" : ","));
+
+	heap_close(rel, NoLock);
 	appendStringInfoChar(buf, ' ');
 
 	/*
@@ -280,6 +306,134 @@ deparseAnalyzeSql(StringInfo buf, Relation rel)
 
 	appendStringInfo(buf, " FROM %s.%s", quote_identifier(nspname),
 					 quote_identifier(relname));
+}
+
+/*
+ * deparse RETURNING clause of INSERT/UPDATE/DELETE
+ */
+static void
+deparseReturningSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+					Relation frel)
+{
+	AttrNumber	i, nattrs = RelationGetNumberOfAttributes(frel);
+
+	appendStringInfo(buf, " RETURNING ");
+	for (i=0; i < nattrs; i++)
+	{
+		Form_pg_attribute attr = RelationGetDescr(frel)->attrs[i];
+
+		if (i > 0)
+			appendStringInfo(buf, ",");
+
+		if (attr->attisdropped)
+			appendStringInfo(buf, "null");
+		else
+		{
+			Var		var;
+
+			var.varno = rtindex;
+			var.varattno = attr->attnum;
+			deparseVar(buf, &var, root);
+		}
+	}
+}
+
+/*
+ * deparse remote INSERT statement
+ */
+void
+deparseInsertSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+				 List *targetAttrs, bool has_returning)
+{
+	RangeTblEntry  *rte = root->simple_rte_array[rtindex];
+	Relation		frel = heap_open(rte->relid, NoLock);
+	ListCell	   *lc;
+	AttrNumber		pindex = 1;
+
+	appendStringInfo(buf, "INSERT INTO ");
+	deparseRelation(buf, rte);
+	appendStringInfo(buf, "(");
+
+	foreach (lc, targetAttrs)
+	{
+		Var		var;
+		Form_pg_attribute	attr
+			= RelationGetDescr(frel)->attrs[lfirst_int(lc) - 1];
+
+		Assert(!attr->attisdropped);
+		if (lc != list_head(targetAttrs))
+			appendStringInfo(buf, ",");
+
+		var.varno = rtindex;
+		var.varattno = attr->attnum;
+		deparseVar(buf, &var, root);
+	}
+	appendStringInfo(buf, ") VALUES (");
+
+	foreach (lc, targetAttrs)
+	{
+		appendStringInfo(buf, "%s$%d", (pindex == 1 ? "" : ","), pindex);
+		pindex++;
+	}
+	appendStringInfo(buf, ")");
+
+	if (has_returning)
+		deparseReturningSql(buf, root, rtindex, frel);
+
+	heap_close(frel, NoLock);
+}
+
+/*
+ * deparse remote UPDATE statement
+ */
+void
+deparseUpdateSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+				 List *targetAttrs, bool has_returning)
+{
+	RangeTblEntry  *rte = root->simple_rte_array[rtindex];
+	Relation		frel = heap_open(rte->relid, NoLock);
+	ListCell	   *lc;
+	AttrNumber		pindex = 2;
+
+	appendStringInfo(buf, "UPDATE ");
+	deparseRelation(buf, rte);
+	appendStringInfo(buf, " SET ");
+
+	foreach (lc, targetAttrs)
+	{
+		Var		var;
+		Form_pg_attribute	attr
+			= RelationGetDescr(frel)->attrs[lfirst_int(lc) - 1];
+
+		Assert(!attr->attisdropped);
+
+		if (lc != list_head(targetAttrs))
+			appendStringInfo(buf, ",");
+
+		var.varno = rtindex;
+		var.varattno = attr->attnum;
+		deparseVar(buf, &var, root);
+		appendStringInfo(buf, "=$%d", pindex++);
+	}
+	appendStringInfo(buf, " WHERE ctid=$1");
+
+	if (has_returning)
+		deparseReturningSql(buf, root, rtindex, frel);
+
+	heap_close(frel, NoLock);
+}
+
+/*
+ * deparse remote DELETE statement
+ */
+void
+deparseDeleteSql(StringInfo buf, PlannerInfo *root, Index rtindex)
+{
+	RangeTblEntry  *rte = root->simple_rte_array[rtindex];
+
+	appendStringInfo(buf, "DELETE FROM ");
+	deparseRelation(buf, rte);
+	appendStringInfo(buf, " WHERE ctid = $1");
 }
 
 /*

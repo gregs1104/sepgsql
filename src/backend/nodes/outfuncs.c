@@ -335,6 +335,7 @@ _outModifyTable(StringInfo str, const ModifyTable *node)
 	WRITE_NODE_FIELD(returningLists);
 	WRITE_NODE_FIELD(rowMarks);
 	WRITE_INT_FIELD(epqParam);
+	WRITE_NODE_FIELD(fdwPrivList);
 }
 
 static void
@@ -562,6 +563,7 @@ _outForeignScan(StringInfo str, const ForeignScan *node)
 	WRITE_NODE_FIELD(fdw_exprs);
 	WRITE_NODE_FIELD(fdw_private);
 	WRITE_BOOL_FIELD(fsSystemCol);
+	WRITE_BOOL_FIELD(fsPseudoCol);
 }
 
 static void

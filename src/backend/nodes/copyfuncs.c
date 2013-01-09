@@ -181,6 +181,7 @@ _copyModifyTable(const ModifyTable *from)
 	COPY_NODE_FIELD(returningLists);
 	COPY_NODE_FIELD(rowMarks);
 	COPY_SCALAR_FIELD(epqParam);
+	COPY_NODE_FIELD(fdwPrivList);
 
 	return newnode;
 }
@@ -594,6 +595,7 @@ _copyForeignScan(const ForeignScan *from)
 	COPY_NODE_FIELD(fdw_exprs);
 	COPY_NODE_FIELD(fdw_private);
 	COPY_SCALAR_FIELD(fsSystemCol);
+	COPY_SCALAR_FIELD(fsPseudoCol);
 
 	return newnode;
 }

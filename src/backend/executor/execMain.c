@@ -44,6 +44,7 @@
 #include "catalog/namespace.h"
 #include "commands/trigger.h"
 #include "executor/execdebug.h"
+#include "foreign/fdwapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "optimizer/clauses.h"
@@ -933,6 +934,7 @@ void
 CheckValidResultRel(Relation resultRel, CmdType operation)
 {
 	TriggerDesc *trigDesc = resultRel->trigdesc;
+	FdwRoutine	*fdwroutine;
 
 	switch (resultRel->rd_rel->relkind)
 	{
@@ -991,10 +993,34 @@ CheckValidResultRel(Relation resultRel, CmdType operation)
 			}
 			break;
 		case RELKIND_FOREIGN_TABLE:
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("cannot change foreign table \"%s\"",
-							RelationGetRelationName(resultRel))));
+			fdwroutine = GetFdwRoutineByRelId(RelationGetRelid(resultRel));
+			switch (operation)
+			{
+				case CMD_INSERT:
+					if (!fdwroutine || !fdwroutine->ExecForeignInsert)
+						ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("cannot insert into foreign table \"%s\"",
+									RelationGetRelationName(resultRel))));
+					break;
+				case CMD_UPDATE:
+					if (!fdwroutine || !fdwroutine->ExecForeignUpdate)
+						ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("cannot update foreign table \"%s\"",
+									RelationGetRelationName(resultRel))));
+					break;
+				case CMD_DELETE:
+					if (!fdwroutine || !fdwroutine->ExecForeignDelete)
+						ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("cannot delete from foreign table \"%s\"",
+									RelationGetRelationName(resultRel))));
+					break;
+				default:
+					elog(ERROR, "unrecognized CmdType: %d", (int) operation);
+					break;
+			}
 			break;
 		default:
 			ereport(ERROR,

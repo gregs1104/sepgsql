@@ -79,7 +79,8 @@ extern SetOp *make_setop(SetOpCmd cmd, SetOpStrategy strategy, Plan *lefttree,
 		   long numGroups, double outputRows);
 extern Result *make_result(PlannerInfo *root, List *tlist,
 			Node *resconstantqual, Plan *subplan);
-extern ModifyTable *make_modifytable(CmdType operation, bool canSetTag,
+extern ModifyTable *make_modifytable(PlannerInfo *root,
+				 CmdType operation, bool canSetTag,
 				 List *resultRelations, List *subplans, List *returningLists,
 				 List *rowMarks, int epqParam);
 extern bool is_projection_capable_plan(Plan *plan);
@@ -90,7 +91,8 @@ extern bool is_projection_capable_plan(Plan *plan);
 extern int	from_collapse_limit;
 extern int	join_collapse_limit;
 
-extern void add_base_rels_to_query(PlannerInfo *root, Node *jtnode);
+extern void add_base_rels_to_query(PlannerInfo *root, List *tlist,
+								   Node *jtnode);
 extern void build_base_rel_tlists(PlannerInfo *root, List *final_tlist);
 extern void add_vars_to_targetlist(PlannerInfo *root, List *vars,
 					   Relids where_needed, bool create_new_ph);

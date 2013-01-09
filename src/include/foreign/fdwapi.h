@@ -14,6 +14,7 @@
 
 #include "nodes/execnodes.h"
 #include "nodes/relation.h"
+#include "utils/rel.h"
 
 /* To avoid including explain.h here, reference ExplainState thus: */
 struct ExplainState;
@@ -22,6 +23,11 @@ struct ExplainState;
 /*
  * Callback function signatures --- see fdwhandler.sgml for more info.
  */
+typedef AttrNumber (*GetForeignRelWidth_function) (PlannerInfo *root,
+												   RelOptInfo *baserel,
+												   Relation foreignrel,
+												   bool inhparent,
+												   List *targetList);
 
 typedef void (*GetForeignRelSize_function) (PlannerInfo *root,
 														RelOptInfo *baserel,
@@ -58,6 +64,24 @@ typedef int (*AcquireSampleRowsFunc) (Relation relation, int elevel,
 typedef bool (*AnalyzeForeignTable_function) (Relation relation,
 												 AcquireSampleRowsFunc *func,
 													BlockNumber *totalpages);
+typedef List *(*PlanForeignModify_function) (PlannerInfo *root,
+											 ModifyTable *plan,
+											 Index resultRelation,
+											 Plan *subplan);
+
+typedef void (*BeginForeignModify_function) (ModifyTableState *mtstate,
+											 ResultRelInfo *rinfo,
+											 List *fdw_private,
+											 Plan *subplan,
+											 int eflags);
+typedef TupleTableSlot *(*ExecForeignInsert_function) (ResultRelInfo *rinfo,
+													   TupleTableSlot *slot);
+typedef TupleTableSlot *(*ExecForeignUpdate_function) (ResultRelInfo *rinfo,
+													   const char *rowid,
+													   TupleTableSlot *slot);
+typedef bool (*ExecForeignDelete_function) (ResultRelInfo *rinfo,
+											const char *rowid);
+typedef void (*EndForeignModify_function) (ResultRelInfo *rinfo);
 
 /*
  * FdwRoutine is the struct returned by a foreign-data wrapper's handler
@@ -90,6 +114,13 @@ typedef struct FdwRoutine
 	 * not provided.
 	 */
 	AnalyzeForeignTable_function AnalyzeForeignTable;
+	GetForeignRelWidth_function GetForeignRelWidth;
+	PlanForeignModify_function PlanForeignModify;
+	BeginForeignModify_function	BeginForeignModify;
+	ExecForeignInsert_function ExecForeignInsert;
+	ExecForeignDelete_function ExecForeignDelete;
+	ExecForeignUpdate_function ExecForeignUpdate;
+	EndForeignModify_function EndForeignModify;
 } FdwRoutine;
 
 

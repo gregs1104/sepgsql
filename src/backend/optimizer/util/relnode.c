@@ -80,7 +80,8 @@ setup_simple_rel_arrays(PlannerInfo *root)
  *	  Construct a new RelOptInfo for a base relation or 'other' relation.
  */
 RelOptInfo *
-build_simple_rel(PlannerInfo *root, int relid, RelOptKind reloptkind)
+build_simple_rel(PlannerInfo *root, int relid, List *tlist,
+				 RelOptKind reloptkind)
 {
 	RelOptInfo *rel;
 	RangeTblEntry *rte;
@@ -133,7 +134,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptKind reloptkind)
 	{
 		case RTE_RELATION:
 			/* Table --- retrieve statistics from the system catalogs */
-			get_relation_info(root, rte->relid, rte->inh, rel);
+			get_relation_info(root, rte->relid, rte->inh, tlist, rel);
 			break;
 		case RTE_SUBQUERY:
 		case RTE_FUNCTION:
@@ -180,7 +181,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptKind reloptkind)
 			if (appinfo->parent_relid != relid)
 				continue;
 
-			(void) build_simple_rel(root, appinfo->child_relid,
+			(void) build_simple_rel(root, appinfo->child_relid, tlist,
 									RELOPT_OTHER_MEMBER_REL);
 		}
 	}

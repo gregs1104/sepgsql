@@ -571,7 +571,8 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 			else
 				rowMarks = root->rowMarks;
 
-			plan = (Plan *) make_modifytable(parse->commandType,
+			plan = (Plan *) make_modifytable(root,
+											 parse->commandType,
 											 parse->canSetTag,
 									   list_make1_int(parse->resultRelation),
 											 list_make1(plan),
@@ -964,7 +965,8 @@ inheritance_planner(PlannerInfo *root)
 		rowMarks = root->rowMarks;
 
 	/* And last, tack on a ModifyTable node to do the UPDATE/DELETE work */
-	return (Plan *) make_modifytable(parse->commandType,
+	return (Plan *) make_modifytable(root,
+									 parse->commandType,
 									 parse->canSetTag,
 									 resultRelations,
 									 subplans,
@@ -3385,7 +3387,7 @@ plan_cluster_use_sort(Oid tableOid, Oid indexOid)
 	setup_simple_rel_arrays(root);
 
 	/* Build RelOptInfo */
-	rel = build_simple_rel(root, 1, RELOPT_BASEREL);
+	rel = build_simple_rel(root, 1, NIL, RELOPT_BASEREL);
 
 	/* Locate IndexOptInfo for the target index */
 	indexInfo = NULL;

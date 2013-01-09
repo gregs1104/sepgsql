@@ -112,6 +112,9 @@ query_planner(PlannerInfo *root, List *tlist,
 	 */
 	if (parse->jointree->fromlist == NIL)
 	{
+		/* Make a flattened version of the rangetable for faster access */
+		setup_simple_rel_arrays(root);
+
 		/* We need a trivial path result */
 		*cheapest_path = (Path *)
 			create_result_path((List *) parse->jointree->quals);
@@ -163,7 +166,7 @@ query_planner(PlannerInfo *root, List *tlist,
 	 * rangetable may contain RTEs for rels not actively part of the query,
 	 * for example views.  We don't want to make RelOptInfos for them.
 	 */
-	add_base_rels_to_query(root, (Node *) parse->jointree);
+	add_base_rels_to_query(root, tlist, (Node *) parse->jointree);
 
 	/*
 	 * Examine the targetlist and join tree, adding entries to baserel

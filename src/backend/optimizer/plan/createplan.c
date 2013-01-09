@@ -39,6 +39,7 @@
 #include "parser/parse_clause.h"
 #include "parser/parsetree.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 
 
 static Plan *create_plan_recurse(PlannerInfo *root, Path *best_path);
@@ -1943,6 +1944,8 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 	RelOptInfo *rel = best_path->path.parent;
 	Index		scan_relid = rel->relid;
 	RangeTblEntry *rte;
+	Relation	relation;
+	AttrNumber	num_attrs;
 	int			i;
 
 	/* it should be a base rel... */
@@ -2000,6 +2003,22 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 			break;
 		}
 	}
+
+	/*
+	 * Also, detect whether any pseudo columns are requested from rel.
+	 */
+	relation = heap_open(rte->relid, NoLock);
+	scan_plan->fsPseudoCol = false;
+	num_attrs = RelationGetNumberOfAttributes(relation);
+	for (i = num_attrs + 1; i <= rel->max_attr; i++)
+	{
+		if (!bms_is_empty(rel->attr_needed[i - rel->min_attr]))
+		{
+			scan_plan->fsPseudoCol = true;
+			break;
+		}
+	}
+	heap_close(relation, NoLock);
 
 	return scan_plan;
 }
@@ -4695,7 +4714,8 @@ make_result(PlannerInfo *root,
  * to make it look better sometime.
  */
 ModifyTable *
-make_modifytable(CmdType operation, bool canSetTag,
+make_modifytable(PlannerInfo *root,
+				 CmdType operation, bool canSetTag,
 				 List *resultRelations,
 				 List *subplans, List *returningLists,
 				 List *rowMarks, int epqParam)
@@ -4704,6 +4724,8 @@ make_modifytable(CmdType operation, bool canSetTag,
 	Plan	   *plan = &node->plan;
 	double		total_size;
 	ListCell   *subnode;
+	ListCell   *resultRel;
+	List	   *fdw_priv_list = NIL;
 
 	Assert(list_length(resultRelations) == list_length(subplans));
 	Assert(returningLists == NIL ||
@@ -4745,6 +4767,30 @@ make_modifytable(CmdType operation, bool canSetTag,
 	node->returningLists = returningLists;
 	node->rowMarks = rowMarks;
 	node->epqParam = epqParam;
+
+	/*
+	 * Allow FDW driver to construct its private plan if the result relation
+	 * is a foreign table.
+	 */
+	forboth (resultRel, resultRelations, subnode, subplans)
+	{
+		RangeTblEntry  *rte = rt_fetch(lfirst_int(resultRel),
+									   root->parse->rtable);
+		List		   *fdw_private = NIL;
+		char			relkind = get_rel_relkind(rte->relid);
+
+		if (relkind == RELKIND_FOREIGN_TABLE)
+		{
+			FdwRoutine *fdwroutine = GetFdwRoutineByRelId(rte->relid);
+
+			if (fdwroutine && fdwroutine->PlanForeignModify)
+				fdw_private = fdwroutine->PlanForeignModify(root, node,
+													lfirst_int(resultRel),
+													(Plan *) lfirst(subnode));
+		}
+		fdw_priv_list = lappend(fdw_priv_list, fdw_private);
+	}
+	node->fdwPrivList = fdw_priv_list;
 
 	return node;
 }

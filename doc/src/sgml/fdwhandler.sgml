@@ -89,6 +89,54 @@
 
     <para>
 <programlisting>
+AttrNumber
+GetForeignRelWidth(PlannerInfo *root,
+                   RelOptInfo *baserel,
+                   Relation foreignrel,
+                   bool inhparent,
+                   List *targetList);
+</programlisting>
+     Obtain the width of the result set to be fetched during a foreign table scan.
+     This is an optional handler, and called before <literal>GetForeignRelSize</>
+     for a query involving a foreign table
+     (during the construction of <literal>RelOptInfo</>).
+     <literal>root</> is the planner's global information about the query,
+     <literal>baserel</> is the planner's information being constructed for
+     this query, and <literal>foreignrel</> is a <literal>Relation</>
+     descriptor of the foreign table.
+     <literal>inhparent</> is a boolean to show whether the relation is
+     an inheritance parent, even though foreign tables do not support table
+     inheritance right now. <literal>targetList</> is the list of
+     <literal>TargetEntry</> to be returned from the (sub-)query
+     that is currently in focus.
+    </para>
+
+    <para>
+     The result value of this function will be assigned to
+     <literal>baserel-&gt;max_attr</>, that means it is the expected number
+     of columns being fetched during the foreign table scan.
+     It should not be smaller than the number of regular columns in the definition
+     of this foreign table.  You can only return a number greater than his value to
+     acquire slots for some additional attributes, which are called
+     <firstterm>pseudo-columns</>.
+     A typical usage of a pseudo-column is to carry an identifier of
+     a particular remote row to be updated or deleted from the scanning stage
+     to the modifying stage when the foreign table is the target of
+     a data-modifying SQL statement.
+     You can return the result of the helper function
+     <literal>get_pseudo_rowid_column</> if this <literal>"rowid"</>
+     pseudo-column is the only one you need.
+   </para>
+
+   <para>
+     In addition to that, pseudo-columns can be used to off-load the burden of
+     complex calculations to foreign computing resources by replacing an
+     expression with a reference to its result, which is calculated on the
+     remote side rather than locally.
+   </para>
+
+    <para>
+<programlisting>
 void
 GetForeignRelSize (PlannerInfo *root,
                    RelOptInfo *baserel,
@@ -96,7 +144,8 @@ GetForeignRelSize (PlannerInfo *root,
 </programlisting>
 
      Obtain relation size estimates for a foreign table.  This is called
-     at the beginning of planning for a query involving a foreign table.
+     for a query involving a foreign table at the beginning of planning
+     or right after <literal>GetForeignRelWidth</>, if that callback is configured.
      <literal>root</> is the planner's global information about the query;
      <literal>baserel</> is the planner's information about this table; and
      <literal>foreigntableid</> is the <structname>pg_class</> OID of the
@@ -312,6 +361,125 @@ AcquireSampleRowsFunc (Relation relation, int elevel,
      the table into the output parameters <parameter>totalrows</> and
      <parameter>totaldeadrows</>.  (Set <parameter>totaldeadrows</> to zero
      if the FDW does not have any concept of dead rows.)
+    </para>
+
+    <para>
+     If a FDW supports writable foreign tables, it should implement
+     some or all of the following callback functions depending on
+     the needs and capabilities of the FDW.
+    </para>
+
+    <para>
+<programlisting>
+List *
+PlanForeignModify(PlannerInfo *root,
+                  ModifyTable *plan,
+                  Index resultRelation,
+                  Plan *subplan);
+</programlisting>
+     It allows FDW drivers to construct private information relevant to
+     the modification of the foreign table.  This private information must have
+     the form of a <literal>List *</>, which will be delivered as
+     third argument to <literal>BeginForeignModify</> during the execution stage.
+    </para>
+
+    <para>
+     <literal>root</> is the planner's global information about the query.
+     <literal>plan</> is the master plan to modify the result relation according
+     to its command type.  Please consider that <literal>ModifyTable</>
+     may have multiple result relations in a future revision, even though
+     currently there is no support for table inheritance on foreign tables.
+     <literal>resultRelation</> is an index for the result relation in the
+     range table entries, and <literal>subplan</> is the relevant scan plan;
+     that should be a <literal>ForeignScan</> for <literal>UPDATE</> or
+     <literal>DELETE</>, so the driver can access the private information of
+     the scan stage using this argument.
+    </para>
+
+    <para>
+<programlisting>
+void
+BeginForeignModify (ModifyTableState *mtstate,
+                    ResultRelInfo *resultRelInfo,
+                    List *fdw_private,
+                    Plan *subplan,
+                    int eflags);
+</programlisting>
+     It is invoked at beginning of foreign table modification, during
+     executor startup.  This routine should perform any initialization
+     needed prior to the actual table modifications, but not start
+     modifying the actual tuples. (That should be done during each call of
+     <function>ExecForeignInsert</>, <function>ExecForeignUpdate</> or
+     <function>ExecForeignDelete</>.)
+    </para>
+
+    <para>
+     The <structfield>ri_fdw_state</> field of <structname>ResultRelInfo</>
+     is reserved to store any private information relevant to this foreign table,
+     so it should be initialized to contain the per-scan state.
+     Please consider that <literal>ModifyTableState</> may have multiple
+     result relations in a future revision, even though currently there is no
+     support for table inheritance on foreign tables.  <literal>resultRelInfo</>
+     is the master information connected to this foreign table.
+     <literal>fdw_private</> is private information constructed in
+     <literal>PlanForeignModify</>, and <literal>subplan</> is the relevant
+     scan plan of this table modification.
+    </para>
+
+    <para>
+<programlisting>
+TupleTableSlot *
+ExecForeignInsert (ResultRelInfo *resultRelInfo,
+                   TupleTableSlot *slot);
+</programlisting>
+     Insert the given tuple into backing storage on behalf of the foreign table.
+     The supplied slot shall hold a tuple being already formed according to
+     the definition of the relation, thus all the pseudo-columns are already
+     filtered out.
+     FDW driver can modify the tuple to be inserted (due to before-row-insert
+     triggers at remote side, for example). In this case, this routine can
+     return a modified slot that affects result of <literal>RETURNING</>,
+     or <literal>NULL</> that means this insertion was skipped. Elsewhere,
+     it usually returns the given slot, as is.
+    </para>
+
+    <para>
+<programlisting>
+bool
+ExecForeignDelete (ResultRelInfo *resultRelInfo,
+                   const char *rowid);
+</programlisting>
+     Delete the tuple being identified with <literal>rowid</> from the backing
+     storage on behalf of the foreign table.
+     FDW driver can return a boolean that means whether this deletion was done
+     actually, or not.
+    </para>
+
+    <para>
+<programlisting>
+TupleTableSlot *
+ExecForeignUpdate (ResultRelInfo *resultRelInfo,
+                   const char *rowid,
+                   TupleTableSlot *slot);
+</programlisting>
+     Update the tuple being identified with <literal>rowid</> in the backing
+     storage on behalf of the foreign table with the given slot that shall
+     hold a newer version of tuple.
+     FDW driver can modify the tuple to be updated (due to before-row-update
+     triggers at remote side, for example). In this case, this routine can
+     return a modified slot that affects result of <literal>RETURNING</>,
+     or <literal>NULL</> that means this update was skipped. Elsewhere,
+     it usually returns the given slot, as is.
+    </para>
+
+    <para>
+<programlisting>
+void
+EndForeignModify (ResultRelInfo *resultRelInfo);
+</programlisting>
+     End the modification and release resources.  It is normally not important
+     to release palloc'd memory, but for example open files and connections
+     to remote servers should be cleaned up.
     </para>
 
     <para>

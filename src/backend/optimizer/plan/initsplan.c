@@ -85,7 +85,7 @@ static void check_hashjoinable(RestrictInfo *restrictinfo);
  * "other rel" RelOptInfos for the members of any appendrels we find here.)
  */
 void
-add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
+add_base_rels_to_query(PlannerInfo *root, List *tlist, Node *jtnode)
 {
 	if (jtnode == NULL)
 		return;
@@ -93,7 +93,7 @@ add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
 	{
 		int			varno = ((RangeTblRef *) jtnode)->rtindex;
 
-		(void) build_simple_rel(root, varno, RELOPT_BASEREL);
+		(void) build_simple_rel(root, varno, tlist, RELOPT_BASEREL);
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
@@ -101,14 +101,14 @@ add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
 		ListCell   *l;
 
 		foreach(l, f->fromlist)
-			add_base_rels_to_query(root, lfirst(l));
+			add_base_rels_to_query(root, tlist, lfirst(l));
 	}
 	else if (IsA(jtnode, JoinExpr))
 	{
 		JoinExpr   *j = (JoinExpr *) jtnode;
 
-		add_base_rels_to_query(root, j->larg);
-		add_base_rels_to_query(root, j->rarg);
+		add_base_rels_to_query(root, tlist, j->larg);
+		add_base_rels_to_query(root, tlist, j->rarg);
 	}
 	else
 		elog(ERROR, "unrecognized node type: %d",

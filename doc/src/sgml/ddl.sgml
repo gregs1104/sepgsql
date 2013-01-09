@@ -3066,11 +3066,6 @@ ANALYZE measurement;
     <firstterm>user mapping</>, which can provide additional options based
     on the current <productname>PostgreSQL</productname> role.
    </para>
-
-   <para>
-    Currently, foreign tables are read-only.  This limitation may be fixed
-    in a future release.
-   </para>
  </sect1>
 
  <sect1 id="ddl-others">

@@ -16,10 +16,14 @@
 #include "foreign/foreign.h"
 #include "libpq-fe.h"
 
+#define PGSQL_FDW_CONNTX_NONE			0
+#define PGSQL_FDW_CONNTX_READ_ONLY		1
+#define PGSQL_FDW_CONNTX_READ_WRITE		2
+
 /*
  * Connection management
  */
-PGconn *GetConnection(ForeignServer *server, UserMapping *user, bool use_tx);
-void ReleaseConnection(PGconn *conn);
+PGconn *GetConnection(ForeignServer *server, UserMapping *user, int conntx);
+void ReleaseConnection(PGconn *conn, bool is_abort);
 
 #endif /* CONNECTION_H */

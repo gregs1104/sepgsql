@@ -30,7 +30,8 @@ int GetFetchCountOption(ForeignTable *table, ForeignServer *server);
 void deparseSimpleSql(StringInfo buf,
 					  PlannerInfo *root,
 					  RelOptInfo *baserel,
-					  List *local_conds);
+					  List *local_conds,
+					  AttrNumber anum_rowid);
 void appendWhereClause(StringInfo buf,
 					   bool has_where,
 					   List *exprs,
@@ -41,5 +42,10 @@ void classifyConditions(PlannerInfo *root,
 						List **param_conds,
 						List **local_conds);
 void deparseAnalyzeSql(StringInfo buf, Relation rel);
+void deparseInsertSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+					  List *targetAttrs, bool has_returning);
+void deparseUpdateSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+					  List *targetAttrs, bool has_returning);
+void deparseDeleteSql(StringInfo buf, PlannerInfo *root, Index rtindex);
 
 #endif /* POSTGRESQL_FDW_H */

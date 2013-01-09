@@ -268,9 +268,11 @@ typedef struct ProjectionInfo
  *						attribute numbers of the "original" tuple and the
  *						attribute numbers of the "clean" tuple.
  *	  resultSlot:		tuple slot used to hold cleaned tuple.
- *	  junkAttNo:		not used by junkfilter code.  Can be used by caller
- *						to remember the attno of a specific junk attribute
+ *	  jf_junkRowidNo:	not used by junkfilter code.  Can be used by caller
+ *						to remember the attno used to track a particular tuple
+ *						being updated or deleted.
  *						(execMain.c stores the "ctid" attno here).
+ *	  jf_junkRecordNo:	Also, the attno of whole-row reference.
  * ----------------
  */
 typedef struct JunkFilter
@@ -280,7 +282,8 @@ typedef struct JunkFilter
 	TupleDesc	jf_cleanTupType;
 	AttrNumber *jf_cleanMap;
 	TupleTableSlot *jf_resultSlot;
-	AttrNumber	jf_junkAttNo;
+	AttrNumber	jf_junkRowidNo;
+	AttrNumber	jf_junkRecordNo;
 } JunkFilter;
 
 /* ----------------
@@ -303,6 +306,8 @@ typedef struct JunkFilter
  *		ConstraintExprs			array of constraint-checking expr states
  *		junkFilter				for removing junk attributes from tuples
  *		projectReturning		for computing a RETURNING list
+ *		fdwroutine				FDW callbacks if foreign table
+ *		fdw_state				opaque state of FDW module, or NULL
  * ----------------
  */
 typedef struct ResultRelInfo
@@ -320,6 +325,8 @@ typedef struct ResultRelInfo
 	List	  **ri_ConstraintExprs;
 	JunkFilter *ri_junkFilter;
 	ProjectionInfo *ri_projectReturning;
+	struct FdwRoutine  *ri_fdwroutine;
+	void	   *ri_fdw_state;
 } ResultRelInfo;
 
 /* ----------------

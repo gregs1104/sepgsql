@@ -300,6 +300,37 @@ ERROR OUT;          -- ERROR
 SELECT srvname FROM postgres_fdw_connections;
 
 -- ===================================================================
+-- test for writable foreign table stuff (PoC stage now)
+-- ===================================================================
+EXPLAIN(verbose) INSERT INTO ft2 (c1,c2,c3) (SELECT c1+1000,c2+100, c3 || c3 FROM ft2 LIMIT 20);
+INSERT INTO ft2 (c1,c2,c3) (SELECT c1+1000,c2+100, c3 || c3 FROM ft2 LIMIT 20);
+INSERT INTO ft2 (c1,c2,c3) VALUES (1101,201,'aaa'), (1102,202,'bbb'),(1103,203,'ccc') RETURNING *;
+INSERT INTO ft2 (c1,c2,c3) VALUES (1104,204,'ddd'), (1105,205,'eee');
+UPDATE ft2 SET c2 = c2 + 300, c3 = c3 || '_update3' WHERE c1 % 10 = 3;
+UPDATE ft2 SET c2 = c2 + 400, c3 = c3 || '_update7' WHERE c1 % 10 = 7 RETURNING *;
+EXPLAIN(verbose) UPDATE ft2 SET c2 = ft2.c2 + 500, c3 = ft2.c3 || '_update9' FROM ft1 WHERE ft1.c1 = ft2.c2 AND ft1.c1 % 10 = 9;
+UPDATE ft2 SET c2 = ft2.c2 + 500, c3 = ft2.c3 || '_update9' FROM ft1 WHERE ft1.c1 = ft2.c2 AND ft1.c1 % 10 = 9;
+DELETE FROM ft2 WHERE c1 % 10 = 5 RETURNING *;
+EXPLAIN(verbose) DELETE FROM ft2 USING ft1 WHERE ft1.c1 = ft2.c2 AND ft1.c1 % 10 = 2;
+DELETE FROM ft2 USING ft1 WHERE ft1.c1 = ft2.c2 AND ft1.c1 % 10 = 2;
+SELECT c1,c2,c3,c4 FROM ft2 ORDER BY c1;
+
+-- In case of remote table has before-row trigger or default with returning
+ALTER TABLE "S 1"."T 1" ALTER c6 SET DEFAULT '(^-^;)';
+CREATE OR REPLACE FUNCTION "S 1".F_BRTRIG() RETURNS trigger AS $$
+BEGIN
+    NEW.c3 = NEW.c3 || '_trig_update';
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER t1_br_insert BEFORE INSERT OR UPDATE
+    ON "S 1"."T 1" FOR EACH ROW EXECUTE PROCEDURE "S 1".F_BRTRIG();
+
+INSERT INTO ft2 (c1,c2,c3) VALUES (1208, 218, 'fff') RETURNING *;
+INSERT INTO ft2 (c1,c2,c3,c6) VALUES (1218, 218, 'ggg', '(--;') RETURNING *;
+UPDATE ft2 SET c2 = c2 + 600 WHERE c1 % 10 = 8 RETURNING *;
+
+-- ===================================================================
 -- cleanup
 -- ===================================================================
 DROP OPERATOR === (int, int) CASCADE;

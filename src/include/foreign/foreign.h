@@ -14,6 +14,8 @@
 #define FOREIGN_H
 
 #include "nodes/parsenodes.h"
+#include "nodes/plannodes.h"
+#include "nodes/relation.h"
 
 
 /* Helper for obtaining username for user mapping */
@@ -81,4 +83,8 @@ extern List *GetForeignColumnOptions(Oid relid, AttrNumber attnum);
 extern Oid	get_foreign_data_wrapper_oid(const char *fdwname, bool missing_ok);
 extern Oid	get_foreign_server_oid(const char *servername, bool missing_ok);
 
+extern AttrNumber get_pseudo_rowid_column(RelOptInfo *baserel,
+										  List *targetList);
+extern ForeignScan *lookup_foreign_scan_plan(Plan *subplan,
+											 Index rtindex);
 #endif   /* FOREIGN_H */
