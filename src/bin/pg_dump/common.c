@@ -245,6 +245,10 @@ getSchemaData(Archive *fout, int *numTablesPtr)
 		write_msg(NULL, "reading event triggers\n");
 	getEventTriggers(fout, &numEventTriggers);
 
+	if (g_verbose)
+		write_msg(NULL, "reading row-security policies\n");
+	getRowSecurity(fout, tblinfo, numTables);
+
 	*numTablesPtr = numTables;
 	return tblinfo;
 }

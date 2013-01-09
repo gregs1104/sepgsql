@@ -35,9 +35,44 @@
 #include "utils/rel.h"
 
 
-static List *expand_targetlist(List *tlist, int command_type,
-				  Index result_relation, List *range_table);
+/*
+ * lookup_varattno
+ *
+ * This routine returns an attribute number to reference a particular
+ * attribute. In case when the target relation is really relation,
+ * we can reference arbitrary attribute (including system column)
+ * without any translations. However, we have to translate varattno
+ * of Vat that references sub-queries being originated from regular
+ * relations with row-level security policy.
+ */
+static AttrNumber
+lookup_varattno(AttrNumber attno, Index rt_index, List *rtables)
+{
+	RangeTblEntry  *rte = rt_fetch(rt_index, rtables);
 
+	if (rte->rtekind == RTE_SUBQUERY &&
+		rte->subquery->querySource == QSRC_ROW_SECURITY)
+	{
+		ListCell   *cell;
+
+		foreach (cell, rte->subquery->targetList)
+		{
+			TargetEntry *tle = lfirst(cell);
+			Var			*var;
+
+			if (IsA(tle->expr, Const))
+				continue;
+
+			var = (Var *) tle->expr;
+			Assert(IsA(var, Var));
+
+			if (var->varattno == attno)
+				return tle->resno;
+		}
+		elog(ERROR, "invalid attno %d on the pseudo targetList", attno);
+	}
+	return attno;
+}
 
 /*
  * preprocess_targetlist
@@ -61,8 +96,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	if (result_relation)
 	{
 		RangeTblEntry *rte = rt_fetch(result_relation, range_table);
-
-		if (rte->subquery != NULL || rte->relid == InvalidOid)
+		if (rte->subquery != NULL &&
+			rte->subquery->querySource != QSRC_ROW_SECURITY)
 			elog(ERROR, "subquery cannot be result relation");
 	}
 
@@ -95,7 +130,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 		{
 			/* It's a regular table, so fetch its TID */
 			var = makeVar(rc->rti,
-						  SelfItemPointerAttributeNumber,
+						  lookup_varattno(SelfItemPointerAttributeNumber,
+										  rc->rti, range_table),
 						  TIDOID,
 						  -1,
 						  InvalidOid,
@@ -111,7 +147,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 			if (rc->isParent)
 			{
 				var = makeVar(rc->rti,
-							  TableOidAttributeNumber,
+							  lookup_varattno(TableOidAttributeNumber,
+											  rc->rti, range_table),
 							  OIDOID,
 							  -1,
 							  InvalidOid,
@@ -129,7 +166,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 			/* Not a table, so we need the whole row as a junk var */
 			var = makeWholeRowVar(rt_fetch(rc->rti, range_table),
 								  rc->rti,
-								  0,
+								  lookup_varattno(0, rc->rti, range_table),
 								  false);
 			snprintf(resname, sizeof(resname), "wholerow%u", rc->rowmarkId);
 			tle = makeTargetEntry((Expr *) var,
@@ -192,13 +229,15 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  *	  add targetlist entries for any missing attributes, and ensure the
  *	  non-junk attributes appear in proper field order.
  */
-static List *
+List *
 expand_targetlist(List *tlist, int command_type,
 				  Index result_relation, List *range_table)
 {
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
 	Relation	rel;
+	Oid			relid;
+	RangeTblEntry *rte;
 	int			attrno,
 				numattrs;
 
@@ -213,7 +252,9 @@ expand_targetlist(List *tlist, int command_type,
 	 * that the rewriter already acquired at least AccessShareLock on the
 	 * relation, so we need no lock here.
 	 */
-	rel = heap_open(getrelid(result_relation, range_table), NoLock);
+	rte = rt_fetch(result_relation, range_table);
+	relid = OidIsValid(rte->relid) ? rte->relid : rte->relid_orig;
+	rel = heap_open(relid, NoLock);
 
 	numattrs = RelationGetNumberOfAttributes(rel);
 
@@ -298,7 +339,9 @@ expand_targetlist(List *tlist, int command_type,
 					if (!att_tup->attisdropped)
 					{
 						new_expr = (Node *) makeVar(result_relation,
-													attrno,
+													lookup_varattno(attrno,
+														result_relation,
+														range_table),
 													atttype,
 													atttypmod,
 													attcollation,

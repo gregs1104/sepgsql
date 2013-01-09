@@ -33,6 +33,7 @@
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/prep.h"
+#include "optimizer/rowsecurity.h"
 #include "optimizer/subselect.h"
 #include "optimizer/tlist.h"
 #include "parser/analyze.h"
@@ -167,6 +168,7 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	glob->lastPHId = 0;
 	glob->lastRowMarkId = 0;
 	glob->transientPlan = false;
+	glob->planUserId = InvalidOid;
 
 	/* Determine what fraction of the plan is likely to be scanned */
 	if (cursorOptions & CURSOR_OPT_FAST_PLAN)
@@ -244,6 +246,7 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	result->relationOids = glob->relationOids;
 	result->invalItems = glob->invalItems;
 	result->nParamExec = glob->nParamExec;
+	result->planUserId = glob->planUserId;
 
 	return result;
 }
@@ -391,6 +394,19 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 	 * subqueries.
 	 */
 	expand_inherited_tables(root);
+
+	/*
+	 * Apply row-security policy of the relation being referenced,
+	 * if configured with either of built-in or extension's features.
+	 * RangeTblEntry of the relation with row-security policy shall
+	 * be replaced with a row-security subquery that has simple scan
+	 * on the target relation with row-security policy qualifiers.
+	 *
+	 * This routine assumes PlannerInfo is already handled with
+	 * expand_inherited_tables, thus, AppendRelInfo or PlanRowMark
+	 * have valid information.
+	 */
+	apply_row_security_policy(root);
 
 	/*
 	 * Set hasHavingQual to remember if HAVING clause is present.  Needed

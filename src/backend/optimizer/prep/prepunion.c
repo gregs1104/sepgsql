@@ -55,6 +55,7 @@ typedef struct
 {
 	PlannerInfo *root;
 	AppendRelInfo *appinfo;
+	bool		in_returning;
 } adjust_appendrel_attrs_context;
 
 static Plan *recurse_set_operations(Node *setOp, PlannerInfo *root,
@@ -1594,6 +1595,7 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 
 	context.root = root;
 	context.appinfo = appinfo;
+	context.in_returning = false;
 
 	/*
 	 * Must be prepared to start with a Query or a bare expression tree.
@@ -1605,7 +1607,26 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 		newnode = query_tree_mutator((Query *) node,
 									 adjust_appendrel_attrs_mutator,
 									 (void *) &context,
-									 QTW_IGNORE_RC_SUBQUERIES);
+									 QTW_IGNORE_RC_SUBQUERIES |
+									 QTW_IGNORE_RETURNING);
+		/*
+		 * In case when row-security policy was applied on some child
+		 * relations, RETURNING clause needs to be handled in a special
+		 * way, because Var node of RETURNING clause points a certain 
+		 * field on "raw" relations, unlike scanning stage. If relation
+		 * has row-security policy, its RangeTblEntry was replaced with
+		 * a sub-query in earlier optimization stage, thus, references
+		 * to system columns will have different resource number of
+		 * TargetEntry on behalf of underlying system column.
+		 * So, we don't need to adjust attribute number of system column
+		 * in the RETURNING clause, even if Var node tries to reference
+		 * row-security sub-query.
+		 */
+		context.in_returning = true;
+		newnode->returningList =
+			(List *) expression_tree_mutator((Node *) newnode->returningList,
+											 adjust_appendrel_attrs_mutator,
+											 (void *) &context);
 		if (newnode->resultRelation == appinfo->parent_relid)
 		{
 			newnode->resultRelation = appinfo->child_relid;
@@ -1621,6 +1642,49 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 		result = adjust_appendrel_attrs_mutator(node, &context);
 
 	return result;
+}
+
+static Node *
+fixup_var_on_rls_subquery(RangeTblEntry *rte, Var *var)
+{
+	ListCell   *cell;
+
+	Assert(rte->rtekind == RTE_SUBQUERY &&
+		   rte->subquery->querySource == QSRC_ROW_SECURITY);
+	/*
+	 * In case when row-level security policy is applied on the referenced
+	 * table, its RangeTblEntry (RTE_RELATION) is replaced with sub-query
+	 * to filter out unprivileged rows of underlying relation.
+	 * Even though reference to this sub-query should perform as if ones
+	 * to real relations, system column has to be cared in special way
+	 * due to the nature of sub-query.
+	 * Target-entries that reference system columns should be added on
+	 * rowlevelsec.c, so all we need to do here is looking up underlying
+	 * target-list that can reference underlying system column, and fix-
+	 * up varattno of the referencing Var node with resno of TargetEntry.
+	 */
+	foreach (cell, rte->subquery->targetList)
+	{
+		TargetEntry *subtle = lfirst(cell);
+
+		if (IsA(subtle->expr, Var))
+		{
+			Var	   *subvar = (Var *) subtle->expr;
+			Var	   *newnode;
+
+			if (subvar->varattno == var->varattno)
+			{
+				newnode = copyObject(var);
+				newnode->varattno = subtle->resno;
+				return (Node *)newnode;
+			}
+		}
+		else
+			Assert(IsA(subtle->expr, Const));
+	}
+	elog(ERROR, "could not find artificial column of %d in relation %s",
+		 var->varattno, get_rel_name(rte->relid_orig));
+	return NULL;
 }
 
 static Node *
@@ -1664,6 +1728,14 @@ adjust_appendrel_attrs_mutator(Node *node,
 				 */
 				if (OidIsValid(appinfo->child_reltype))
 				{
+					Query          *parse = context->root->parse;
+					RangeTblEntry  *rte = rt_fetch(appinfo->child_relid,
+												   parse->rtable);
+					if (!context->in_returning &&
+						rte->rtekind == RTE_SUBQUERY &&
+						rte->subquery->querySource == QSRC_ROW_SECURITY)
+						var = (Var *)fixup_var_on_rls_subquery(rte, var);
+
 					Assert(var->vartype == appinfo->parent_reltype);
 					if (appinfo->parent_reltype != appinfo->child_reltype)
 					{
@@ -1708,7 +1780,16 @@ adjust_appendrel_attrs_mutator(Node *node,
 					return (Node *) rowexpr;
 				}
 			}
-			/* system attributes don't need any other translation */
+			else
+			{
+				Query		   *parse = context->root->parse;
+				RangeTblEntry  *rte = rt_fetch(appinfo->child_relid,
+											   parse->rtable);
+				if (!context->in_returning &&
+					rte->rtekind == RTE_SUBQUERY &&
+					rte->subquery->querySource == QSRC_ROW_SECURITY)
+					return fixup_var_on_rls_subquery(rte, var);
+			}
 		}
 		return (Node *) var;
 	}

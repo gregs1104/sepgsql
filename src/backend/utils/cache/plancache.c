@@ -51,6 +51,7 @@
 #include "catalog/namespace.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
+#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planmain.h"
 #include "optimizer/prep.h"
@@ -762,6 +763,16 @@ CheckCachedPlan(CachedPlanSource *plansource)
 		AcquireExecutorLocks(plan->stmt_list, true);
 
 		/*
+		 * If plan was constructed with assumption of a particular user-id,
+		 * and it is different from the current one, the cached-plan shall
+		 * be invalidated to construct suitable query plan.
+		 */
+		if (plan->is_valid &&
+			OidIsValid(plan->planUserId) &&
+			plan->planUserId == GetUserId())
+			plan->is_valid = false;
+
+		/*
 		 * If plan was transient, check to see if TransactionXmin has
 		 * advanced, and if so invalidate it.
 		 */
@@ -814,6 +825,8 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 {
 	CachedPlan *plan;
 	List	   *plist;
+	ListCell   *cell;
+	Oid			planUserId = InvalidOid;
 	bool		snapshot_set;
 	bool		spi_pushed;
 	MemoryContext plan_context;
@@ -898,6 +911,24 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	PopOverrideSearchPath();
 
 	/*
+	 * Check whether the generated plan assumes a particular user-id, or not.
+	 * In case when a valid user-id is recorded on PlannedStmt->planUserId,
+	 * it should be kept and used to validation check of the cached plan
+	 * under the "current" user-id.
+	 */
+	foreach (cell, plist)
+	{
+		PlannedStmt	*pstmt = lfirst(cell);
+
+		if (IsA(pstmt, PlannedStmt) && OidIsValid(pstmt->planUserId))
+		{
+			Assert(!OidIsValid(planUserId) || planUserId == pstmt->planUserId);
+
+			planUserId = pstmt->planUserId;
+		}
+	}
+
+	/*
 	 * Normally we make a dedicated memory context for the CachedPlan and its
 	 * subsidiary data.  (It's probably not going to be large, but just in
 	 * case, use the default maxsize parameter.  It's transient for the
@@ -940,6 +971,7 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	plan->is_oneshot = plansource->is_oneshot;
 	plan->is_saved = false;
 	plan->is_valid = true;
+	plan->planUserId = planUserId;
 
 	/* assign generation number to new plan */
 	plan->generation = ++(plansource->generation);

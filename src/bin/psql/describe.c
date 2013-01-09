@@ -2652,6 +2652,10 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 		appendPQExpBuffer(&buf,
 			  ",\n  pg_catalog.obj_description(c.oid, 'pg_class') as \"%s\"",
 						  gettext_noop("Description"));
+		if (pset.sversion >= 90300)
+			appendPQExpBuffer(&buf,
+			  ",\n pg_catalog.pg_get_expr(rs.rsecqual, c.oid) as \"%s\"",
+							  gettext_noop("Row-security"));
 	}
 
 	appendPQExpBuffer(&buf,
@@ -2661,6 +2665,9 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 		appendPQExpBuffer(&buf,
 			 "\n     LEFT JOIN pg_catalog.pg_index i ON i.indexrelid = c.oid"
 		   "\n     LEFT JOIN pg_catalog.pg_class c2 ON i.indrelid = c2.oid");
+	if (verbose && pset.sversion >= 90300)
+		appendPQExpBuffer(&buf,
+		   "\n     LEFT JOIN pg_rowsecurity rs ON rs.rsecrelid = c.oid");
 
 	appendPQExpBuffer(&buf, "\nWHERE c.relkind IN (");
 	if (showTables)

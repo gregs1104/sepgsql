@@ -49,6 +49,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_rowsecurity.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -908,6 +909,11 @@ RelationBuildDesc(Oid targetRelId, bool insertIt)
 		RelationBuildTriggers(relation);
 	else
 		relation->trigdesc = NULL;
+
+	if (relation->rd_rel->relhasrowsecurity)
+		RelationBuildRowSecurity(relation);
+	else
+		relation->rsdesc = NULL;
 
 	/*
 	 * if it's an index, initialize index-related information
@@ -1813,6 +1819,8 @@ RelationDestroyRelation(Relation relation)
 		MemoryContextDelete(relation->rd_indexcxt);
 	if (relation->rd_rulescxt)
 		MemoryContextDelete(relation->rd_rulescxt);
+	if (relation->rsdesc)
+		MemoryContextDelete(relation->rsdesc->rscxt);
 	pfree(relation);
 }
 
@@ -3061,7 +3069,13 @@ RelationCacheInitializePhase3(void)
 				relation->rd_rel->relhastriggers = false;
 			restart = true;
 		}
-
+		if (relation->rd_rel->relhasrowsecurity && relation->rsdesc == NULL)
+		{
+			RelationBuildRowSecurity(relation);
+			if (relation->rsdesc == NULL)
+				relation->rd_rel->relhasrowsecurity = false;
+			restart = true;
+		}
 		/* Release hold on the relation */
 		RelationDecrementReferenceCount(relation);
 
@@ -4214,6 +4228,7 @@ load_relcache_init_file(bool shared)
 		rel->rd_rules = NULL;
 		rel->rd_rulescxt = NULL;
 		rel->trigdesc = NULL;
+		rel->rsdesc = NULL;
 		rel->rd_indexprs = NIL;
 		rel->rd_indpred = NIL;
 		rel->rd_exclops = NULL;

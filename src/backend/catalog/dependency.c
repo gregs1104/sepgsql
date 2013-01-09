@@ -47,6 +47,7 @@
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_rewrite.h"
+#include "catalog/pg_rowsecurity.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_ts_config.h"
@@ -1238,6 +1239,10 @@ doDeletion(const ObjectAddress *object, int flags)
 			RemoveEventTriggerById(object->objectId);
 			break;
 
+		case OCLASS_ROWSECURITY:
+			RemoveRowSecurityById(object->objectId);
+			break;
+
 		default:
 			elog(ERROR, "unrecognized object class: %u",
 				 object->classId);
@@ -2297,6 +2302,9 @@ getObjectClass(const ObjectAddress *object)
 
 		case EventTriggerRelationId:
 			return OCLASS_EVENT_TRIGGER;
+
+		case RowSecurityRelationId:
+			return OCLASS_ROWSECURITY;
 	}
 
 	/* shouldn't get here */
@@ -2948,6 +2956,56 @@ getObjectDescription(const ObjectAddress *object)
 				appendStringInfo(&buffer, _("event trigger %s"),
 					 NameStr(((Form_pg_event_trigger) GETSTRUCT(tup))->evtname));
 				ReleaseSysCache(tup);
+				break;
+			}
+
+		case OCLASS_ROWSECURITY:
+			{
+				Relation	rsec_rel;
+				ScanKeyData	skey;
+				SysScanDesc	sscan;
+				HeapTuple	tuple;
+				Form_pg_rowsecurity	form_rsec;
+
+				rsec_rel = heap_open(RowSecurityRelationId, AccessShareLock);
+
+				ScanKeyInit(&skey,
+							ObjectIdAttributeNumber,
+							BTEqualStrategyNumber, F_OIDEQ,
+							ObjectIdGetDatum(object->objectId));
+				sscan = systable_beginscan(rsec_rel, RowSecurityOidIndexId,
+										   true, SnapshotNow, 1, &skey);
+				tuple = systable_getnext(sscan);
+				if (!HeapTupleIsValid(tuple))
+					elog(ERROR, "could not find tuple for row-security %u",
+						 object->objectId);
+				form_rsec = (Form_pg_rowsecurity) GETSTRUCT(tuple);
+
+				appendStringInfo(&buffer, _("row-security of "));
+				getRelationDescription(&buffer, form_rsec->rsecrelid);
+				switch (form_rsec->rseccmd)
+				{
+					case ROWSECURITY_CMD_ALL:
+						appendStringInfo(&buffer, _(" FOR ALL"));
+						break;
+					case ROWSECURITY_CMD_SELECT:
+						appendStringInfo(&buffer, _(" FOR SELECT"));
+						break;
+					case ROWSECURITY_CMD_INSERT:
+						appendStringInfo(&buffer, _(" FOR INSERT"));
+						break;
+					case ROWSECURITY_CMD_UPDATE:
+						appendStringInfo(&buffer, _(" FOR UPDATE"));
+						break;
+					case ROWSECURITY_CMD_DELETE:
+						appendStringInfo(&buffer, _(" FOR DELETE"));
+						break;
+					default:
+						elog(ERROR, "unexpected row-security command type: %c",
+							 form_rsec->rseccmd);
+				}
+				systable_endscan(sscan);
+				heap_close(rsec_rel, AccessShareLock);
 				break;
 			}
 

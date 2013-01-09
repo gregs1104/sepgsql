@@ -31,7 +31,8 @@ typedef enum QuerySource
 	QSRC_PARSER,				/* added by parse analysis (now unused) */
 	QSRC_INSTEAD_RULE,			/* added by unconditional INSTEAD rule */
 	QSRC_QUAL_INSTEAD_RULE,		/* added by conditional INSTEAD rule */
-	QSRC_NON_INSTEAD_RULE		/* added by non-INSTEAD rule */
+	QSRC_NON_INSTEAD_RULE,		/* added by non-INSTEAD rule */
+	QSRC_ROW_SECURITY,			/* added by row-security */
 } QuerySource;
 
 /* Sort ordering options for ORDER BY and CREATE INDEX */
@@ -700,6 +701,13 @@ typedef struct RangeTblEntry
 
 	/*
 	 * Fields valid for a plain relation RTE (else zero):
+	 *
+	 * XXX - Query optimizer may modify and replace RangeTblEntry on
+	 * a particular relation by sub-query, but should perform as result
+	 * relation of the query. In this case, relid field is used to track
+	 * which relation is the sub-query originated.
+	 * Right now, only row-level security feature uses this field to track
+	 * the relation-id of sub-query being originated.
 	 */
 	Oid			relid;			/* OID of the relation */
 	char		relkind;		/* relation kind (see pg_class.relkind) */
@@ -709,7 +717,9 @@ typedef struct RangeTblEntry
 	 */
 	Query	   *subquery;		/* the sub-query */
 	bool		security_barrier;		/* is from security_barrier view? */
-
+	Oid			relid_orig;		/* OID of the relation, if this sub-query
+								 * was originated from a regular relation,
+								 * then, replaced by row-security feature */
 	/*
 	 * Fields valid for a join RTE (else NULL/zero):
 	 *
@@ -1233,6 +1243,8 @@ typedef enum AlterTableType
 	AT_DropInherit,				/* NO INHERIT parent */
 	AT_AddOf,					/* OF <type_name> */
 	AT_DropOf,					/* NOT OF */
+	AT_SetRowSecurity,			/* SET ROW SECURITY (...) */
+	AT_ResetRowSecurity,		/* RESET ROW SECURITY */
 	AT_GenericOptions			/* OPTIONS (...) */
 } AlterTableType;
 
