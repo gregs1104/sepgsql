@@ -87,6 +87,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 {
 	Query	   *parse = root->parse;
 	int			result_relation = parse->resultRelation;
+	int			result_source = parse->resultSource;
 	List	   *range_table = parse->rtable;
 	CmdType		command_type = parse->commandType;
 	ListCell   *lc;
@@ -107,10 +108,16 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	 * for heap_form_tuple to work, the targetlist must match the exact order
 	 * of the attributes. We also need to fill in any missing attributes. -ay
 	 * 10/94
+	 *
+	 * XXX - In case when row-security is applied on the result relation,
+	 * the missing fields should be fetched from the source relation (that
+	 * can be sub-query), instead of the result relation.
 	 */
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
 		tlist = expand_targetlist(tlist, command_type,
-								  result_relation, range_table);
+								  (result_source != 0 ?
+								   result_source : result_relation),
+								  range_table);
 
 	/*
 	 * Add necessary junk columns for rowmarked rels.  These values are needed
@@ -235,6 +242,7 @@ static List *
 expand_targetlist(List *tlist, int command_type,
 				  Index result_relation, List *range_table)
 {
+	RangeTblEntry  *rte;
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
 	Relation	rel;

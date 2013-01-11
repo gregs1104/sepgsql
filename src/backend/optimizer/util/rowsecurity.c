@@ -220,7 +220,7 @@ fixup_varnode_walker(Node *node, fixup_varnode_context *context)
 				if (var->varattno > InvalidAttrNumber)
 					continue;
 
-				child_rte = rt_fetch(appinfo->child_relid,
+				child_rte = rt_fetch(context->vartrans[appinfo->child_relid],
 									 context->root->parse->rtable);
 				if (child_rte->rtekind == RTE_SUBQUERY &&
 					child_rte->subquery->querySource == QSRC_ROW_SECURITY)
@@ -383,6 +383,7 @@ expand_rtentry_with_policy(PlannerInfo *root, Index rtindex,
 		lookup_artificial_column(root, newrte, SelfItemPointerAttributeNumber);
 		lookup_artificial_column(root, newrte, TableOidAttributeNumber);
 	}
+
 	return list_length(parse->rtable);
 }
 
@@ -591,18 +592,27 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 					rte_new = copyObject(rt_fetch(apinfo->child_relid,
 												  parse->rtable));
 					parse->rtable = lappend(parse->rtable, rte_new);
-
-					apinfo_new = copyObject(apinfo);
-					apinfo_new->parent_relid = rtindex_new;
-					apinfo_new->child_relid = list_length(parse->rtable);
-					foreach (lc2, apinfo_new->translated_vars)
-					{
-						Var	   *var = lfirst(lc2);
-
-						var->varno = apinfo_new->child_relid;
-					}
-					vartrans[apinfo->child_relid] = apinfo_new->child_relid;
+					vartrans[apinfo->child_relid]
+						= list_length(parse->rtable);
 				}
+				/*
+				 * Fixup parent/child index of AppendRelInfo
+				 */
+				apinfo_new = copyObject(apinfo);
+				apinfo_new->parent_relid = rtindex_new;
+				apinfo_new->child_relid
+					= vartrans[apinfo->child_relid];
+				foreach (lc2, apinfo_new->translated_vars)
+				{
+					Var	   *var = lfirst(lc2);
+
+					var->varno = apinfo_new->child_relid;
+				}
+				root->append_rel_list = lappend(root->append_rel_list,
+												apinfo_new);
+				/*
+				 * Fixup parent/child index of PlanRowMark
+				 */
 				rowmark = get_plan_rowmark(root->rowMarks,
 										   apinfo->child_relid);
 				if (rowmark)
@@ -651,6 +661,8 @@ apply_row_security_recursive(PlannerInfo *root, Index *vartrans, Node *jtnode)
 
 		/* Try to apply row-security policy, if configured */
 		result = apply_row_security_relation(root, vartrans, cmd, rtindex);
+		if (result && parse->resultRelation == rtindex)
+			parse->resultSource = vartrans[parse->resultRelation];
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
