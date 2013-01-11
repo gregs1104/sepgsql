@@ -34,7 +34,8 @@
 #include "parser/parse_coerce.h"
 #include "utils/rel.h"
 
-
+static List *expand_targetlist(List *tlist, int command_type,
+							   Index result_relation, List *range_table);
 /*
  * lookup_varattno
  *
@@ -69,7 +70,8 @@ lookup_varattno(AttrNumber attno, Index rt_index, List *rtables)
 			if (var->varattno == attno)
 				return tle->resno;
 		}
-		elog(ERROR, "invalid attno %d on the pseudo targetList", attno);
+		elog(ERROR, "invalid attno %d on row-security subquery target-list",
+			 attno);
 	}
 	return attno;
 }
@@ -96,8 +98,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	if (result_relation)
 	{
 		RangeTblEntry *rte = rt_fetch(result_relation, range_table);
-		if (rte->subquery != NULL &&
-			rte->subquery->querySource != QSRC_ROW_SECURITY)
+
+		if (rte->subquery != NULL || rte->relid == InvalidOid)
 			elog(ERROR, "subquery cannot be result relation");
 	}
 
@@ -229,15 +231,13 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  *	  add targetlist entries for any missing attributes, and ensure the
  *	  non-junk attributes appear in proper field order.
  */
-List *
+static List *
 expand_targetlist(List *tlist, int command_type,
 				  Index result_relation, List *range_table)
 {
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
 	Relation	rel;
-	Oid			relid;
-	RangeTblEntry *rte;
 	int			attrno,
 				numattrs;
 
@@ -252,9 +252,7 @@ expand_targetlist(List *tlist, int command_type,
 	 * that the rewriter already acquired at least AccessShareLock on the
 	 * relation, so we need no lock here.
 	 */
-	rte = rt_fetch(result_relation, range_table);
-	relid = OidIsValid(rte->relid) ? rte->relid : rte->relid_orig;
-	rel = heap_open(relid, NoLock);
+	rel = heap_open(getrelid(result_relation, range_table), NoLock);
 
 	numattrs = RelationGetNumberOfAttributes(rel);
 

@@ -750,12 +750,8 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 			Index		resultRelationIndex = lfirst_int(l);
 			Oid			resultRelationOid;
 			Relation	resultRelation;
-			RangeTblEntry  *resultRTE;
 
-			resultRTE = rt_fetch(resultRelationIndex, rangeTable);
-			resultRelationOid = (OidIsValid(resultRTE->relid) ?
-								 resultRTE->relid :
-								 resultRTE->relid_orig);
+			resultRelationOid = getrelid(resultRelationIndex, rangeTable);
 			resultRelation = heap_open(resultRelationOid, RowExclusiveLock);
 			InitResultRelInfo(resultRelInfo,
 							  resultRelation,
@@ -804,14 +800,6 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 				break;
 			case ROW_MARK_REFERENCE:
 				relid = getrelid(rc->rti, rangeTable);
-				if (!OidIsValid(relid))
-				{
-					RangeTblEntry  *rte = rt_fetch(rc->rti, rangeTable);
-
-					Assert(rte->rtekind == RTE_SUBQUERY &&
-						   OidIsValid(rte->relid_orig));
-					relid = rte->relid_orig;
-				}
 				relation = heap_open(relid, AccessShareLock);
 				break;
 			case ROW_MARK_COPY:

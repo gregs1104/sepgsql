@@ -107,6 +107,11 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	Index		rti;
 
 	/*
+	 * Generate access paths for the entire join tree.
+	 */
+	rel = make_rel_from_joinlist(root, joinlist);
+
+	/*
 	 * Construct the all_baserels Relids set.
 	 */
 	root->all_baserels = NULL;
@@ -124,6 +129,21 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 		if (brel->reloptkind != RELOPT_BASEREL)
 			continue;
 
+		/*
+		 * ignore RTEs that appears only result relations.
+		 *
+		 * XXX - It may happen when user tries to update or delete a table
+		 * with row-security policy, because this feature adds alternaive
+		 * RTEs of row-security subquery to be referenced instead of the
+		 * original relation. It means, update or delete performs as if
+		 * executor fetches a tuple from a sub-query with different range-
+		 * table index into the result relation. In this case, the result
+		 * relation is on root->simple_rel_array, but not a member of
+		 * join tree.
+		 */
+		if (!bms_is_member(brel->relid, rel->relids))
+			continue;
+
 		root->all_baserels = bms_add_member(root->all_baserels, brel->relid);
 	}
 
@@ -134,15 +154,9 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 	set_base_rel_pathlists(root);
 
 	/*
-	 * Generate access paths for the entire join tree.
-	 */
-	rel = make_rel_from_joinlist(root, joinlist);
-
-	/*
 	 * The result should join all and only the query's base rels.
 	 */
 	Assert(bms_equal(rel->relids, root->all_baserels));
-
 	return rel;
 }
 

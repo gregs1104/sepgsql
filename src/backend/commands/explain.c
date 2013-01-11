@@ -1966,14 +1966,9 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 		case T_TidScan:
 		case T_ForeignScan:
 		case T_ModifyTable:
-			if (rte->rtekind == RTE_RELATION)
-				objectname = get_rel_name(rte->relid);
-			else
-			{
-				Assert(rte->rtekind == RTE_SUBQUERY &&
-					   OidIsValid(rte->relid_orig));
-				objectname = get_rel_name(rte->relid_orig);
-			}
+			/* Assert it's on a real relation */
+			Assert(rte->rtekind == RTE_RELATION);
+			objectname = get_rel_name(rte->relid);
 			if (es->verbose)
 				namespace = get_namespace_name(get_rel_namespace(rte->relid));
 			objecttag = "Relation Name";

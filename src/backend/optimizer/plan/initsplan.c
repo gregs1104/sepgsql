@@ -84,8 +84,8 @@ static void check_hashjoinable(RestrictInfo *restrictinfo);
  * RELOPT_BASEREL.	(Note: build_simple_rel recurses internally to build
  * "other rel" RelOptInfos for the members of any appendrels we find here.)
  */
-void
-add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
+static void
+add_base_rels_to_query_recursive(PlannerInfo *root, Node *jtnode)
 {
 	if (jtnode == NULL)
 		return;
@@ -115,6 +115,19 @@ add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
 			 (int) nodeTag(jtnode));
 }
 
+void
+add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
+{
+	add_base_rels_to_query_recursive(root, jtnode);
+
+	if (root->parse->resultRelation > 0)
+	{
+		int		resultRelation = root->parse->resultRelation;
+
+		if (!root->simple_rel_array[resultRelation])
+			(void) build_simple_rel(root, resultRelation, RELOPT_BASEREL);
+	}
+}
 
 /*****************************************************************************
  *

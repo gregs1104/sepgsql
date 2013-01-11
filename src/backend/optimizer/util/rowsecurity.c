@@ -166,6 +166,7 @@ lookup_artificial_column(PlannerInfo *root,
 typedef struct {
 	PlannerInfo	*root;
 	int		varlevelsup;
+	Index  *vartrans;
 } fixup_varnode_context;
 
 static bool
@@ -187,26 +188,36 @@ fixup_varnode_walker(Node *node, fixup_varnode_context *context)
 		if (var->varlevelsup != context->varlevelsup)
 			return false;
 
+		if (context->vartrans[var->varno] == 0)
+			return false;
+
 		/*
 		 * Var nodes that reference the relation being replaced by row-
 		 * security sub-query has to be adjusted; to reference the sub-
 		 * query, instead of the original relation.
 		 */
-		rte = rt_fetch(var->varno, context->root->parse->rtable);
+		rte = rt_fetch(context->vartrans[var->varno],
+					   context->root->parse->rtable);
 		if (rte->rtekind == RTE_SUBQUERY &&
 			rte->subquery->querySource == QSRC_ROW_SECURITY)
 		{
+			var->varno = context->vartrans[var->varno];
 			var->varattno = lookup_artificial_column(context->root,
 													 rte, var->varattno);
 		}
-		else if (rte->rtekind == RTE_RELATION && rte->inh)
+		else
 		{
+			Assert(rte->inh);
+
 			foreach (cell, context->root->append_rel_list)
 			{
 				AppendRelInfo  *appinfo = lfirst(cell);
 				RangeTblEntry  *child_rte;
 
 				if (appinfo->parent_relid != var->varno)
+					continue;
+
+				if (var->varattno > InvalidAttrNumber)
 					continue;
 
 				child_rte = rt_fetch(appinfo->child_relid,
@@ -216,7 +227,16 @@ fixup_varnode_walker(Node *node, fixup_varnode_context *context)
 					(void) lookup_artificial_column(context->root,
 													child_rte, var->varattno);
 			}
+			var->varno = context->vartrans[var->varno];
 		}
+	}
+	else if (IsA(node, RangeTblRef))
+	{
+		RangeTblRef  *rtr = (RangeTblRef *) node;
+
+		if (context->varlevelsup == 0 &&
+			context->vartrans[rtr->rtindex] != 0)
+			rtr->rtindex = context->vartrans[rtr->rtindex];
 	}
 	else if (IsA(node, Query))
 	{
@@ -263,57 +283,6 @@ check_infinite_recursion(PlannerInfo *root, Oid relid)
 }
 
 /*
- * fixup_plan_rowmark
- *
- * Push down the given PlanRowMark into row-security subquery.
- */
-static void
-fixup_plan_rowmark(RangeTblEntry *rte, PlanRowMark *rowmark)
-{
-	Query		   *subqry = rte->subquery;
-	RangeTblEntry  *subrte;
-	TargetEntry	   *subtle;
-
-	Assert(!rowmark->isParent);
-#if 1
-	if (rowmark->markType == ROW_MARK_EXCLUSIVE ||
-		rowmark->markType == ROW_MARK_SHARE)
-	{
-		RowMarkClause  *rclause = makeNode(RowMarkClause);
-
-		rclause->rti = (Index) 1;
-		if (rowmark->markType == ROW_MARK_EXCLUSIVE)
-			rclause->forUpdate = true;
-		else
-			rclause->forUpdate = false;
-		rclause->noWait = rowmark->noWait;
-		rclause->pushedDown = true;
-
-		subqry->rowMarks = lappend(subqry->rowMarks, rclause);
-	}
-#endif
-	rowmark->markType = ROW_MARK_REFERENCE;
-
-	/*
-	 * Addition of artificial columns relevant to 'ctid' and 'tableoid'
-	 * to be required for row-level locks.
-	 */
-	subrte = rt_fetch(1, subqry->rtable);
-
-	subtle = make_artificial_column(subrte, SelfItemPointerAttributeNumber);
-	subtle->resno = list_length(subqry->targetList) + 1;
-	subqry->targetList = lappend(subqry->targetList, subtle);
-	rte->eref->colnames = lappend(rte->eref->colnames,
-		makeString(pstrdup(subtle->resname)));
-
-	subtle = make_artificial_column(subrte, TableOidAttributeNumber);
-	subtle->resno = list_length(subqry->targetList) + 1;
-	subqry->targetList = lappend(subqry->targetList, subtle);
-	rte->eref->colnames = lappend(rte->eref->colnames,
-		makeString(pstrdup(subtle->resname)));
-}
-
-/*
  * expand_rtentry_with_policy
  *
  * It extends a range-table entry of row-security sub-query with supplied
@@ -326,15 +295,17 @@ fixup_plan_rowmark(RangeTblEntry *rte, PlanRowMark *rowmark)
  * be adjusted to reference this sub-query instead. walker
  *
  */
-static void
-expand_rtentry_with_policy(PlannerInfo *root,
-						   Index rtindex, Expr *qual, int flags)
+static Index
+expand_rtentry_with_policy(PlannerInfo *root, Index rtindex,
+						   Expr *qual, int flags)
 {
-	RangeTblEntry  *rte = rt_fetch(rtindex, root->parse->rtable);
+	Query		   *parse = root->parse;
+	RangeTblEntry  *rte = rt_fetch(rtindex, parse->rtable);
 	Query		   *subqry;
 	RangeTblEntry  *subrte;
 	RangeTblRef	   *subrtr;
 	TargetEntry	   *subtle;
+	RangeTblEntry  *newrte;
 	HeapTuple		tuple;
 	AttrNumber		nattrs;
 	AttrNumber		attnum;
@@ -388,25 +359,31 @@ expand_rtentry_with_policy(PlannerInfo *root,
 	}
 	subqry->targetList = targetList;
 
-	/* Replace the original RengeTblEntry by sub-query */
-	rte->rtekind = RTE_SUBQUERY;
-	rte->subquery = subqry;
-	rte->security_barrier = true;
-	rte->relid_orig = rte->relid;
-	rte->relid = InvalidOid;
+	/* Expand RengeTblEntry with this sub-query */
+	newrte = makeNode(RangeTblEntry);
+	newrte->rtekind = RTE_SUBQUERY;
+	newrte->subquery = subqry;
+	newrte->security_barrier = true;
+	newrte->rowsec_relid = rte->relid;
+	newrte->eref = makeAlias(get_rel_name(rte->relid), colNameList);
 
-	/* no permission checks on subquery itself */
-	rte->requiredPerms = 0;
-	rte->checkAsUser = InvalidOid;
-	rte->selectedCols = NULL;
-	rte->modifiedCols = NULL;
+	parse->rtable = lappend(parse->rtable, newrte);
 
-	rte->eref = makeAlias(get_rel_name(rte->relid_orig), colNameList);
-
-	/* Push-down of PlanRowMark if needed */
+	/* Push-down rowmark, if needed */
 	rowmark = get_plan_rowmark(root->rowMarks, rtindex);
 	if (rowmark)
-		fixup_plan_rowmark(rte, rowmark);
+	{
+		/*
+		 * XXX - In case of inherited children, rti/prti of rowmark shall
+		 * be fixed up later.
+		 */
+		if (rowmark->rti == rowmark->prti)
+			rowmark->rti = rowmark->prti = list_length(parse->rtable);
+
+		lookup_artificial_column(root, newrte, SelfItemPointerAttributeNumber);
+		lookup_artificial_column(root, newrte, TableOidAttributeNumber);
+	}
+	return list_length(parse->rtable);
 }
 
 /*
@@ -545,7 +522,103 @@ copy_row_security_policy(CopyStmt *stmt, Relation rel, List *attnums)
 }
 
 static bool
-apply_row_security_recursive(PlannerInfo *root, Node *jtnode)
+apply_row_security_relation(PlannerInfo *root, Index *vartrans,
+							CmdType cmd, Index rtindex)
+{
+	Query		   *parse = root->parse;
+	RangeTblEntry  *rte = rt_fetch(rtindex, parse->rtable);
+	bool			result = false;
+
+	if (!rte->inh)
+	{
+		Relation	rel;
+		Expr	   *qual;
+		int			flags = 0;
+
+		rel = heap_open(rte->relid, NoLock);
+		qual = pull_row_security_policy(cmd, rel, &flags);
+		if (qual)
+		{
+			vartrans[rtindex]
+				= expand_rtentry_with_policy(root, rtindex, qual, flags);
+			result = true;
+		}
+		heap_close(rel, NoLock);
+	}
+	else
+	{
+		ListCell   *lc1, *lc2;
+
+		foreach (lc1, root->append_rel_list)
+		{
+			AppendRelInfo  *apinfo = lfirst(lc1);
+
+			if (apinfo->parent_relid != rtindex)
+				continue;
+
+			if (apply_row_security_relation(root, vartrans, cmd,
+											apinfo->child_relid))
+				result = true;
+		}
+
+		if (result)
+		{
+			RangeTblEntry  *rte_new = copyObject(rte);
+			PlanRowMark	   *rowmark;
+			Index			rtindex_new;
+
+			parse->rtable = lappend(parse->rtable, rte_new);
+			rtindex_new = list_length(parse->rtable);
+			vartrans[rtindex] = rtindex_new;
+
+			rowmark = get_plan_rowmark(root->rowMarks, rtindex);
+			if (rowmark)
+			{
+				Assert(rowmark->rti == rowmark->prti);
+				rowmark->rti = rowmark->prti = rtindex_new;
+			}
+
+			foreach (lc1, root->append_rel_list)
+			{
+				AppendRelInfo  *apinfo = lfirst(lc1);
+				AppendRelInfo  *apinfo_new;
+
+				if (apinfo->parent_relid != rtindex)
+					continue;
+
+				if (vartrans[apinfo->child_relid] == 0)
+				{
+					rte_new = copyObject(rt_fetch(apinfo->child_relid,
+												  parse->rtable));
+					parse->rtable = lappend(parse->rtable, rte_new);
+
+					apinfo_new = copyObject(apinfo);
+					apinfo_new->parent_relid = rtindex_new;
+					apinfo_new->child_relid = list_length(parse->rtable);
+					foreach (lc2, apinfo_new->translated_vars)
+					{
+						Var	   *var = lfirst(lc2);
+
+						var->varno = apinfo_new->child_relid;
+					}
+					vartrans[apinfo->child_relid] = apinfo_new->child_relid;
+				}
+				rowmark = get_plan_rowmark(root->rowMarks,
+										   apinfo->child_relid);
+				if (rowmark)
+				{
+					Assert(rowmark->prti == rtindex);
+					rowmark->prti = rtindex_new;
+					rowmark->rti = vartrans[apinfo->child_relid];
+				}
+			}
+		}
+	}
+	return result;
+}
+
+static bool
+apply_row_security_recursive(PlannerInfo *root, Index *vartrans, Node *jtnode)
 {
 	bool	result = false;
 
@@ -556,18 +629,16 @@ apply_row_security_recursive(PlannerInfo *root, Node *jtnode)
 		Index			rtindex = ((RangeTblRef *) jtnode)->rtindex;
 		Query		   *parse = root->parse;
 		RangeTblEntry  *rte = rt_fetch(rtindex, parse->rtable);
-		Relation		rel;
-		Expr		   *qual;
 		CmdType			cmd;
-		ListCell	   *cell;
 
 		/* Only relation can have row-security policy */
 		if (rte->rtekind != RTE_RELATION)
 			return false;
 
 		/*
-		 * It does not make sense to apply row-security policy on
-		 * the relation underlying row-security sub-query
+		 * Prevents infinite recursion. Please note that rtindex == 1
+		 * of the row-security subquery is a relation being already
+		 * processed on the upper level.
 		 */
 		if (parse->querySource == QSRC_ROW_SECURITY && rtindex == 1)
 			return false;
@@ -578,67 +649,8 @@ apply_row_security_recursive(PlannerInfo *root, Node *jtnode)
 		else
 			cmd = CMD_SELECT;
 
-		if (!rte->inh)
-		{
-			/*
-			 * A simple case - If referenced relation has no inherited
-			 * children, all we need to do is 
-			 *
-			 *
-			 *
-			 */
-			int		flags = 0;
-
-			rel = heap_open(rte->relid, NoLock);
-
-			qual = pull_row_security_policy(cmd, rel, &flags);
-			if (qual)
-			{
-				//rowmark = get_plan_rowmark(root->rowMarks, rtindex);
-				expand_rtentry_with_policy(root, rtindex, qual, flags);
-				//rowmark->markType = ROW_MARK_COPY;
-				result = true;
-			}
-			heap_close(rel, NoLock);
-		}
-		else
-		{
-			/*
-			 * In case when 
-			 *
-			 *
-			 *
-			 *
-			 */
-			foreach (cell, root->append_rel_list)
-			{
-				AppendRelInfo  *apinfo = lfirst(cell);
-				RangeTblEntry  *child_rte;
-				int				flags = 0;
-
-				if (apinfo->parent_relid != rtindex)
-					continue;
-
-				child_rte = rt_fetch(apinfo->child_relid, parse->rtable);
-				Assert(!child_rte->inh);
-				if (child_rte->rtekind != RTE_RELATION)
-					continue;
-
-				rel = heap_open(child_rte->relid, NoLock);
-
-				qual = pull_row_security_policy(cmd, rel, &flags);
-				if (qual)
-				{
-					//rowmark = get_plan_rowmark(root->rowMarks,
-					//						   apinfo->child_relid);
-					expand_rtentry_with_policy(root, apinfo->child_relid,
-											   qual, flags);
-					//rowmark->markType = ROW_MARK_COPY;
-					result = true;
-				}
-				heap_close(rel, NoLock);
-			}
-		}
+		/* Try to apply row-security policy, if configured */
+		result = apply_row_security_relation(root, vartrans, cmd, rtindex);
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
@@ -647,7 +659,7 @@ apply_row_security_recursive(PlannerInfo *root, Node *jtnode)
 
 		foreach (l, f->fromlist)
 		{
-			if (apply_row_security_recursive(root, lfirst(l)))
+			if (apply_row_security_recursive(root, vartrans, lfirst(l)))
 				result = true;
 		}
 	}
@@ -655,9 +667,9 @@ apply_row_security_recursive(PlannerInfo *root, Node *jtnode)
 	{
 		JoinExpr   *j = (JoinExpr *) jtnode;
 
-		if (apply_row_security_recursive(root, j->larg))
+		if (apply_row_security_recursive(root, vartrans, j->larg))
 			result = true;
-		if (apply_row_security_recursive(root, j->rarg))
+		if (apply_row_security_recursive(root, vartrans, j->rarg))
 			result = true;
 	}
 	else
@@ -694,6 +706,7 @@ apply_row_security_policy(PlannerInfo *root)
 	Query	   *parse = root->parse;
 	Oid			curr_userid;
 	int			curr_seccxt;
+	Index	   *vartrans;
 
 	/*
 	 * Mode checks. In case when SECURITY_ROW_LEVEL_DISABLED is set,
@@ -704,7 +717,8 @@ apply_row_security_policy(PlannerInfo *root)
 	if (curr_seccxt & SECURITY_ROW_LEVEL_DISABLED)
 		return;
 
-	if (apply_row_security_recursive(root, (Node *)parse->jointree))
+	vartrans = palloc0(sizeof(Index) * (list_length(parse->rtable) + 1));
+	if (apply_row_security_recursive(root, vartrans, (Node *)parse->jointree))
 	{
 		PlannerGlobal  *glob = root->glob;
 		PlanInvalItem  *pi_item;
@@ -739,9 +753,11 @@ apply_row_security_policy(PlannerInfo *root)
 		 */
 		context.root = root;
 		context.varlevelsup = 0;
+		context.vartrans = vartrans;
 		query_tree_walker(parse,
 						  fixup_varnode_walker,
 						  (void *) &context,
 						  QTW_IGNORE_RETURNING);
 	}
+	pfree(vartrans);
 }

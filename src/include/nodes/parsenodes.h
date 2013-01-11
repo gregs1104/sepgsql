@@ -717,9 +717,12 @@ typedef struct RangeTblEntry
 	 */
 	Query	   *subquery;		/* the sub-query */
 	bool		security_barrier;		/* is from security_barrier view? */
-	Oid			relid_orig;		/* OID of the relation, if this sub-query
-								 * was originated from a regular relation,
-								 * then, replaced by row-security feature */
+	Oid			rowsec_relid;	/* OID of the original relation, if this
+								 * sub-query originated from row-security
+								 * policy on the relation. Elsewhere, it
+								 * should be InvalidOid.
+								 */
+
 	/*
 	 * Fields valid for a join RTE (else NULL/zero):
 	 *

@@ -55,7 +55,6 @@ typedef struct
 {
 	PlannerInfo *root;
 	AppendRelInfo *appinfo;
-	bool		in_returning;
 } adjust_appendrel_attrs_context;
 
 static Plan *recurse_set_operations(Node *setOp, PlannerInfo *root,
@@ -1595,7 +1594,6 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 
 	context.root = root;
 	context.appinfo = appinfo;
-	context.in_returning = false;
 
 	/*
 	 * Must be prepared to start with a Query or a bare expression tree.
@@ -1607,26 +1605,7 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 		newnode = query_tree_mutator((Query *) node,
 									 adjust_appendrel_attrs_mutator,
 									 (void *) &context,
-									 QTW_IGNORE_RC_SUBQUERIES |
-									 QTW_IGNORE_RETURNING);
-		/*
-		 * In case when row-security policy was applied on some child
-		 * relations, RETURNING clause needs to be handled in a special
-		 * way, because Var node of RETURNING clause points a certain 
-		 * field on "raw" relations, unlike scanning stage. If relation
-		 * has row-security policy, its RangeTblEntry was replaced with
-		 * a sub-query in earlier optimization stage, thus, references
-		 * to system columns will have different resource number of
-		 * TargetEntry on behalf of underlying system column.
-		 * So, we don't need to adjust attribute number of system column
-		 * in the RETURNING clause, even if Var node tries to reference
-		 * row-security sub-query.
-		 */
-		context.in_returning = true;
-		newnode->returningList =
-			(List *) expression_tree_mutator((Node *) newnode->returningList,
-											 adjust_appendrel_attrs_mutator,
-											 (void *) &context);
+									 QTW_IGNORE_RC_SUBQUERIES);
 		if (newnode->resultRelation == appinfo->parent_relid)
 		{
 			newnode->resultRelation = appinfo->child_relid;
@@ -1682,8 +1661,8 @@ fixup_var_on_rls_subquery(RangeTblEntry *rte, Var *var)
 		else
 			Assert(IsA(subtle->expr, Const));
 	}
-	elog(ERROR, "could not find artificial column of %d in relation %s",
-		 var->varattno, get_rel_name(rte->relid_orig));
+	elog(ERROR, "could not find artificial column of %d, relid %u",
+		 var->varattno, var->varno);
 	return NULL;
 }
 
@@ -1731,8 +1710,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 					Query          *parse = context->root->parse;
 					RangeTblEntry  *rte = rt_fetch(appinfo->child_relid,
 												   parse->rtable);
-					if (!context->in_returning &&
-						rte->rtekind == RTE_SUBQUERY &&
+					if (rte->rtekind == RTE_SUBQUERY &&
 						rte->subquery->querySource == QSRC_ROW_SECURITY)
 						var = (Var *)fixup_var_on_rls_subquery(rte, var);
 
@@ -1785,8 +1763,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 				Query		   *parse = context->root->parse;
 				RangeTblEntry  *rte = rt_fetch(appinfo->child_relid,
 											   parse->rtable);
-				if (!context->in_returning &&
-					rte->rtekind == RTE_SUBQUERY &&
+				if (rte->rtekind == RTE_SUBQUERY &&
 					rte->subquery->querySource == QSRC_ROW_SECURITY)
 					return fixup_var_on_rls_subquery(rte, var);
 			}
