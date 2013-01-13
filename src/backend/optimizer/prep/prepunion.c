@@ -55,6 +55,7 @@ typedef struct
 {
 	PlannerInfo *root;
 	AppendRelInfo *appinfo;
+	bool		in_returning;
 } adjust_appendrel_attrs_context;
 
 static Plan *recurse_set_operations(Node *setOp, PlannerInfo *root,
@@ -1594,6 +1595,7 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 
 	context.root = root;
 	context.appinfo = appinfo;
+	context.in_returning = false;
 
 	/*
 	 * Must be prepared to start with a Query or a bare expression tree.
@@ -1605,10 +1607,27 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 		newnode = query_tree_mutator((Query *) node,
 									 adjust_appendrel_attrs_mutator,
 									 (void *) &context,
-									 QTW_IGNORE_RC_SUBQUERIES);
+									 QTW_IGNORE_RC_SUBQUERIES |
+									 QTW_IGNORE_RETURNING);
+		/*
+		 * XXX - Returning clause on the relation being replace with
+		 * row-security subquery shall be handled in a special way.
+		 * Var references to system column or whole-row reference should
+		 * be adjusted to reference artificial columns on behalf of the
+		 * underlying these columns, but RETURNING clause is an exception
+		 * because its Var-nodes are evaluated on the "raw" resule relation
+		 * in the modify table operation.
+		 */
+		context.in_returning = true;
+		newnode->returningList = (List *)
+			expression_tree_mutator((Node *) newnode->returningList,
+									adjust_appendrel_attrs_mutator,
+									(void *) &context);
 		if (newnode->resultRelation == appinfo->parent_relid)
 		{
-			newnode->resultRelation = appinfo->child_relid;
+			newnode->resultRelation = (appinfo->child_result > 0 ?
+									   appinfo->child_result :
+									   appinfo->child_relid);
 			/* Fix tlist resnos too, if it's inherited UPDATE */
 			if (newnode->commandType == CMD_UPDATE)
 				newnode->targetList =
@@ -1624,7 +1643,7 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 }
 
 static Node *
-fixup_var_on_rls_subquery(RangeTblEntry *rte, Var *var)
+fixup_var_on_rowsec_subquery(RangeTblEntry *rte, Var *var)
 {
 	ListCell   *cell;
 
@@ -1681,7 +1700,10 @@ adjust_appendrel_attrs_mutator(Node *node,
 		if (var->varlevelsup == 0 &&
 			var->varno == appinfo->parent_relid)
 		{
-			var->varno = appinfo->child_relid;
+			var->varno = (context->in_returning &&
+						  appinfo->child_result > 0 ?
+						  appinfo->child_result :
+						  appinfo->child_relid);
 			var->varnoold = appinfo->child_relid;
 			if (var->varattno > 0)
 			{
@@ -1710,9 +1732,10 @@ adjust_appendrel_attrs_mutator(Node *node,
 					Query          *parse = context->root->parse;
 					RangeTblEntry  *rte = rt_fetch(appinfo->child_relid,
 												   parse->rtable);
-					if (rte->rtekind == RTE_SUBQUERY &&
+					if (!context->in_returning &&
+						rte->rtekind == RTE_SUBQUERY &&
 						rte->subquery->querySource == QSRC_ROW_SECURITY)
-						var = (Var *)fixup_var_on_rls_subquery(rte, var);
+						var = (Var *)fixup_var_on_rowsec_subquery(rte, var);
 
 					Assert(var->vartype == appinfo->parent_reltype);
 					if (appinfo->parent_reltype != appinfo->child_reltype)
@@ -1763,9 +1786,10 @@ adjust_appendrel_attrs_mutator(Node *node,
 				Query		   *parse = context->root->parse;
 				RangeTblEntry  *rte = rt_fetch(appinfo->child_relid,
 											   parse->rtable);
-				if (rte->rtekind == RTE_SUBQUERY &&
+				if (!context->in_returning &&
+					rte->rtekind == RTE_SUBQUERY &&
 					rte->subquery->querySource == QSRC_ROW_SECURITY)
-					return fixup_var_on_rls_subquery(rte, var);
+					return fixup_var_on_rowsec_subquery(rte, var);
 			}
 		}
 		return (Node *) var;

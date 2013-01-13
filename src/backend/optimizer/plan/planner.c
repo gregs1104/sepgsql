@@ -934,7 +934,10 @@ inheritance_planner(PlannerInfo *root)
 		root->init_plans = subroot.init_plans;
 
 		/* Build list of target-relation RT indexes */
-		resultRelations = lappend_int(resultRelations, appinfo->child_relid);
+		resultRelations = lappend_int(resultRelations,
+									  (appinfo->child_result > 0 ?
+									   appinfo->child_result :
+									   appinfo->child_relid));
 
 		/* Build list of per-relation RETURNING targetlists */
 		if (parse->returningList)

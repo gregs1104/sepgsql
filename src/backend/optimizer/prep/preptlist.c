@@ -34,8 +34,6 @@
 #include "parser/parse_coerce.h"
 #include "utils/rel.h"
 
-static List *expand_targetlist(List *tlist, int command_type,
-							   Index result_relation, List *range_table);
 /*
  * lookup_varattno
  *
@@ -87,7 +85,6 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 {
 	Query	   *parse = root->parse;
 	int			result_relation = parse->resultRelation;
-	int			result_source = parse->resultSource;
 	List	   *range_table = parse->rtable;
 	CmdType		command_type = parse->commandType;
 	ListCell   *lc;
@@ -115,9 +112,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	 */
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
 		tlist = expand_targetlist(tlist, command_type,
-								  (result_source != 0 ?
-								   result_source : result_relation),
-								  range_table);
+								  result_relation, range_table);
 
 	/*
 	 * Add necessary junk columns for rowmarked rels.  These values are needed
@@ -238,11 +233,10 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  *	  add targetlist entries for any missing attributes, and ensure the
  *	  non-junk attributes appear in proper field order.
  */
-static List *
+List *
 expand_targetlist(List *tlist, int command_type,
 				  Index result_relation, List *range_table)
 {
-	RangeTblEntry  *rte;
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
 	Relation	rel;
