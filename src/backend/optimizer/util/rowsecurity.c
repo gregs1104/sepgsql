@@ -200,7 +200,7 @@ fixup_varnode_walker(Node *node, fixup_varnode_context *context)
 			if (rte->rtekind == RTE_SUBQUERY &&
 				rte->subquery->querySource == QSRC_ROW_SECURITY)
 			{
-				var->varno = context->vartrans[var->varno];
+				var->varno = var->varnoold = context->vartrans[var->varno];
 				var->varattno = lookup_artificial_column(context->root,
 														 rte, var->varattno);
 			}
@@ -563,13 +563,15 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 			if (apply_row_security_relation(root, vartrans, cmd,
 											apinfo->child_relid))
 			{
-				apinfo->child_result = apinfo->child_relid;
+				if (parse->resultRelation == rtindex)
+					apinfo->child_result = apinfo->child_relid;
 				apinfo->child_relid = vartrans[apinfo->child_relid];
 				foreach (lc2, apinfo->translated_vars)
 				{
 					Var    *var = lfirst(lc2);
 
-					var->varno = apinfo->child_relid;
+					if (var)
+						var->varno = apinfo->child_relid;
 				}
 				result = true;
 			}
@@ -612,7 +614,6 @@ apply_row_security_recursive(PlannerInfo *root, Index *vartrans, Node *jtnode)
 
 		/* Try to apply row-security policy, if configured */
 		result = apply_row_security_relation(root, vartrans, cmd, rtindex);
-
 
 		/*
 		 * XXX - 

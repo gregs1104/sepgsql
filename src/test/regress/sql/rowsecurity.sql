@@ -280,39 +280,6 @@ EXPLAIN (costs off) DELETE FROM t1 WHERE f_leak(b);
 DELETE FROM only t1 WHERE f_leak(b) RETURNING oid, *, t1;
 DELETE FROM t1 WHERE f_leak(b) RETURNING oid, *, t1;
 
--- row-security check on row insert / update
-INSERT INTO t1(a,b) VALUES (10, 'ABCD');		-- OK
-INSERT INTO t1(a,b) VALUES (11, 'EFGI');		-- fail
-INSERT INTO t2(a,b) VALUES (11, 'HIJL');		-- OK
-
-UPDATE t1 SET a = a + 2;        -- OK
-UPDATE t1 SET a = a + 1;        -- fail
-
--- also, in case when row-security contains SubLink node
-ALTER TABLE t3 SET ROW SECURITY FOR ALL TO (t3.a in (SELECT t2.a FROM t2));
-INSERT INTO t3(a,b) VALUES (11, 'foobar');    -- fail
-INSERT INTO t3(a,b) VALUES (13, 'foobaz');    -- OK
-INSERT INTO t2(a,b) VALUES (11, 'hoge');      -- OK
-INSERT INTO t3(a,b) VALUES (11, 'foobar');    -- OK
-
-UPDATE t3 SET a = a + 2;    -- fail
-UPDATE t3 SET a = a + 2 WHERE b = 'foobar';    -- OK
-
--- also, COPY TO command to be dealt as INSERT
-COPY t2 FROM stdin;    -- fail
-11	 xxx	 110.0
-12	 yyy	 120.0
-13	 zzz	 130.0
-\.
-
-COPY t2 FROM stdin;    -- OK
-11	 XXX	 110.0
-13	 ZZZ	 130.0
-\.
-
-RESET SESSION AUTHORIZATION;
-SELECT tableoid::regclass, * FROM t1;
-
 --
 -- Test psql \dt+ command
 --
