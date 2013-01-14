@@ -61,8 +61,8 @@ INSERT INTO document VALUES
     ( 7, 33, 2, 'rls_regress_user2', 'great technology book'),
     ( 8, 44, 1, 'rls_regress_user2', 'great manga');
 -- user's security level must higher than or equal to document's one
-ALTER TABLE document SET ROW SECURITY
-    (dlevel <= (SELECT seclv FROM uaccount WHERE pguser = current_user));
+ALTER TABLE document SET ROW SECURITY FOR ALL
+    TO (dlevel <= (SELECT seclv FROM uaccount WHERE pguser = current_user));
 -- viewpoint from rls_regress_user1
 SET SESSION AUTHORIZATION rls_regress_user1;
 SELECT * FROM document WHERE f_leak(dtitle);
@@ -164,12 +164,12 @@ EXPLAIN (costs off) SELECT * FROM document NATURAL JOIN category WHERE f_leak(dt
 (11 rows)
 
 -- only owner can change row-level security
-ALTER TABLE document SET ROW SECURITY (true);     -- fail
+ALTER TABLE document SET ROW SECURITY FOR ALL TO (true);     -- fail
 ERROR:  must be owner of relation document
-ALTER TABLE document RESET ROW SECURITY;          -- fail
+ALTER TABLE document RESET ROW SECURITY FOR ALL;             -- fail
 ERROR:  must be owner of relation document
 SET SESSION AUTHORIZATION rls_regress_user0;
-ALTER TABLE document SET ROW SECURITY (dauthor = current_user);
+ALTER TABLE document SET ROW SECURITY FOR ALL TO (dauthor = current_user);
 -- viewpoint from rls_regress_user1 again
 SET SESSION AUTHORIZATION rls_regress_user1;
 SELECT * FROM document WHERE f_leak(dtitle);
@@ -249,10 +249,10 @@ EXPLAIN (costs off) SELECT * FROM document NATURAL JOIN category WHERE f_leak(dt
 
 -- interaction of FK/PK constraints
 SET SESSION AUTHORIZATION rls_regress_user0;
-ALTER TABLE category SET ROW SECURITY
-    (CASE WHEN current_user = 'rls_regress_user1' THEN cid IN (11, 33)
-     WHEN current_user = 'rls_regress_user2' THEN cid IN (22, 44)
-     ELSE false END);
+ALTER TABLE category SET ROW SECURITY FOR ALL
+    TO (CASE WHEN current_user = 'rls_regress_user1' THEN cid IN (11, 33)
+        WHEN current_user = 'rls_regress_user2' THEN cid IN (22, 44)
+        ELSE false END);
 -- cannot delete PK referenced by invisible FK
 SET SESSION AUTHORIZATION rls_regress_user1;
 SELECT * FROM document d full outer join category c on d.cid = c.cid;
@@ -319,8 +319,8 @@ COPY t2 FROM stdin WITH (oids);
 CREATE TABLE t3 (c text, b text, a int) WITH OIDS;
 ALTER TABLE t3 INHERIT t1;
 COPY t3(a,b,c) FROM stdin WITH (oids);
-ALTER TABLE t1 SET ROW SECURITY (a % 2 = 0);	-- be even number
-ALTER TABLE t2 SET ROW SECURITY (a % 2 = 1);	-- be odd number
+ALTER TABLE t1 SET ROW SECURITY FOR ALL TO (a % 2 = 0); -- be even number
+ALTER TABLE t2 SET ROW SECURITY FOR ALL TO (a % 2 = 1); -- be odd number
 SELECT * FROM t1;
  a |  b  
 ---+-----
@@ -451,21 +451,19 @@ SELECT * FROM t1 FOR SHARE;
 (7 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1 FOR SHARE;
-                      QUERY PLAN                       
--------------------------------------------------------
+                   QUERY PLAN                    
+-------------------------------------------------
  LockRows
    ->  Result
          ->  Append
                ->  Subquery Scan on t1
-                     ->  LockRows
-                           ->  Seq Scan on t1 t1_1
-                                 Filter: ((a % 2) = 0)
+                     ->  Seq Scan on t1 t1_1
+                           Filter: ((a % 2) = 0)
                ->  Subquery Scan on t2
-                     ->  LockRows
-                           ->  Seq Scan on t2 t2_1
-                                 Filter: ((a % 2) = 1)
+                     ->  Seq Scan on t2 t2_1
+                           Filter: ((a % 2) = 1)
                ->  Seq Scan on t3
-(12 rows)
+(10 rows)
 
 SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 NOTICE:  f_leak => bbb
@@ -487,24 +485,22 @@ NOTICE:  f_leak => zzz
 (7 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
-                      QUERY PLAN                       
--------------------------------------------------------
+                   QUERY PLAN                    
+-------------------------------------------------
  LockRows
    ->  Result
          ->  Append
                ->  Subquery Scan on t1
                      Filter: f_leak(t1.b)
-                     ->  LockRows
-                           ->  Seq Scan on t1 t1_1
-                                 Filter: ((a % 2) = 0)
+                     ->  Seq Scan on t1 t1_1
+                           Filter: ((a % 2) = 0)
                ->  Subquery Scan on t2
                      Filter: f_leak(t2.b)
-                     ->  LockRows
-                           ->  Seq Scan on t2 t2_1
-                                 Filter: ((a % 2) = 1)
+                     ->  Seq Scan on t2 t2_1
+                           Filter: ((a % 2) = 1)
                ->  Seq Scan on t3
                      Filter: f_leak(b)
-(15 rows)
+(13 rows)
 
 --
 -- COPY TO statement 
@@ -536,13 +532,13 @@ INSERT INTO s1 (SELECT x, md5(x::text) FROM generate_series(-10,10) x);
 CREATE TABLE s2 (x int, y text);
 INSERT INTO s2 (SELECT x, md5(x::text) FROM generate_series(-6,6) x);
 CREATE VIEW v2 AS SELECT * FROM s2 WHERE y like '%af%';
-ALTER TABLE s1 SET ROW SECURITY
-   (a in (select x from s2 where y like '%2f%'));
-ALTER TABLE s2 SET ROW SECURITY
-   (x in (select a from s1 where b like '%22%'));
+ALTER TABLE s1 SET ROW SECURITY FOR ALL
+   TO (a in (select x from s2 where y like '%2f%'));
+ALTER TABLE s2 SET ROW SECURITY FOR ALL
+   TO (x in (select a from s1 where b like '%22%'));
 SELECT * FROM s1 WHERE f_leak(b);	-- fail (infinite recursion)
 ERROR:  infinite recursion detected for relation "s1"
-ALTER TABLE s2 SET ROW SECURITY (x % 2 = 0);
+ALTER TABLE s2 SET ROW SECURITY FOR ALL TO (x % 2 = 0);
 SELECT * FROM s1 WHERE f_leak(b);	-- OK
 NOTICE:  f_leak => c81e728d9d4c2f636f067f89cc14862c
 NOTICE:  f_leak => a87ff679a2f3e71d9181a67b7542122c
@@ -568,8 +564,8 @@ EXPLAIN SELECT * FROM only s1 WHERE f_leak(b);
                                  Filter: ((x % 2) = 0)
 (11 rows)
 
-ALTER TABLE s1 SET ROW SECURITY
-   (a in (select x from v2));		-- using VIEW in RLS policy
+ALTER TABLE s1 SET ROW SECURITY FOR ALL
+   TO (a in (select x from v2));		-- using VIEW in RLS policy
 SELECT * FROM s1 WHERE f_leak(b);	-- OK
 NOTICE:  f_leak => 0267aaf632e87a63288a08331f22c7c3
 NOTICE:  f_leak => 1679091c5a880faf6fb5e6087eb1b2dc
@@ -623,8 +619,8 @@ EXPLAIN (COSTS OFF) SELECT (SELECT x FROM s1 LIMIT 1) xx, * FROM s2 WHERE y like
                                          Filter: ((x % 2) = 0)
 (15 rows)
 
-ALTER TABLE s2 SET ROW SECURITY
-   (x in (select a from s1 where b like '%d2%'));
+ALTER TABLE s2 SET ROW SECURITY FOR ALL
+   TO (x in (select a from s1 where b like '%d2%'));
 SELECT * FROM s1 WHERE f_leak(b);	-- fail (infinite recursion via view)
 ERROR:  infinite recursion detected for relation "s1"
 -- prepared statement with rls_regress_user0 privilege
@@ -774,9 +770,9 @@ EXPLAIN (costs off) UPDATE t1 SET b = b || b WHERE f_leak(b);
              QUERY PLAN              
 -------------------------------------
  Update on t1
-   ->  Subquery Scan on t1
-         Filter: f_leak(t1.b)
-         ->  Seq Scan on t1 t1_1
+   ->  Subquery Scan on t1_1
+         Filter: f_leak(t1_1.b)
+         ->  Seq Scan on t1 t1_2
                Filter: ((a % 2) = 0)
    ->  Subquery Scan on t2
          Filter: f_leak(t2.b)
@@ -798,9 +794,9 @@ EXPLAIN (costs off) UPDATE only t1 SET b = b || '_updt' WHERE f_leak(b);
              QUERY PLAN              
 -------------------------------------
  Update on t1
-   ->  Subquery Scan on t1
-         Filter: f_leak(t1.b)
-         ->  Seq Scan on t1 t1_1
+   ->  Subquery Scan on t1_1
+         Filter: f_leak(t1_1.b)
+         ->  Seq Scan on t1 t1_2
                Filter: ((a % 2) = 0)
 (5 rows)
 
@@ -877,9 +873,9 @@ EXPLAIN (costs off) DELETE FROM only t1 WHERE f_leak(b);
              QUERY PLAN              
 -------------------------------------
  Delete on t1
-   ->  Subquery Scan on t1
-         Filter: f_leak(t1.b)
-         ->  Seq Scan on t1 t1_1
+   ->  Subquery Scan on t1_1
+         Filter: f_leak(t1_1.b)
+         ->  Seq Scan on t1 t1_2
                Filter: ((a % 2) = 0)
 (5 rows)
 
@@ -887,9 +883,9 @@ EXPLAIN (costs off) DELETE FROM t1 WHERE f_leak(b);
              QUERY PLAN              
 -------------------------------------
  Delete on t1
-   ->  Subquery Scan on t1
-         Filter: f_leak(t1.b)
-         ->  Seq Scan on t1 t1_1
+   ->  Subquery Scan on t1_1
+         Filter: f_leak(t1_1.b)
+         ->  Seq Scan on t1 t1_2
                Filter: ((a % 2) = 0)
    ->  Subquery Scan on t2
          Filter: f_leak(t2.b)
@@ -923,55 +919,10 @@ NOTICE:  f_leak => zzzzzz
  303 | 3 | zzzzzz | (3,zzzzzz)
 (5 rows)
 
--- row-security check on row insert / update
-INSERT INTO t1(a,b) VALUES (10, 'ABCD');		-- OK
-INSERT INTO t1(a,b) VALUES (11, 'EFGI');		-- fail
-ERROR:  new row for relation "t1" violates row-secirity
-DETAIL:  Failing row contains (11, null, EFGI).
-INSERT INTO t2(a,b) VALUES (11, 'HIJL');		-- OK
-UPDATE t1 SET a = a + 2;        -- OK
-UPDATE t1 SET a = a + 1;        -- fail
-ERROR:  new row for relation "t1" violates row-secirity
-DETAIL:  Failing row contains (13, null, ABCD).
--- also, in case when row-security contains SubLink node
-ALTER TABLE t3 SET ROW SECURITY (t3.a in (SELECT t2.a FROM t2));
-INSERT INTO t3(a,b) VALUES (11, 'foobar');    -- fail
-ERROR:  new row for relation "t3" violates row-secirity
-DETAIL:  Failing row contains (null, foobar, 11).
-INSERT INTO t3(a,b) VALUES (13, 'foobaz');    -- OK
-INSERT INTO t2(a,b) VALUES (11, 'hoge');      -- OK
-INSERT INTO t3(a,b) VALUES (11, 'foobar');    -- OK
-UPDATE t3 SET a = a + 2;    -- fail
-ERROR:  new row for relation "t3" violates row-secirity
-DETAIL:  Failing row contains (null, foobaz, 15).
-UPDATE t3 SET a = a + 2 WHERE b = 'foobar';    -- OK
--- also, COPY TO command to be dealt as INSERT
-COPY t2 FROM stdin;    -- fail
-ERROR:  new row for relation "t2" violates row-secirity
-DETAIL:  Failing row contains (12,  yyy, 120).
-CONTEXT:  COPY t2, line 2: "12	 yyy	 120.0"
-COPY t2 FROM stdin;    -- OK
-RESET SESSION AUTHORIZATION;
-SELECT tableoid::regclass, * FROM t1;
- tableoid | a  |   b    
-----------+----+--------
- t1       |  1 | aaa
- t1       |  3 | ccc
- t1       | 12 | ABCD
- t2       |  2 | bcd
- t2       |  4 | def
- t2       | 13 | HIJL
- t2       | 11 | hoge
- t2       | 11 |  XXX
- t2       | 13 |  ZZZ
- t3       | 13 | foobaz
- t3       | 13 | foobar
-(11 rows)
-
 --
 -- Test psql \dt+ command
 --
-ALTER TABLE category RESET ROW SECURITY;  -- too long qual
+ALTER TABLE category RESET ROW SECURITY FOR ALL;  -- too long qual
 \dt+
                                                                 List of relations
        Schema       |   Name   | Type  |       Owner       |    Size    | Description |                       Row-security                        
@@ -982,7 +933,7 @@ ALTER TABLE category RESET ROW SECURITY;  -- too long qual
  rls_regress_schema | s2       | table | rls_regress_user0 | 16 kB      |             | (x IN (SELECT s1.a FROM s1 WHERE (s1.b ~~ '%d2%'::text)))
  rls_regress_schema | t1       | table | rls_regress_user0 | 16 kB      |             | ((a % 2) = 0)
  rls_regress_schema | t2       | table | rls_regress_user0 | 16 kB      |             | ((a % 2) = 1)
- rls_regress_schema | t3       | table | rls_regress_user0 | 16 kB      |             | (a IN (SELECT t2.a FROM t2))
+ rls_regress_schema | t3       | table | rls_regress_user0 | 16 kB      |             | 
  rls_regress_schema | uaccount | table | rls_regress_user0 | 8192 bytes |             | 
 (8 rows)
 
