@@ -1917,6 +1917,7 @@ _outAppendRelInfo(StringInfo str, const AppendRelInfo *node)
 
 	WRITE_UINT_FIELD(parent_relid);
 	WRITE_UINT_FIELD(child_relid);
+	WRITE_UINT_FIELD(child_result);
 	WRITE_OID_FIELD(parent_reltype);
 	WRITE_OID_FIELD(child_reltype);
 	WRITE_NODE_FIELD(translated_vars);

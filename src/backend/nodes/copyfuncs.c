@@ -1930,6 +1930,7 @@ _copyAppendRelInfo(const AppendRelInfo *from)
 
 	COPY_SCALAR_FIELD(parent_relid);
 	COPY_SCALAR_FIELD(child_relid);
+	COPY_SCALAR_FIELD(child_result);
 	COPY_SCALAR_FIELD(parent_reltype);
 	COPY_SCALAR_FIELD(child_reltype);
 	COPY_NODE_FIELD(translated_vars);

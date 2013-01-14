@@ -817,6 +817,7 @@ _equalAppendRelInfo(const AppendRelInfo *a, const AppendRelInfo *b)
 {
 	COMPARE_SCALAR_FIELD(parent_relid);
 	COMPARE_SCALAR_FIELD(child_relid);
+	COMPARE_SCALAR_FIELD(child_result);
 	COMPARE_SCALAR_FIELD(parent_reltype);
 	COMPARE_SCALAR_FIELD(child_reltype);
 	COMPARE_NODE_FIELD(translated_vars);
