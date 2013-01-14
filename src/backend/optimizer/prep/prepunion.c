@@ -1628,6 +1628,7 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 			newnode->resultRelation = (appinfo->child_result > 0 ?
 									   appinfo->child_result :
 									   appinfo->child_relid);
+			newnode->sourceRelation = appinfo->child_relid;
 			/* Fix tlist resnos too, if it's inherited UPDATE */
 			if (newnode->commandType == CMD_UPDATE)
 				newnode->targetList =
@@ -1705,6 +1706,7 @@ adjust_appendrel_attrs_mutator(Node *node,
 						  appinfo->child_result :
 						  appinfo->child_relid);
 			var->varnoold = appinfo->child_relid;
+
 			if (var->varattno > 0)
 			{
 				Node	   *newnode;
@@ -1784,8 +1786,10 @@ adjust_appendrel_attrs_mutator(Node *node,
 			else
 			{
 				Query		   *parse = context->root->parse;
-				RangeTblEntry  *rte = rt_fetch(appinfo->child_relid,
-											   parse->rtable);
+				RangeTblEntry  *rte;
+
+				rte = rt_fetch(appinfo->child_relid, parse->rtable);
+
 				if (!context->in_returning &&
 					rte->rtekind == RTE_SUBQUERY &&
 					rte->subquery->querySource == QSRC_ROW_SECURITY)

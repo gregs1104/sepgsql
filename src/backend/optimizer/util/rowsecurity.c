@@ -552,6 +552,8 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 		{
 			vartrans[rtindex]
 				= expand_rtentry_with_policy(root, rtindex, qual, flags);
+			if (parse->resultRelation == rtindex)
+				parse->sourceRelation = vartrans[rtindex];
 			result = true;
 		}
 		heap_close(rel, NoLock);

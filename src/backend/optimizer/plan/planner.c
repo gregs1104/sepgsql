@@ -871,6 +871,8 @@ inheritance_planner(PlannerInfo *root)
 					newrti = list_length(subroot.parse->rtable) + 1;
 					ChangeVarNodes((Node *) subroot.parse, rti, newrti, 0);
 					ChangeVarNodes((Node *) subroot.rowMarks, rti, newrti, 0);
+					if (subroot.parse->sourceRelation == rti)
+						subroot.parse->sourceRelation = newrti;
 					rte = copyObject(rte);
 					subroot.parse->rtable = lappend(subroot.parse->rtable,
 													rte);

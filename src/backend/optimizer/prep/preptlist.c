@@ -112,8 +112,13 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	 * 10/94
 	 */
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
+	{
+		Index	source_relation = (parse->sourceRelation > 0 ?
+								   parse->sourceRelation :
+								   result_relation);
 		tlist = expand_targetlist(tlist, command_type,
-								  result_relation, range_table);
+								  source_relation, range_table);
+	}
 
 	/*
 	 * Add necessary junk columns for rowmarked rels.  These values are needed

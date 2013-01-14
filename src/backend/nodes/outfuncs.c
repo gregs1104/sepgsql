@@ -2231,6 +2231,7 @@ _outQuery(StringInfo str, const Query *node)
 		appendStringInfo(str, " :utilityStmt <>");
 
 	WRITE_INT_FIELD(resultRelation);
+	WRITE_INT_FIELD(sourceRelation);
 	WRITE_BOOL_FIELD(hasAggs);
 	WRITE_BOOL_FIELD(hasWindowFuncs);
 	WRITE_BOOL_FIELD(hasSubLinks);
