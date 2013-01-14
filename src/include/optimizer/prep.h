@@ -42,9 +42,6 @@ extern List *preprocess_targetlist(PlannerInfo *root, List *tlist);
 
 extern PlanRowMark *get_plan_rowmark(List *rowmarks, Index rtindex);
 
-extern List *expand_targetlist(List *tlist, int command_type,
-							   Index result_relation, List *range_table);
-
 /*
  * prototypes for prepunion.c
  */

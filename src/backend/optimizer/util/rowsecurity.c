@@ -257,6 +257,74 @@ fixup_varnode_walker(Node *node, fixup_varnode_context *context)
 }
 
 /*
+ * complement_update_targetlist
+ *
+ * It adds missing columns on target-list of UPDATE query, if user gives
+ * new values on a partial columns only.
+ */
+static void
+complement_update_targetlist(Query *parse)
+{
+	Relation	rel;
+	Oid			relid;
+	List	   *targetListOld = copyObject(parse->targetList);
+	List	   *targetListNew = NIL;
+	int			i, nattrs;
+
+	relid = getrelid(parse->resultRelation, parse->rtable);
+	rel = heap_open(relid, NoLock);
+	nattrs = RelationGetNumberOfAttributes(rel);
+	for (i=0; i < nattrs; i++)
+	{
+		Form_pg_attribute	attr = RelationGetDescr(rel)->attrs[i];
+		TargetEntry	   *tle;
+		ListCell	   *cell;
+		ListCell	   *prev;
+
+		/* dropped columns are complemented later, at preptlist.c */
+		if (attr->attisdropped)
+			continue;
+
+		/*
+		 * Does user give new value relevant to this column
+		 */
+		prev = NULL;
+		foreach (cell, targetListOld)
+		{
+			tle = lfirst(cell);
+
+			if (!tle->resjunk && tle->resno == attr->attnum)
+			{
+				targetListNew = lappend(targetListNew, tle);
+				targetListOld = list_delete_cell(targetListOld, cell, prev);
+				break;
+			}
+			prev = cell;
+		}
+
+		/*
+		 * If not, add a dummy target-entry that just references an old-value.
+		 */
+		if (cell == NULL)
+		{
+			Expr   *new_expr = makeVar(parse->resultRelation,
+									   attr->attnum,
+									   attr->atttypid,
+									   attr->atttypmod,
+									   attr->attcollation,
+									   0);
+			tle = makeTargetEntry(new_expr, attr->attnum,
+								  pstrdup(NameStr(attr->attname)),
+								  false); 
+			targetListNew = lappend(targetListNew, tle);
+		}
+	}
+	heap_close(rel, NoLock);
+
+	parse->targetList = list_concat(targetListNew, targetListOld);
+}
+
+/*
  * check_infinite_recursion
  *
  * It is a wrong row-security configuration, if we try to expand
@@ -525,6 +593,13 @@ copy_row_security_policy(CopyStmt *stmt, Relation rel, List *attnums)
 	return true;
 }
 
+/*
+ * apply_row_security_relation
+ *
+ * It applies row-security policy on a particular relation being specified.
+ * If this relation is top of the inheritance tree, it also checks inherited
+ * children.
+ */
 static bool
 apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 							CmdType cmd, Index rtindex)
@@ -543,8 +618,8 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 		qual = pull_row_security_policy(cmd, rel, &flags);
 		if (qual)
 		{
-			vartrans[rtindex]
-				= expand_rtentry_with_policy(root, rtindex, qual, flags);
+			vartrans[rtindex] = expand_rtentry_with_policy(root, rtindex,
+														   qual, flags);
 			result = true;
 		}
 		heap_close(rel, NoLock);
@@ -580,6 +655,11 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 	return result;
 }
 
+/*
+ * apply_row_security_recursive
+ *
+ * walker on join-tree
+ */
 static bool
 apply_row_security_recursive(PlannerInfo *root, Index *vartrans, Node *jtnode)
 {
@@ -613,22 +693,22 @@ apply_row_security_recursive(PlannerInfo *root, Index *vartrans, Node *jtnode)
 			cmd = CMD_SELECT;
 
 		/* Try to apply row-security policy, if configured */
-		result = apply_row_security_relation(root, vartrans, cmd, rtindex);
+		if (apply_row_security_relation(root, vartrans, cmd, rtindex))
+		{
+			/*
+			 * XXX - In case when result relation of UPDATE has row-
+			 * security policy but user didn't give new value for all
+			 * the columns, it needs to complement the missing columns
+			 * prior to fixup_varnode_walker. Even though similar jobs
+			 * are done in preptlist.c, case handling between UPDATE on
+			 * inherited and flat tables makes code complex. So, we add
+			 * missing references here.
+			 */
+			if (cmd == CMD_UPDATE)
+				complement_update_targetlist(parse);
 
-		/*
-		 * XXX - 
-		 *
-		 *
-		 *
-		 *
-		 *
-		 *
-		 */
-		if (result && cmd == CMD_UPDATE)
-			parse->targetList = expand_targetlist(parse->targetList,
-												  parse->commandType,
-												  parse->resultRelation,
-												  parse->rtable);
+			result = true;
+		}
 	}
 	else if (IsA(jtnode, FromExpr))
 	{

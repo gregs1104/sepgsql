@@ -34,6 +34,9 @@
 #include "parser/parse_coerce.h"
 #include "utils/rel.h"
 
+static List *expand_targetlist(List *tlist, int command_type,
+							   Index result_relation, List *range_table);
+
 /*
  * lookup_varattno
  *
@@ -41,8 +44,9 @@
  * attribute. In case when the target relation is really relation,
  * we can reference arbitrary attribute (including system column)
  * without any translations. However, we have to translate varattno
- * of Vat that references sub-queries being originated from regular
- * relations with row-level security policy.
+ * of Var that references sub-queries being originated from regular
+ * relations with row-level security policy due to nature of sub-query
+ * that has no system-column.
  */
 static AttrNumber
 lookup_varattno(AttrNumber attno, Index rt_index, List *rtables)
@@ -233,7 +237,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  *	  add targetlist entries for any missing attributes, and ensure the
  *	  non-junk attributes appear in proper field order.
  */
-List *
+static List *
 expand_targetlist(List *tlist, int command_type,
 				  Index result_relation, List *range_table)
 {
