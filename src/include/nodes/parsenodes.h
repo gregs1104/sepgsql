@@ -703,13 +703,6 @@ typedef struct RangeTblEntry
 
 	/*
 	 * Fields valid for a plain relation RTE (else zero):
-	 *
-	 * XXX - Query optimizer may modify and replace RangeTblEntry on
-	 * a particular relation by sub-query, but should perform as result
-	 * relation of the query. In this case, relid field is used to track
-	 * which relation is the sub-query originated.
-	 * Right now, only row-level security feature uses this field to track
-	 * the relation-id of sub-query being originated.
 	 */
 	Oid			relid;			/* OID of the relation */
 	char		relkind;		/* relation kind (see pg_class.relkind) */
