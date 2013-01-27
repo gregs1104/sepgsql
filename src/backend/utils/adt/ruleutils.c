@@ -2857,15 +2857,27 @@ set_relation_column_names(deparse_namespace *dpns, RangeTblEntry *rte,
 		rel = relation_open(rte->relid, AccessShareLock);
 		tupdesc = RelationGetDescr(rel);
 
-		ncolumns = tupdesc->natts;
+		ncolumns = (tupdesc->natts < list_length(rte->eref->colnames)
+					? list_length(rte->eref->colnames)
+					: tupdesc->natts);
 		real_colnames = (char **) palloc(ncolumns * sizeof(char *));
 
-		for (i = 0; i < ncolumns; i++)
+		for (i = 0; i < tupdesc->natts; i++)
 		{
 			if (tupdesc->attrs[i]->attisdropped)
 				real_colnames[i] = NULL;
 			else
 				real_colnames[i] = pstrdup(NameStr(tupdesc->attrs[i]->attname));
+		}
+		/*
+		 * XXX - foreign table may have pseudo-column that has attribute
+		 * number larger than or equal with number of attributes in table
+		 * definition. So, we need to add entries for them.
+		 */
+		while (i < ncolumns)
+		{
+			real_colnames[i] = strVal(list_nth(rte->eref->colnames, i));
+			i++;
 		}
 		relation_close(rel, AccessShareLock);
 	}
