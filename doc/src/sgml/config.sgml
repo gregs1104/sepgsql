@@ -1968,7 +1968,7 @@ include 'filename'
         the first process that becomes ready to flush waits for the configured
         interval, while subsequent processes wait only until the leader
         completes the flush.  The default <varname>commit_delay</> is zero
-        (no delay).
+        (no delay), and only honored if <varname>fsync</varname> is enabled.
        </para>
       </listitem>
      </varlistentry>
@@ -4778,7 +4778,8 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
      <varlistentry id="guc-search-path" xreflabel="search_path">
       <term><varname>search_path</varname> (<type>string</type>)</term>
       <indexterm>
-       <primary><varname>search_path</> configuration parameter</primary>
+       <primary><varname>search_path</></primary>
+       <secondary>configuration parameter</secondary>
       </indexterm>
       <indexterm><primary>path</><secondary>for schemas</></>
       <listitem>

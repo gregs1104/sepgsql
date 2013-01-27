@@ -430,6 +430,7 @@ ldelete:;
 										   epqstate,
 										   resultRelationDesc,
 										   resultRelInfo->ri_RangeTableIndex,
+										   LockTupleExclusive,
 										   &hufd.ctid,
 										   hufd.xmax);
 					if (!TupIsNull(epqslot))
@@ -611,6 +612,7 @@ ExecUpdate(Datum rowid,
 	}
 	else
 	{
+		LockTupleMode	lockmode;
 		ItemPointer	tupleid = (ItemPointer) DatumGetPointer(rowid);
 
 		/*
@@ -639,7 +641,7 @@ lreplace:;
 							 estate->es_output_cid,
 							 estate->es_crosscheck_snapshot,
 							 true /* wait for commit */,
-							 &hufd);
+							 &hufd, &lockmode);
 		switch (result)
 		{
 			case HeapTupleSelfUpdated:
@@ -691,6 +693,7 @@ lreplace:;
 										   epqstate,
 										   resultRelationDesc,
 										   resultRelInfo->ri_RangeTableIndex,
+										   lockmode,
 										   &hufd.ctid,
 										   hufd.xmax);
 					if (!TupIsNull(epqslot))

@@ -110,6 +110,9 @@ static int	sendFile = -1;
 static XLogSegNo sendSegNo = 0;
 static uint32 sendOff = 0;
 
+/* Timeline ID of the currently open file */
+static TimeLineID	curFileTimeLine = 0;
+
 /*
  * These variables keep track of the state of the timeline we're currently
  * sending. sendTimeLine identifies the timeline. If sendTimeLineIsHistoric,
@@ -117,6 +120,7 @@ static uint32 sendOff = 0;
  * history forked off from that timeline at sendTimeLineValidUpto.
  */
 static TimeLineID	sendTimeLine = 0;
+static TimeLineID	sendTimeLineNextTLI = 0;
 static bool			sendTimeLineIsHistoric = false;
 static XLogRecPtr	sendTimeLineValidUpto = InvalidXLogRecPtr;
 
@@ -315,8 +319,8 @@ SendTimeLineHistory(TimeLineHistoryCmd *cmd)
 	char		histfname[MAXFNAMELEN];
 	char		path[MAXPGPATH];
 	int			fd;
-	size_t		histfilelen;
-	size_t		bytesleft;
+	off_t		histfilelen;
+	off_t		bytesleft;
 
 	/*
 	 * Reply with a result set with one row, and two columns. The first col
@@ -449,7 +453,8 @@ StartReplication(StartReplicationCmd *cmd)
 			 * requested start location is on that timeline.
 			 */
 			timeLineHistory = readTimeLineHistory(ThisTimeLineID);
-			switchpoint = tliSwitchPoint(cmd->timeline, timeLineHistory);
+			switchpoint = tliSwitchPoint(cmd->timeline, timeLineHistory,
+										 &sendTimeLineNextTLI);
 			list_free_deep(timeLineHistory);
 
 			/*
@@ -496,8 +501,7 @@ StartReplication(StartReplicationCmd *cmd)
 	streamingDoneSending = streamingDoneReceiving = false;
 
 	/* If there is nothing to stream, don't even enter COPY mode */
-	if (!sendTimeLineIsHistoric ||
-		cmd->startpoint < sendTimeLineValidUpto)
+	if (!sendTimeLineIsHistoric || cmd->startpoint < sendTimeLineValidUpto)
 	{
 		/*
 		 * When we first start replication the standby will be behind the primary.
@@ -554,10 +558,46 @@ StartReplication(StartReplicationCmd *cmd)
 		if (walsender_ready_to_stop)
 			proc_exit(0);
 		WalSndSetState(WALSNDSTATE_STARTUP);
+
+		Assert(streamingDoneSending && streamingDoneReceiving);
 	}
 
-	/* Get out of COPY mode (CommandComplete). */
-	EndCommand("COPY 0", DestRemote);
+	/*
+	 * Copy is finished now. Send a single-row result set indicating the next
+	 * timeline.
+	 */
+	if (sendTimeLineIsHistoric)
+	{
+		char		str[11];
+		snprintf(str, sizeof(str), "%u", sendTimeLineNextTLI);
+
+		pq_beginmessage(&buf, 'T'); /* RowDescription */
+		pq_sendint(&buf, 1, 2);		/* 1 field */
+
+		/* Field header */
+		pq_sendstring(&buf, "next_tli");
+		pq_sendint(&buf, 0, 4);		/* table oid */
+		pq_sendint(&buf, 0, 2);		/* attnum */
+		/*
+		 * int8 may seem like a surprising data type for this, but in theory
+		 * int4 would not be wide enough for this, as TimeLineID is unsigned.
+		 */
+		pq_sendint(&buf, INT8OID, 4);	/* type oid */
+		pq_sendint(&buf, -1, 2);
+		pq_sendint(&buf, 0, 4);
+		pq_sendint(&buf, 0, 2);
+		pq_endmessage(&buf);
+
+		/* Data row */
+		pq_beginmessage(&buf, 'D');
+		pq_sendint(&buf, 1, 2);		/* number of columns */
+		pq_sendint(&buf, strlen(str), 4);	/* length */
+		pq_sendbytes(&buf, str, strlen(str));
+		pq_endmessage(&buf);
+	}
+
+	/* Send CommandComplete message */
+	pq_puttextmessage('C', "START_STREAMING");
 }
 
 /*
@@ -1164,8 +1204,8 @@ WalSndKill(int code, Datum arg)
  * always be one descriptor left open until the process ends, but never
  * more than one.
  */
-void
-XLogRead(char *buf, TimeLineID tli, XLogRecPtr startptr, Size count)
+static void
+XLogRead(char *buf, XLogRecPtr startptr, Size count)
 {
 	char	   *p;
 	XLogRecPtr	recptr;
@@ -1185,7 +1225,7 @@ retry:
 
 		startoff = recptr % XLogSegSize;
 
-		if (sendFile < 0 || !XLByteInSeg(recptr, sendSegNo) || sendTimeLine != tli)
+		if (sendFile < 0 || !XLByteInSeg(recptr, sendSegNo))
 		{
 			char		path[MAXPGPATH];
 
@@ -1193,9 +1233,45 @@ retry:
 			if (sendFile >= 0)
 				close(sendFile);
 
-			sendTimeLine = tli;
 			XLByteToSeg(recptr, sendSegNo);
-			XLogFilePath(path, sendTimeLine, sendSegNo);
+
+			/*-------
+			 * When reading from a historic timeline, and there is a timeline
+			 * switch within this segment, read from the WAL segment belonging
+			 * to the new timeline.
+			 *
+			 * For example, imagine that this server is currently on timeline
+			 * 5, and we're streaming timeline 4. The switch from timeline 4
+			 * to 5 happened at 0/13002088. In pg_xlog, we have these files:
+			 *
+			 * ...
+			 * 000000040000000000000012
+			 * 000000040000000000000013
+			 * 000000050000000000000013
+			 * 000000050000000000000014
+			 * ...
+			 *
+			 * In this situation, when requested to send the WAL from
+			 * segment 0x13, on timeline 4, we read the WAL from file
+			 * 000000050000000000000013. Archive recovery prefers files from
+			 * newer timelines, so if the segment was restored from the
+			 * archive on this server, the file belonging to the old timeline,
+			 * 000000040000000000000013, might not exist. Their contents are
+			 * equal up to the switchpoint, because at a timeline switch, the
+			 * used portion of the old segment is copied to the new file.
+			 *-------
+			 */
+			curFileTimeLine = sendTimeLine;
+			if (sendTimeLineIsHistoric)
+			{
+				XLogSegNo endSegNo;
+
+				XLByteToSeg(sendTimeLineValidUpto, endSegNo);
+				if (sendSegNo == endSegNo)
+					curFileTimeLine = sendTimeLineNextTLI;
+			}
+
+			XLogFilePath(path, curFileTimeLine, sendSegNo);
 
 			sendFile = BasicOpenFile(path, O_RDONLY | PG_BINARY, 0);
 			if (sendFile < 0)
@@ -1209,7 +1285,7 @@ retry:
 					ereport(ERROR,
 							(errcode_for_file_access(),
 							 errmsg("requested WAL segment %s has already been removed",
-									XLogFileNameP(sendTimeLine, sendSegNo))));
+									XLogFileNameP(curFileTimeLine, sendSegNo))));
 				else
 					ereport(ERROR,
 							(errcode_for_file_access(),
@@ -1226,7 +1302,7 @@ retry:
 				ereport(ERROR,
 						(errcode_for_file_access(),
 						 errmsg("could not seek in log segment %s to offset %u: %m",
-								XLogFileNameP(sendTimeLine, sendSegNo),
+								XLogFileNameP(curFileTimeLine, sendSegNo),
 								startoff)));
 			sendOff = startoff;
 		}
@@ -1243,7 +1319,7 @@ retry:
 			ereport(ERROR,
 					(errcode_for_file_access(),
 			errmsg("could not read from log segment %s, offset %u, length %lu: %m",
-				   XLogFileNameP(sendTimeLine, sendSegNo),
+				   XLogFileNameP(curFileTimeLine, sendSegNo),
 				   sendOff, (unsigned long) segbytes)));
 		}
 
@@ -1377,8 +1453,9 @@ XLogSend(bool *caughtup)
 			List	   *history;
 
 			history = readTimeLineHistory(ThisTimeLineID);
-			sendTimeLineValidUpto = tliSwitchPoint(sendTimeLine, history);
+			sendTimeLineValidUpto = tliSwitchPoint(sendTimeLine, history, &sendTimeLineNextTLI);
 			Assert(sentPtr <= sendTimeLineValidUpto);
+			Assert(sendTimeLine < sendTimeLineNextTLI);
 			list_free_deep(history);
 
 			/* the current send pointer should be <= the switchpoint */
@@ -1486,7 +1563,7 @@ XLogSend(bool *caughtup)
 	 * calls.
 	 */
 	enlargeStringInfo(&output_message, nbytes);
-	XLogRead(&output_message.data[output_message.len], sendTimeLine, startptr, nbytes);
+	XLogRead(&output_message.data[output_message.len], startptr, nbytes);
 	output_message.len += nbytes;
 	output_message.data[output_message.len] = '\0';
 

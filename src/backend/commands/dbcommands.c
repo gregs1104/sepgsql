@@ -80,6 +80,7 @@ static bool get_db_info(const char *name, LOCKMODE lockmode,
 			Oid *dbIdP, Oid *ownerIdP,
 			int *encodingP, bool *dbIsTemplateP, bool *dbAllowConnP,
 			Oid *dbLastSysOidP, TransactionId *dbFrozenXidP,
+			MultiXactId *dbMinMultiP,
 			Oid *dbTablespace, char **dbCollate, char **dbCtype);
 static bool have_createdb_privilege(void);
 static void remove_dbtablespaces(Oid db_id);
@@ -104,6 +105,7 @@ createdb(const CreatedbStmt *stmt)
 	bool		src_allowconn;
 	Oid			src_lastsysoid;
 	TransactionId src_frozenxid;
+	MultiXactId src_minmxid;
 	Oid			src_deftablespace;
 	volatile Oid dst_deftablespace;
 	Relation	pg_database_rel;
@@ -131,6 +133,7 @@ createdb(const CreatedbStmt *stmt)
 	int			notherbackends;
 	int			npreparedxacts;
 	createdb_failure_params fparms;
+	Snapshot	snapshot;
 
 	/* Extract options from the statement node tree */
 	foreach(option, stmt->options)
@@ -287,7 +290,7 @@ createdb(const CreatedbStmt *stmt)
 	if (!get_db_info(dbtemplate, ShareLock,
 					 &src_dboid, &src_owner, &src_encoding,
 					 &src_istemplate, &src_allowconn, &src_lastsysoid,
-					 &src_frozenxid, &src_deftablespace,
+					 &src_frozenxid, &src_minmxid, &src_deftablespace,
 					 &src_collate, &src_ctype))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
@@ -490,6 +493,7 @@ createdb(const CreatedbStmt *stmt)
 	new_record[Anum_pg_database_datconnlimit - 1] = Int32GetDatum(dbconnlimit);
 	new_record[Anum_pg_database_datlastsysoid - 1] = ObjectIdGetDatum(src_lastsysoid);
 	new_record[Anum_pg_database_datfrozenxid - 1] = TransactionIdGetDatum(src_frozenxid);
+	new_record[Anum_pg_database_datminmxid - 1] = TransactionIdGetDatum(src_minmxid);
 	new_record[Anum_pg_database_dattablespace - 1] = ObjectIdGetDatum(dst_deftablespace);
 
 	/*
@@ -535,6 +539,29 @@ createdb(const CreatedbStmt *stmt)
 	RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 
 	/*
+	 * Take an MVCC snapshot to use while scanning through pg_tablespace.  For
+	 * safety, register the snapshot (this prevents it from changing if
+	 * something else were to request a snapshot during the loop).
+	 *
+	 * Traversing pg_tablespace with an MVCC snapshot is necessary to provide
+	 * us with a consistent view of the tablespaces that exist.  Using
+	 * SnapshotNow here would risk seeing the same tablespace multiple times,
+	 * or worse not seeing a tablespace at all, if its tuple is moved around
+	 * by a concurrent update (eg an ACL change).
+	 *
+	 * Inconsistency of this sort is inherent to all SnapshotNow scans, unless
+	 * some lock is held to prevent concurrent updates of the rows being
+	 * sought.	There should be a generic fix for that, but in the meantime
+	 * it's worth fixing this case in particular because we are doing very
+	 * heavyweight operations within the scan, so that the elapsed time for
+	 * the scan is vastly longer than for most other catalog scans.  That
+	 * means there's a much wider window for concurrent updates to cause
+	 * trouble here than anywhere else.  XXX this code should be changed
+	 * whenever a generic fix is implemented.
+	 */
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
+
+	/*
 	 * Once we start copying subdirectories, we need to be able to clean 'em
 	 * up if we fail.  Use an ENSURE block to make sure this happens.  (This
 	 * is not a 100% solution, because of the possibility of failure during
@@ -551,7 +578,7 @@ createdb(const CreatedbStmt *stmt)
 		 * each one to the new database.
 		 */
 		rel = heap_open(TableSpaceRelationId, AccessShareLock);
-		scan = heap_beginscan(rel, SnapshotNow, 0, NULL);
+		scan = heap_beginscan(rel, snapshot, 0, NULL);
 		while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 		{
 			Oid			srctablespace = HeapTupleGetOid(tuple);
@@ -656,6 +683,9 @@ createdb(const CreatedbStmt *stmt)
 	PG_END_ENSURE_ERROR_CLEANUP(createdb_failure_callback,
 								PointerGetDatum(&fparms));
 
+	/* Free our snapshot */
+	UnregisterSnapshot(snapshot);
+
 	return dboid;
 }
 
@@ -759,7 +789,7 @@ dropdb(const char *dbname, bool missing_ok)
 	pgdbrel = heap_open(DatabaseRelationId, RowExclusiveLock);
 
 	if (!get_db_info(dbname, AccessExclusiveLock, &db_id, NULL, NULL,
-					 &db_istemplate, NULL, NULL, NULL, NULL, NULL, NULL))
+					 &db_istemplate, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
 	{
 		if (!missing_ok)
 		{
@@ -918,7 +948,7 @@ RenameDatabase(const char *oldname, const char *newname)
 	rel = heap_open(DatabaseRelationId, RowExclusiveLock);
 
 	if (!get_db_info(oldname, AccessExclusiveLock, &db_id, NULL, NULL,
-					 NULL, NULL, NULL, NULL, NULL, NULL, NULL))
+					 NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("database \"%s\" does not exist", oldname)));
@@ -1019,7 +1049,7 @@ movedb(const char *dbname, const char *tblspcname)
 	pgdbrel = heap_open(DatabaseRelationId, RowExclusiveLock);
 
 	if (!get_db_info(dbname, AccessExclusiveLock, &db_id, NULL, NULL,
-					 NULL, NULL, NULL, NULL, &src_tblspcoid, NULL, NULL))
+					 NULL, NULL, NULL, NULL, NULL, &src_tblspcoid, NULL, NULL))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("database \"%s\" does not exist", dbname)));
@@ -1572,6 +1602,7 @@ get_db_info(const char *name, LOCKMODE lockmode,
 			Oid *dbIdP, Oid *ownerIdP,
 			int *encodingP, bool *dbIsTemplateP, bool *dbAllowConnP,
 			Oid *dbLastSysOidP, TransactionId *dbFrozenXidP,
+			MultiXactId *dbMinMultiP,
 			Oid *dbTablespace, char **dbCollate, char **dbCtype)
 {
 	bool		result = false;
@@ -1658,6 +1689,9 @@ get_db_info(const char *name, LOCKMODE lockmode,
 				/* limit of frozen XIDs */
 				if (dbFrozenXidP)
 					*dbFrozenXidP = dbform->datfrozenxid;
+				/* limit of frozen Multixacts */
+				if (dbMinMultiP)
+					*dbMinMultiP = dbform->datminmxid;
 				/* default tablespace for this database */
 				if (dbTablespace)
 					*dbTablespace = dbform->dattablespace;
@@ -1715,9 +1749,20 @@ remove_dbtablespaces(Oid db_id)
 	Relation	rel;
 	HeapScanDesc scan;
 	HeapTuple	tuple;
+	Snapshot	snapshot;
+
+	/*
+	 * As in createdb(), we'd better use an MVCC snapshot here, since this
+	 * scan can run for a long time.  Duplicate visits to tablespaces would be
+	 * harmless, but missing a tablespace could result in permanently leaked
+	 * files.
+	 *
+	 * XXX change this when a generic fix for SnapshotNow races is implemented
+	 */
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
 
 	rel = heap_open(TableSpaceRelationId, AccessShareLock);
-	scan = heap_beginscan(rel, SnapshotNow, 0, NULL);
+	scan = heap_beginscan(rel, snapshot, 0, NULL);
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		Oid			dsttablespace = HeapTupleGetOid(tuple);
@@ -1763,6 +1808,7 @@ remove_dbtablespaces(Oid db_id)
 
 	heap_endscan(scan);
 	heap_close(rel, AccessShareLock);
+	UnregisterSnapshot(snapshot);
 }
 
 /*
@@ -1784,9 +1830,19 @@ check_db_file_conflict(Oid db_id)
 	Relation	rel;
 	HeapScanDesc scan;
 	HeapTuple	tuple;
+	Snapshot	snapshot;
+
+	/*
+	 * As in createdb(), we'd better use an MVCC snapshot here; missing a
+	 * tablespace could result in falsely reporting the OID is unique, with
+	 * disastrous future consequences per the comment above.
+	 *
+	 * XXX change this when a generic fix for SnapshotNow races is implemented
+	 */
+	snapshot = RegisterSnapshot(GetLatestSnapshot());
 
 	rel = heap_open(TableSpaceRelationId, AccessShareLock);
-	scan = heap_beginscan(rel, SnapshotNow, 0, NULL);
+	scan = heap_beginscan(rel, snapshot, 0, NULL);
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		Oid			dsttablespace = HeapTupleGetOid(tuple);
@@ -1812,6 +1868,8 @@ check_db_file_conflict(Oid db_id)
 
 	heap_endscan(scan);
 	heap_close(rel, AccessShareLock);
+	UnregisterSnapshot(snapshot);
+
 	return result;
 }
 
