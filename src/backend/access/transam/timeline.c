@@ -41,6 +41,28 @@
 #include "storage/fd.h"
 
 /*
+ * Copies all timeline history files with id's between 'begin' and 'end'
+ * from archive to pg_xlog.
+ */
+void
+restoreTimeLineHistoryFiles(TimeLineID begin, TimeLineID end)
+{
+	char		path[MAXPGPATH];
+	char		histfname[MAXFNAMELEN];
+	TimeLineID tli;
+
+	for (tli = begin; tli < end; tli++)
+	{
+		if (tli == 1)
+			continue;
+
+		TLHistoryFileName(histfname, tli);
+		if (RestoreArchivedFile(path, histfname, "RECOVERYHISTORY", 0, false))
+			KeepFileRestoredFromArchive(path, histfname);
+	}
+}
+
+/*
  * Try to read a timeline's history file.
  *
  * If successful, return the list of component TLIs (the given TLI followed by
@@ -545,22 +567,26 @@ tliOfPointInHistory(XLogRecPtr ptr, List *history)
 }
 
 /*
- * Returns the point in history where we branched off the given timeline.
- * Returns InvalidXLogRecPtr if the timeline is current (= we have not
- * branched off from it), and throws an error if the timeline is not part of
- * this server's history.
+ * Returns the point in history where we branched off the given timeline,
+ * and the timeline we branched to (*nextTLI). Returns InvalidXLogRecPtr if
+ * the timeline is current, ie. we have not branched off from it, and throws
+ * an error if the timeline is not part of this server's history.
  */
 XLogRecPtr
-tliSwitchPoint(TimeLineID tli, List *history)
+tliSwitchPoint(TimeLineID tli, List *history, TimeLineID *nextTLI)
 {
 	ListCell   *cell;
 
+	if (nextTLI)
+		*nextTLI = 0;
 	foreach (cell, history)
 	{
 		TimeLineHistoryEntry *tle = (TimeLineHistoryEntry *) lfirst(cell);
 
 		if (tle->tli == tli)
 			return tle->end;
+		if (nextTLI)
+			*nextTLI = tle->tli;
 	}
 
 	ereport(ERROR,
