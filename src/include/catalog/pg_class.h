@@ -94,7 +94,7 @@ typedef FormData_pg_class *Form_pg_class;
  * ----------------
  */
 
-#define Natts_pg_class					28
+#define Natts_pg_class					29
 #define Anum_pg_class_relname			1
 #define Anum_pg_class_relnamespace		2
 #define Anum_pg_class_reltype			3
@@ -122,8 +122,8 @@ typedef FormData_pg_class *Form_pg_class;
 #define Anum_pg_class_relhassubclass	25
 #define Anum_pg_class_relfrozenxid		26
 #define Anum_pg_class_relminmxid		27
-#define Anum_pg_class_relacl			27
-#define Anum_pg_class_reloptions		28
+#define Anum_pg_class_relacl			28
+#define Anum_pg_class_reloptions		29
 
 /* ----------------
  *		initial contents of pg_class
@@ -144,7 +144,7 @@ DATA(insert OID = 1249 (  pg_attribute	PGNSP 75 0 PGUID 0 0 0 0 0 0 0 0 f f p r 
 DESCR("");
 DATA(insert OID = 1255 (  pg_proc		PGNSP 81 0 PGUID 0 0 0 0 0 0 0 0 f f p r 27 0 t f f f f f 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 0 f f p r 28 0 t f f f f f 3 1 _null_ _null_ ));
+DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 0 f f p r 29 0 t f f f f f 3 1 _null_ _null_ ));
 DESCR("");
 
 
