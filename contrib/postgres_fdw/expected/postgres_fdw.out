@@ -739,11 +739,11 @@ SELECT srvname FROM postgres_fdw_connections;
 -- test for writable foreign table stuff (PoC stage now)
 -- ===================================================================
 EXPLAIN(verbose) INSERT INTO ft2 (c1,c2,c3) (SELECT c1+1000,c2+100, c3 || c3 FROM ft2 LIMIT 20);
-                                                                                                          QUERY PLAN                                                                                                           
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                            QUERY PLAN                                                                                                             
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Insert on public.ft2  (cost=100.00..100.03 rows=1 width=40)
    ->  Subquery Scan on "*SELECT*"  (cost=100.00..100.03 rows=1 width=40)
-         Output: NULL::integer, "*SELECT*"."?column?", "*SELECT*"."?column?", "*SELECT*"."?column?", NULL::timestamp with time zone, NULL::timestamp without time zone, NULL::character varying, NULL::bpchar, NULL::user_enum
+         Output: NULL::integer, "*SELECT*"."?column?", "*SELECT*"."?column?_1", "*SELECT*"."?column?_2", NULL::timestamp with time zone, NULL::timestamp without time zone, NULL::character varying, NULL::bpchar, NULL::user_enum
          ->  Limit  (cost=100.00..100.02 rows=1 width=40)
                Output: ((ft2_1.c1 + 1000)), ((ft2_1.c2 + 100)), ((ft2_1.c3 || ft2_1.c3))
                ->  Foreign Scan on public.ft2 ft2_1  (cost=100.00..100.02 rows=1 width=40)

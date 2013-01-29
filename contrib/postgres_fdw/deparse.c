@@ -190,7 +190,7 @@ deparseSimpleSql(StringInfo buf,
 			appendStringInfo(buf, "NULL");
 	}
 	if (anum_rowid != InvalidAttrNumber)
-		appendStringInfo(buf, "%sctid", (first ? "" : ","));
+		appendStringInfo(buf, "%sctid", (first ? "" : ", "));
 
 	heap_close(rel, NoLock);
 	appendStringInfoChar(buf, ' ');
