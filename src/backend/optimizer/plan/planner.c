@@ -551,7 +551,6 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 		if (parse->commandType != CMD_SELECT)
 		{
 			List	   *returningLists;
-			List	   *rowMarks;
 
 			/*
 			 * Set up the RETURNING list-of-lists, if needed.
@@ -561,24 +560,12 @@ subquery_planner(PlannerGlobal *glob, Query *parse,
 			else
 				returningLists = NIL;
 
-			/*
-			 * If there was a FOR [KEY] UPDATE/SHARE clause, the LockRows node will
-			 * have dealt with fetching non-locked marked rows, else we need
-			 * to have ModifyTable do that.
-			 */
-			if (parse->rowMarks)
-				rowMarks = NIL;
-			else
-				rowMarks = root->rowMarks;
-
+			Assert(parse->commandType == root->parse->commandType);
+			Assert(parse->canSetTag == root->parse->canSetTag);
 			plan = (Plan *) make_modifytable(root,
-											 parse->commandType,
-											 parse->canSetTag,
 									   list_make1_int(parse->resultRelation),
 											 list_make1(plan),
-											 returningLists,
-											 rowMarks,
-											 SS_assign_special_param(root));
+											 returningLists);
 		}
 	}
 
@@ -762,7 +749,6 @@ inheritance_planner(PlannerInfo *root)
 	List	   *subplans = NIL;
 	List	   *resultRelations = NIL;
 	List	   *returningLists = NIL;
-	List	   *rowMarks;
 	ListCell   *lc;
 
 	/*
@@ -954,25 +940,13 @@ inheritance_planner(PlannerInfo *root)
 	root->simple_rel_array_size = save_rel_array_size;
 	root->simple_rel_array = save_rel_array;
 
-	/*
-	 * If there was a FOR [KEY] UPDATE/SHARE clause, the LockRows node will have
-	 * dealt with fetching non-locked marked rows, else we need to have
-	 * ModifyTable do that.
-	 */
-	if (parse->rowMarks)
-		rowMarks = NIL;
-	else
-		rowMarks = root->rowMarks;
-
 	/* And last, tack on a ModifyTable node to do the UPDATE/DELETE work */
+	Assert(parse->commandType == root->parse->commandType);
+	Assert(parse->canSetTag == root->parse->canSetTag);
 	return (Plan *) make_modifytable(root,
-									 parse->commandType,
-									 parse->canSetTag,
 									 resultRelations,
 									 subplans,
-									 returningLists,
-									 rowMarks,
-									 SS_assign_special_param(root));
+									 returningLists);
 }
 
 /*--------------------
