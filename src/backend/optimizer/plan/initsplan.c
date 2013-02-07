@@ -83,6 +83,10 @@ static void check_hashjoinable(RestrictInfo *restrictinfo);
  * is the only place that should call build_simple_rel with reloptkind
  * RELOPT_BASEREL.	(Note: build_simple_rel recurses internally to build
  * "other rel" RelOptInfos for the members of any appendrels we find here.)
+ *
+ * XXX - Also note that tlist needs to be pushed down into deeper level,
+ * for construction of RelOptInfo relevant to foreign-tables with pseudo-
+ * columns.
  */
 void
 add_base_rels_to_query(PlannerInfo *root, List *tlist, Node *jtnode)
