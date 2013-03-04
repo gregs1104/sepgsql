@@ -1,9 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * connection.c
- *		  Connection management for postgres_fdw
+ *		  Connection management functions for postgres_fdw
  *
- * Portions Copyright (c) 2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2012-2013, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  contrib/postgres_fdw/connection.c
@@ -12,193 +12,256 @@
  */
 #include "postgres.h"
 
-#include "access/htup_details.h"
+#include "postgres_fdw.h"
+
 #include "access/xact.h"
-#include "catalog/pg_type.h"
-#include "foreign/foreign.h"
-#include "funcapi.h"
-#include "libpq-fe.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
-#include "utils/array.h"
-#include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
-#include "utils/resowner.h"
-#include "utils/tuplestore.h"
 
-#include "postgres_fdw.h"
-#include "connection.h"
-
-/* ============================================================================
- * Connection management functions
- * ==========================================================================*/
 
 /*
- * Connection cache entry managed with hash table.
+ * Connection cache hash table entry
+ *
+ * The lookup key in this hash table is the foreign server OID plus the user
+ * mapping OID.  (We use just one connection per user per foreign server,
+ * so that we can ensure all scans use the same snapshot during a query.)
+ *
+ * The "conn" pointer can be NULL if we don't currently have a live connection.
+ * When we do have a connection, xact_depth tracks the current depth of
+ * transactions and subtransactions open on the remote side.  We need to issue
+ * commands at the same nesting depth on the remote as we're executing at
+ * ourselves, so that rolling back a subtransaction will kill the right
+ * queries and not the wrong ones.
  */
+typedef struct ConnCacheKey
+{
+	Oid			serverid;		/* OID of foreign server */
+	Oid			userid;			/* OID of local user whose mapping we use */
+} ConnCacheKey;
+
 typedef struct ConnCacheEntry
 {
-	/* hash key must be first */
-	Oid				serverid;	/* oid of foreign server */
-	Oid				userid;		/* oid of local user */
-
-	int				conntx;		/* one of PGSQL_FDW_CONNTX_* */
-	int				refs;		/* reference counter */
-	PGconn		   *conn;		/* foreign server connection */
+	ConnCacheKey key;			/* hash key (must be first) */
+	PGconn	   *conn;			/* connection to foreign server, or NULL */
+	int			xact_depth;		/* 0 = no xact open, 1 = main xact open, 2 =
+								 * one level of subxact open, etc */
 } ConnCacheEntry;
 
 /*
- * Hash table which is used to cache connection to PostgreSQL servers, will be
- * initialized before first attempt to connect PostgreSQL server by the backend.
+ * Connection cache (initialized on first use)
  */
-static HTAB *ConnectionHash;
+static HTAB *ConnectionHash = NULL;
 
-/* ----------------------------------------------------------------------------
- * prototype of private functions
- * --------------------------------------------------------------------------*/
-static void
-cleanup_connection(ResourceReleasePhase phase,
-				   bool isCommit,
-				   bool isTopLevel,
-				   void *arg);
+/* for assigning cursor numbers */
+static unsigned int cursor_number = 0;
+
+/* tracks whether any work is needed in callback functions */
+static bool xact_got_connection = false;
+
+/* prototypes of private functions */
 static PGconn *connect_pg_server(ForeignServer *server, UserMapping *user);
-static void begin_remote_tx(PGconn *conn);
-static void abort_remote_tx(PGconn *conn);
-static void commit_remote_tx(PGconn *conn);
-static void deallocate_remote_prepare(PGconn *conn);
+static void check_conn_params(const char **keywords, const char **values);
+static void configure_remote_session(PGconn *conn);
+static void begin_remote_xact(ConnCacheEntry *entry);
+static void pgfdw_xact_callback(XactEvent event, void *arg);
+static void pgfdw_subxact_callback(SubXactEvent event,
+					   SubTransactionId mySubid,
+					   SubTransactionId parentSubid,
+					   void *arg);
+
 
 /*
- * Get a PGconn which can be used to execute foreign query on the remote
- * PostgreSQL server with the user's authorization.  If this was the first
- * request for the server, new connection is established.
+ * Get a PGconn which can be used to execute queries on the remote PostgreSQL
+ * server with the user's authorization.  A new connection is established
+ * if we don't already have a suitable one, and a transaction is opened at
+ * the right subtransaction nesting depth if we didn't do that already.
  *
- * When use_tx is true, remote transaction is started if caller is the only
- * user of the connection.  Isolation level of the remote transaction is same
- * as local transaction, and remote transaction will be aborted when last
- * user release.
- *
- * TODO: Note that caching connections requires a mechanism to detect change of
- * FDW object to invalidate already established connections.
+ * XXX Note that caching connections theoretically requires a mechanism to
+ * detect change of FDW objects to invalidate already established connections.
+ * We could manage that by watching for invalidation events on the relevant
+ * syscaches.  For the moment, though, it's not clear that this would really
+ * be useful and not mere pedantry.  We could not flush any active connections
+ * mid-transaction anyway.
  */
 PGconn *
-GetConnection(ForeignServer *server, UserMapping *user, int conntx)
+GetConnection(ForeignServer *server, UserMapping *user)
 {
-	bool			found;
+	bool		found;
 	ConnCacheEntry *entry;
-	ConnCacheEntry	key;
+	ConnCacheKey key;
 
-	/* initialize connection cache if it isn't */
+	/* First time through, initialize connection cache hashtable */
 	if (ConnectionHash == NULL)
 	{
 		HASHCTL		ctl;
 
-		/* hash key is a pair of oids: serverid and userid */
 		MemSet(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(Oid) + sizeof(Oid);
+		ctl.keysize = sizeof(ConnCacheKey);
 		ctl.entrysize = sizeof(ConnCacheEntry);
 		ctl.hash = tag_hash;
-		ctl.match = memcmp;
-		ctl.keycopy = memcpy;
 		/* allocate ConnectionHash in the cache context */
 		ctl.hcxt = CacheMemoryContext;
-		ConnectionHash = hash_create("postgres_fdw connections", 32,
-									   &ctl,
-									   HASH_ELEM | HASH_CONTEXT |
-									   HASH_FUNCTION | HASH_COMPARE |
-									   HASH_KEYCOPY);
+		ConnectionHash = hash_create("postgres_fdw connections", 8,
+									 &ctl,
+								   HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
 
 		/*
-		 * Register postgres_fdw's own cleanup function for connection
-		 * cleanup.  This should be done just once for each backend.
+		 * Register some callback functions that manage connection cleanup.
+		 * This should be done just once in each backend.
 		 */
-		RegisterResourceReleaseCallback(cleanup_connection, ConnectionHash);
+		RegisterXactCallback(pgfdw_xact_callback, NULL);
+		RegisterSubXactCallback(pgfdw_subxact_callback, NULL);
 	}
 
-	/* Create key value for the entry. */
-	MemSet(&key, 0, sizeof(key));
+	/* Set flag that we did GetConnection during the current transaction */
+	xact_got_connection = true;
+
+	/* Create hash key for the entry.  Assume no pad bytes in key struct */
 	key.serverid = server->serverid;
-	key.userid = GetOuterUserId();
+	key.userid = user->userid;
 
 	/*
-	 * Find cached entry for requested connection.  If we couldn't find,
-	 * callback function of ResourceOwner should be registered to clean the
-	 * connection up on error including user interrupt.
+	 * Find or create cached entry for requested connection.
 	 */
 	entry = hash_search(ConnectionHash, &key, HASH_ENTER, &found);
 	if (!found)
 	{
-		entry->conntx = PGSQL_FDW_CONNTX_NONE;
-		entry->refs = 0;
+		/* initialize new hashtable entry (key is already filled in) */
 		entry->conn = NULL;
+		entry->xact_depth = 0;
 	}
 
 	/*
 	 * We don't check the health of cached connection here, because it would
-	 * require some overhead.  Broken connection and its cache entry will be
-	 * cleaned up when the connection is actually used.
+	 * require some overhead.  Broken connection will be detected when the
+	 * connection is actually used.
 	 */
 
 	/*
-	 * If cache entry doesn't have connection, we have to establish new
-	 * connection.
+	 * If cache entry doesn't have a connection, we have to establish a new
+	 * connection.	(If connect_pg_server throws an error, the cache entry
+	 * will be left in a valid empty state.)
 	 */
 	if (entry->conn == NULL)
 	{
-		PGconn *volatile conn = NULL;
-
-		/*
-		 * Use PG_TRY block to ensure closing connection on error.
-		 */
-		PG_TRY();
-		{
-			/*
-			 * Connect to the foreign PostgreSQL server, and store it in cache
-			 * entry to keep new connection.
-			 * Note: key items of entry has already been initialized in
-			 * hash_search(HASH_ENTER).
-			 */
-			conn = connect_pg_server(server, user);
-		}
-		PG_CATCH();
-		{
-			/* Clear connection cache entry on error case. */
-			PQfinish(entry->conn);
-			entry->conntx = PGSQL_FDW_CONNTX_NONE;
-			entry->refs = 0;
-			entry->conn = NULL;
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-		entry->conn = conn;
-		elog(DEBUG3, "new postgres_fdw connection %p for server %s",
+		entry->xact_depth = 0;	/* just to be sure */
+		entry->conn = connect_pg_server(server, user);
+		elog(DEBUG3, "new postgres_fdw connection %p for server \"%s\"",
 			 entry->conn, server->servername);
 	}
 
-	/* Increase connection reference counter. */
-	entry->refs++;
-
 	/*
-	 * If remote transaction is requested but it has not started, start remote
-	 * transaction with the same isolation level as the local transaction we
-	 * are in.  We need to remember whether this connection uses remote
-	 * transaction to abort it when this connection is released completely.
+	 * Start a new transaction or subtransaction if needed.
 	 */
-	if (conntx > entry->conntx)
-	{
-		if (entry->conntx == PGSQL_FDW_CONNTX_NONE)
-			begin_remote_tx(entry->conn);
-		entry->conntx = conntx;
-	}
+	begin_remote_xact(entry);
 
 	return entry->conn;
+}
+
+/*
+ * Connect to remote server using specified server and user mapping properties.
+ */
+static PGconn *
+connect_pg_server(ForeignServer *server, UserMapping *user)
+{
+	PGconn	   *volatile conn = NULL;
+
+	/*
+	 * Use PG_TRY block to ensure closing connection on error.
+	 */
+	PG_TRY();
+	{
+		const char **keywords;
+		const char **values;
+		int			n;
+
+		/*
+		 * Construct connection params from generic options of ForeignServer
+		 * and UserMapping.  (Some of them might not be libpq options, in
+		 * which case we'll just waste a few array slots.)  Add 3 extra slots
+		 * for fallback_application_name, client_encoding, end marker.
+		 */
+		n = list_length(server->options) + list_length(user->options) + 3;
+		keywords = (const char **) palloc(n * sizeof(char *));
+		values = (const char **) palloc(n * sizeof(char *));
+
+		n = 0;
+		n += ExtractConnectionOptions(server->options,
+									  keywords + n, values + n);
+		n += ExtractConnectionOptions(user->options,
+									  keywords + n, values + n);
+
+		/* Use "postgres_fdw" as fallback_application_name. */
+		keywords[n] = "fallback_application_name";
+		values[n] = "postgres_fdw";
+		n++;
+
+		/* Set client_encoding so that libpq can convert encoding properly. */
+		keywords[n] = "client_encoding";
+		values[n] = GetDatabaseEncodingName();
+		n++;
+
+		keywords[n] = values[n] = NULL;
+
+		/* verify connection parameters and make connection */
+		check_conn_params(keywords, values);
+
+		conn = PQconnectdbParams(keywords, values, false);
+		if (!conn || PQstatus(conn) != CONNECTION_OK)
+		{
+			char	   *connmessage;
+			int			msglen;
+
+			/* libpq typically appends a newline, strip that */
+			connmessage = pstrdup(PQerrorMessage(conn));
+			msglen = strlen(connmessage);
+			if (msglen > 0 && connmessage[msglen - 1] == '\n')
+				connmessage[msglen - 1] = '\0';
+			ereport(ERROR,
+			   (errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
+				errmsg("could not connect to server \"%s\"",
+					   server->servername),
+				errdetail_internal("%s", connmessage)));
+		}
+
+		/*
+		 * Check that non-superuser has used password to establish connection;
+		 * otherwise, he's piggybacking on the postgres server's user
+		 * identity. See also dblink_security_check() in contrib/dblink.
+		 */
+		if (!superuser() && !PQconnectionUsedPassword(conn))
+			ereport(ERROR,
+				  (errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+				   errmsg("password is required"),
+				   errdetail("Non-superuser cannot connect if the server does not request a password."),
+				   errhint("Target server's authentication method must be changed.")));
+
+		/* Prepare new session for use */
+		configure_remote_session(conn);
+
+		pfree(keywords);
+		pfree(values);
+	}
+	PG_CATCH();
+	{
+		/* Release PGconn data structure if we managed to create one */
+		if (conn)
+			PQfinish(conn);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return conn;
 }
 
 /*
  * For non-superusers, insist that the connstr specify a password.	This
  * prevents a password from being picked up from .pgpass, a service file,
  * the environment, etc.  We don't want the postgres user's passwords
- * to be accessible to non-superusers.
+ * to be accessible to non-superusers.	(See also dblink_connstr_check in
+ * contrib/dblink.)
  */
 static void
 check_conn_params(const char **keywords, const char **values)
@@ -217,431 +280,331 @@ check_conn_params(const char **keywords, const char **values)
 	}
 
 	ereport(ERROR,
-		  (errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
-		   errmsg("password is required"),
-		   errdetail("Non-superusers must provide a password in the connection string.")));
-}
-
-static PGconn *
-connect_pg_server(ForeignServer *server, UserMapping *user)
-{
-	const char	   *conname = server->servername;
-	PGconn		   *conn;
-	const char	  **all_keywords;
-	const char	  **all_values;
-	const char	  **keywords;
-	const char	  **values;
-	int				n;
-	int				i, j;
-
-	/*
-	 * Construct connection params from generic options of ForeignServer and
-	 * UserMapping.  Those two object hold only libpq options.
-	 * Extra 3 items are for:
-	 *   *) fallback_application_name
-	 *   *) client_encoding
-	 *   *) NULL termination (end marker)
-	 *
-	 * Note: We don't omit any parameters even target database might be older
-	 * than local, because unexpected parameters are just ignored.
-	 */
-	n = list_length(server->options) + list_length(user->options) + 3;
-	all_keywords = (const char **) palloc(sizeof(char *) * n);
-	all_values = (const char **) palloc(sizeof(char *) * n);
-	keywords = (const char **) palloc(sizeof(char *) * n);
-	values = (const char **) palloc(sizeof(char *) * n);
-	n = 0;
-	n += ExtractConnectionOptions(server->options,
-								  all_keywords + n, all_values + n);
-	n += ExtractConnectionOptions(user->options,
-								  all_keywords + n, all_values + n);
-	all_keywords[n] = all_values[n] = NULL;
-
-	for (i = 0, j = 0; all_keywords[i]; i++)
-	{
-		keywords[j] = all_keywords[i];
-		values[j] = all_values[i];
-		j++;
-	}
-
-	/* Use "postgres_fdw" as fallback_application_name. */
-	keywords[j] = "fallback_application_name";
-	values[j++] = "postgres_fdw";
-
-	/* Set client_encoding so that libpq can convert encoding properly. */
-	keywords[j] = "client_encoding";
-	values[j++] = GetDatabaseEncodingName();
-
-	keywords[j] = values[j] = NULL;
-	pfree(all_keywords);
-	pfree(all_values);
-
-	/* verify connection parameters and do connect */
-	check_conn_params(keywords, values);
-	conn = PQconnectdbParams(keywords, values, 0);
-	if (!conn || PQstatus(conn) != CONNECTION_OK)
-		ereport(ERROR,
-				(errcode(ERRCODE_SQLCLIENT_UNABLE_TO_ESTABLISH_SQLCONNECTION),
-				 errmsg("could not connect to server \"%s\"", conname),
-				 errdetail("%s", PQerrorMessage(conn))));
-	pfree(keywords);
-	pfree(values);
-
-	/*
-	 * Check that non-superuser has used password to establish connection.
-	 * This check logic is based on dblink_security_check() in contrib/dblink.
-	 *
-	 * XXX Should we check this even if we don't provide unsafe version like
-	 * dblink_connect_u()?
-	 */
-	if (!superuser() && !PQconnectionUsedPassword(conn))
-	{
-		PQfinish(conn);
-		ereport(ERROR,
-				(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
-				 errmsg("password is required"),
-				 errdetail("Non-superuser cannot connect if the server does not request a password."),
-				 errhint("Target server's authentication method must be changed.")));
-	}
-
-	return conn;
+			(errcode(ERRCODE_S_R_E_PROHIBITED_SQL_STATEMENT_ATTEMPTED),
+			 errmsg("password is required"),
+			 errdetail("Non-superusers must provide a password in the user mapping.")));
 }
 
 /*
- * Start remote transaction with proper isolation level.
+ * Issue SET commands to make sure remote session is configured properly.
+ *
+ * We do this just once at connection, assuming nothing will change the
+ * values later.  Since we'll never send volatile function calls to the
+ * remote, there shouldn't be any way to break this assumption from our end.
+ * It's possible to think of ways to break it at the remote end, eg making
+ * a foreign table point to a view that includes a set_config call ---
+ * but once you admit the possibility of a malicious view definition,
+ * there are any number of ways to break things.
  */
 static void
-begin_remote_tx(PGconn *conn)
+configure_remote_session(PGconn *conn)
 {
-	const char	   *sql = NULL;		/* keep compiler quiet. */
-	PGresult	   *res;
+	const char *sql;
+	PGresult   *res;
 
-	switch (XactIsoLevel)
-	{
-		case XACT_READ_UNCOMMITTED:
-		case XACT_READ_COMMITTED:
-		case XACT_REPEATABLE_READ:
-			sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
-			break;
-		case XACT_SERIALIZABLE:
-			sql = "START TRANSACTION ISOLATION LEVEL SERIALIZABLE";
-			break;
-		default:
-			elog(ERROR, "unexpected isolation level: %d", XactIsoLevel);
-			break;
-	}
-
-	elog(DEBUG3, "starting remote transaction with \"%s\"", sql);
-
+	/* Force the search path to contain only pg_catalog (see deparse.c) */
+	sql = "SET search_path = pg_catalog";
 	res = PQexec(conn, sql);
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		PQclear(res);
-		elog(ERROR, "could not start transaction: %s", PQerrorMessage(conn));
-	}
-	PQclear(res);
-}
-
-static void
-abort_remote_tx(PGconn *conn)
-{
-	PGresult	   *res;
-
-	elog(DEBUG3, "aborting remote transaction");
-
-	res = PQexec(conn, "ABORT TRANSACTION");
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		PQclear(res);
-		elog(ERROR, "could not abort transaction: %s", PQerrorMessage(conn));
-	}
-	PQclear(res);
-}
-
-static void
-commit_remote_tx(PGconn *conn)
-{
-	PGresult	   *res;
-
-	elog(DEBUG3, "committing remote transaction");
-
-	res = PQexec(conn, "COMMIT TRANSACTION");
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		PQclear(res);
-		elog(ERROR, "could not commit transaction: %s", PQerrorMessage(conn));
-	}
-	PQclear(res);
-}
-
-static void
-deallocate_remote_prepare(PGconn *conn)
-{
-	PGresult	   *res;
-
-	elog(DEBUG3, "deallocating remote prepares");
-
-	res = PQexec(conn, "DEALLOCATE PREPARE ALL");
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-	{
-		PQclear(res);
-		elog(ERROR, "could not deallocate prepared statement: %s",
-			 PQerrorMessage(conn));
-	}
+		pgfdw_report_error(ERROR, res, true, sql);
 	PQclear(res);
 }
 
 /*
- * Mark the connection as "unused", and close it if the caller was the last
- * user of the connection.
+ * Start remote transaction or subtransaction, if needed.
+ *
+ * Note that we always use at least REPEATABLE READ in the remote session.
+ * This is so that, if a query initiates multiple scans of the same or
+ * different foreign tables, we will get snapshot-consistent results from
+ * those scans.  A disadvantage is that we can't provide sane emulation of
+ * READ COMMITTED behavior --- it would be nice if we had some other way to
+ * control which remote queries share a snapshot.
+ */
+static void
+begin_remote_xact(ConnCacheEntry *entry)
+{
+	int			curlevel = GetCurrentTransactionNestLevel();
+	PGresult   *res;
+
+	/* Start main transaction if we haven't yet */
+	if (entry->xact_depth <= 0)
+	{
+		const char *sql;
+
+		elog(DEBUG3, "starting remote transaction on connection %p",
+			 entry->conn);
+
+		if (IsolationIsSerializable())
+			sql = "START TRANSACTION ISOLATION LEVEL SERIALIZABLE";
+		else
+			sql = "START TRANSACTION ISOLATION LEVEL REPEATABLE READ";
+		res = PQexec(entry->conn, sql);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			pgfdw_report_error(ERROR, res, true, sql);
+		PQclear(res);
+		entry->xact_depth = 1;
+	}
+
+	/*
+	 * If we're in a subtransaction, stack up savepoints to match our level.
+	 * This ensures we can rollback just the desired effects when a
+	 * subtransaction aborts.
+	 */
+	while (entry->xact_depth < curlevel)
+	{
+		char		sql[64];
+
+		snprintf(sql, sizeof(sql), "SAVEPOINT s%d", entry->xact_depth + 1);
+		res = PQexec(entry->conn, sql);
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			pgfdw_report_error(ERROR, res, true, sql);
+		PQclear(res);
+		entry->xact_depth++;
+	}
+}
+
+/*
+ * Release connection reference count created by calling GetConnection.
  */
 void
-ReleaseConnection(PGconn *conn, bool is_abort)
+ReleaseConnection(PGconn *conn)
 {
-	HASH_SEQ_STATUS		scan;
-	ConnCacheEntry	   *entry;
-
-	if (conn == NULL)
-		return;
-
 	/*
-	 * We need to scan sequentially since we use the address to find
-	 * appropriate PGconn from the hash table.
+	 * Currently, we don't actually track connection references because all
+	 * cleanup is managed on a transaction or subtransaction basis instead. So
+	 * there's nothing to do here.
 	 */
-	hash_seq_init(&scan, ConnectionHash);
-	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
-	{
-		if (entry->conn == conn)
-		{
-			hash_seq_term(&scan);
-			break;
-		}
-	}
-
-	/*
-	 * If the given connection is an orphan, it must be a dangling pointer to
-	 * already released connection.  Discarding connection due to remote query
-	 * error would produce such situation (see comments below).
-	 */
-	if (entry == NULL)
-		return;
-
-	/*
-	 * If releasing connection is broken or its transaction has failed,
-	 * discard the connection to recover from the error.  PQfinish would cause
-	 * dangling pointer of shared PGconn object, but they won't double-free'd
-	 * because their pointer values don't match any of cached entry and ignored
-	 * at the check above.
-	 *
-	 * Subsequent connection request via GetConnection will create new
-	 * connection.
-	 */
-	if (PQstatus(conn) != CONNECTION_OK ||
-		(PQtransactionStatus(conn) != PQTRANS_IDLE &&
-		 PQtransactionStatus(conn) != PQTRANS_INTRANS))
-	{
-		elog(DEBUG3, "discarding connection: %s %s",
-			 PQstatus(conn) == CONNECTION_OK ? "OK" : "NG",
-			 PQtransactionStatus(conn) == PQTRANS_IDLE ? "IDLE" :
-			 PQtransactionStatus(conn) == PQTRANS_ACTIVE ? "ACTIVE" :
-			 PQtransactionStatus(conn) == PQTRANS_INTRANS ? "INTRANS" :
-			 PQtransactionStatus(conn) == PQTRANS_INERROR ? "INERROR" :
-			 "UNKNOWN");
-		PQfinish(conn);
-		entry->conntx = PGSQL_FDW_CONNTX_NONE;
-		entry->refs = 0;
-		entry->conn = NULL;
-		return;
-	}
-
-	/*
-	 * Decrease reference counter of this connection.  Even if the caller was
-	 * the last referrer, we don't unregister it from cache.
-	 */
-	entry->refs--;
-	if (entry->refs < 0)
-		entry->refs = 0;	/* just in case */
-
-	/*
-	 * If this connection uses remote transaction and there is no user other
-	 * than the caller, abort the remote transaction and forget about it.
-	 */
-	if (entry->conntx > PGSQL_FDW_CONNTX_NONE && entry->refs == 0)
-	{
-		if (entry->conntx > PGSQL_FDW_CONNTX_READ_ONLY)
-			deallocate_remote_prepare(conn);
-		if (is_abort || entry->conntx == PGSQL_FDW_CONNTX_READ_ONLY)
-			abort_remote_tx(conn);
-		else
-			commit_remote_tx(conn);
-
-		entry->conntx = PGSQL_FDW_CONNTX_NONE;
-	}
 }
 
 /*
- * Clean the connection up via ResourceOwner.
+ * Assign a "unique" number for a cursor.
+ *
+ * These really only need to be unique per connection within a transaction.
+ * For the moment we ignore the per-connection point and assign them across
+ * all connections in the transaction, but we ask for the connection to be
+ * supplied in case we want to refine that.
+ *
+ * Note that even if wraparound happens in a very long transaction, actual
+ * collisions are highly improbable; just be sure to use %u not %d to print.
+ */
+unsigned int
+GetCursorNumber(PGconn *conn)
+{
+	return ++cursor_number;
+}
+
+/*
+ * Report an error we got from the remote server.
+ *
+ * elevel: error level to use (typically ERROR, but might be less)
+ * res: PGresult containing the error
+ * clear: if true, PQclear the result (otherwise caller will handle it)
+ * sql: NULL, or text of remote command we tried to execute
+ */
+void
+pgfdw_report_error(int elevel, PGresult *res, bool clear, const char *sql)
+{
+	/* If requested, PGresult must be released before leaving this function. */
+	PG_TRY();
+	{
+		char	   *diag_sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+		char	   *message_primary = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY);
+		char	   *message_detail = PQresultErrorField(res, PG_DIAG_MESSAGE_DETAIL);
+		char	   *message_hint = PQresultErrorField(res, PG_DIAG_MESSAGE_HINT);
+		char	   *message_context = PQresultErrorField(res, PG_DIAG_CONTEXT);
+		int			sqlstate;
+
+		if (diag_sqlstate)
+			sqlstate = MAKE_SQLSTATE(diag_sqlstate[0],
+									 diag_sqlstate[1],
+									 diag_sqlstate[2],
+									 diag_sqlstate[3],
+									 diag_sqlstate[4]);
+		else
+			sqlstate = ERRCODE_CONNECTION_FAILURE;
+
+		ereport(elevel,
+				(errcode(sqlstate),
+				 message_primary ? errmsg_internal("%s", message_primary) :
+				 errmsg("unknown error"),
+			   message_detail ? errdetail_internal("%s", message_detail) : 0,
+				 message_hint ? errhint("%s", message_hint) : 0,
+				 message_context ? errcontext("%s", message_context) : 0,
+				 sql ? errcontext("Remote SQL command: %s", sql) : 0));
+	}
+	PG_CATCH();
+	{
+		if (clear)
+			PQclear(res);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (clear)
+		PQclear(res);
+}
+
+/*
+ * pgfdw_xact_callback --- cleanup at main-transaction end.
  */
 static void
-cleanup_connection(ResourceReleasePhase phase,
-				   bool isCommit,
-				   bool isTopLevel,
-				   void *arg)
+pgfdw_xact_callback(XactEvent event, void *arg)
 {
-	HASH_SEQ_STATUS	scan;
-	ConnCacheEntry *entry = (ConnCacheEntry *) arg;
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
 
-	/* If the transaction was committed, don't close connections. */
-	if (isCommit)
+	/* Quick exit if no connections were touched in this transaction. */
+	if (!xact_got_connection)
 		return;
 
 	/*
-	 * We clean the connection up on post-lock because foreign connections are
-	 * backend-internal resource.
-	 */
-	if (phase != RESOURCE_RELEASE_AFTER_LOCKS)
-		return;
-
-	/*
-	 * We ignore cleanup for ResourceOwners other than transaction.  At this
-	 * point, such a ResourceOwner is only Portal.
-	 */
-	if (CurrentResourceOwner != CurTransactionResourceOwner)
-		return;
-
-	/*
-	 * We don't need to clean up at end of subtransactions, because they might
-	 * be recovered to consistent state with savepoints.
-	 */
-	if (!isTopLevel)
-		return;
-
-	/*
-	 * Here, it must be after abort of top level transaction.  Disconnect all
-	 * cached connections to clear error status out and reset their reference
-	 * counters.
+	 * Scan all connection cache entries to find open remote transactions, and
+	 * close them.
 	 */
 	hash_seq_init(&scan, ConnectionHash);
 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
 	{
-		elog(DEBUG3, "discard postgres_fdw connection %p due to resowner cleanup",
+		PGresult   *res;
+
+		/* We only care about connections with open remote transactions */
+		if (entry->conn == NULL || entry->xact_depth == 0)
+			continue;
+
+		elog(DEBUG3, "closing remote transaction on connection %p",
 			 entry->conn);
-		PQfinish(entry->conn);
-		entry->conntx = PGSQL_FDW_CONNTX_NONE;
-		entry->refs = 0;
-		entry->conn = NULL;
-	}
-}
 
-/*
- * Get list of connections currently active.
- */
-Datum postgres_fdw_get_connections(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(postgres_fdw_get_connections);
-Datum
-postgres_fdw_get_connections(PG_FUNCTION_ARGS)
-{
-	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	HASH_SEQ_STATUS		scan;
-	ConnCacheEntry	   *entry;
-	MemoryContext		oldcontext = CurrentMemoryContext;
-	Tuplestorestate	   *tuplestore;
-	TupleDesc			tupdesc;
-
-	/* We return list of connection with storing them in a Tuplestore. */
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = NULL;
-	rsinfo->setDesc = NULL;
-
-	/* Create tuplestore and copy of TupleDesc in per-query context. */
-	MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
-
-	tupdesc = CreateTemplateTupleDesc(2, false);
-	TupleDescInitEntry(tupdesc, 1, "srvid", OIDOID, -1, 0);
-	TupleDescInitEntry(tupdesc, 2, "usesysid", OIDOID, -1, 0);
-	rsinfo->setDesc = tupdesc;
-
-	tuplestore = tuplestore_begin_heap(false, false, work_mem);
-	rsinfo->setResult = tuplestore;
-
-	MemoryContextSwitchTo(oldcontext);
-
-	/*
-	 * We need to scan sequentially since we use the address to find
-	 * appropriate PGconn from the hash table.
-	 */
-	if (ConnectionHash != NULL)
-	{
-		hash_seq_init(&scan, ConnectionHash);
-		while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+		switch (event)
 		{
-			Datum		values[2];
-			bool		nulls[2];
-			HeapTuple	tuple;
+			case XACT_EVENT_PRE_COMMIT:
+				/* Commit all remote transactions during pre-commit */
+				res = PQexec(entry->conn, "COMMIT TRANSACTION");
+				if (PQresultStatus(res) != PGRES_COMMAND_OK)
+					pgfdw_report_error(ERROR, res, true, "COMMIT TRANSACTION");
+				PQclear(res);
+				break;
+			case XACT_EVENT_PRE_PREPARE:
 
-			/* Ignore inactive connections */
-			if (PQstatus(entry->conn) != CONNECTION_OK)
-				continue;
+				/*
+				 * We disallow remote transactions that modified anything,
+				 * since it's not really reasonable to hold them open until
+				 * the prepared transaction is committed.  For the moment,
+				 * throw error unconditionally; later we might allow read-only
+				 * cases.  Note that the error will cause us to come right
+				 * back here with event == XACT_EVENT_ABORT, so we'll clean up
+				 * the connection state at that point.
+				 */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot prepare a transaction that modified remote tables")));
+				break;
+			case XACT_EVENT_COMMIT:
+			case XACT_EVENT_PREPARE:
+				/* Should not get here -- pre-commit should have handled it */
+				elog(ERROR, "missed cleaning up connection during pre-commit");
+				break;
+			case XACT_EVENT_ABORT:
+				/* If we're aborting, abort all remote transactions too */
+				res = PQexec(entry->conn, "ABORT TRANSACTION");
+				/* Note: can't throw ERROR, it would be infinite loop */
+				if (PQresultStatus(res) != PGRES_COMMAND_OK)
+					pgfdw_report_error(WARNING, res, true,
+									   "ABORT TRANSACTION");
+				else
+					PQclear(res);
+				break;
+		}
 
-			/*
-			 * Ignore other users' connections if current user isn't a
-			 * superuser.
-			 */
-			if (!superuser() && entry->userid != GetUserId())
-				continue;
+		/* Reset state to show we're out of a transaction */
+		entry->xact_depth = 0;
 
-			values[0] = ObjectIdGetDatum(entry->serverid);
-			values[1] = ObjectIdGetDatum(entry->userid);
-			nulls[0] = false;
-			nulls[1] = false;
-
-			tuple = heap_formtuple(tupdesc, values, nulls);
-			tuplestore_puttuple(tuplestore, tuple);
+		/*
+		 * If the connection isn't in a good idle state, discard it to
+		 * recover. Next GetConnection will open a new connection.
+		 */
+		if (PQstatus(entry->conn) != CONNECTION_OK ||
+			PQtransactionStatus(entry->conn) != PQTRANS_IDLE)
+		{
+			elog(DEBUG3, "discarding connection %p", entry->conn);
+			PQfinish(entry->conn);
+			entry->conn = NULL;
 		}
 	}
-	tuplestore_donestoring(tuplestore);
 
-	PG_RETURN_VOID();
+	/*
+	 * Regardless of the event type, we can now mark ourselves as out of the
+	 * transaction.  (Note: if we are here during PRE_COMMIT or PRE_PREPARE,
+	 * this saves a useless scan of the hashtable during COMMIT or PREPARE.)
+	 */
+	xact_got_connection = false;
+
+	/* Also reset cursor numbering for next transaction */
+	cursor_number = 0;
 }
 
 /*
- * Discard persistent connection designated by given connection name.
+ * pgfdw_subxact_callback --- cleanup at subtransaction end.
  */
-Datum postgres_fdw_disconnect(PG_FUNCTION_ARGS);
-PG_FUNCTION_INFO_V1(postgres_fdw_disconnect);
-Datum
-postgres_fdw_disconnect(PG_FUNCTION_ARGS)
+static void
+pgfdw_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+					   SubTransactionId parentSubid, void *arg)
 {
-	Oid					serverid = PG_GETARG_OID(0);
-	Oid					userid = PG_GETARG_OID(1);
-	ConnCacheEntry		key;
-	ConnCacheEntry	   *entry = NULL;
-	bool				found;
+	HASH_SEQ_STATUS scan;
+	ConnCacheEntry *entry;
+	int			curlevel;
 
-	/* Non-superuser can't discard other users' connection. */
-	if (!superuser() && userid != GetOuterUserId())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
-				 errmsg("only superuser can discard other user's connection")));
+	/* Nothing to do at subxact start, nor after commit. */
+	if (!(event == SUBXACT_EVENT_PRE_COMMIT_SUB ||
+		  event == SUBXACT_EVENT_ABORT_SUB))
+		return;
+
+	/* Quick exit if no connections were touched in this transaction. */
+	if (!xact_got_connection)
+		return;
 
 	/*
-	 * If no connection has been established, or no such connections, just
-	 * return "NG" to indicate nothing has done.
+	 * Scan all connection cache entries to find open remote subtransactions
+	 * of the current level, and close them.
 	 */
-	if (ConnectionHash == NULL)
-		PG_RETURN_TEXT_P(cstring_to_text("NG"));
+	curlevel = GetCurrentTransactionNestLevel();
+	hash_seq_init(&scan, ConnectionHash);
+	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
+	{
+		PGresult   *res;
+		char		sql[100];
 
-	key.serverid = serverid;
-	key.userid = userid;
-	entry = hash_search(ConnectionHash, &key, HASH_FIND, &found);
-	if (!found)
-		PG_RETURN_TEXT_P(cstring_to_text("NG"));
+		/*
+		 * We only care about connections with open remote subtransactions of
+		 * the current level.
+		 */
+		if (entry->conn == NULL || entry->xact_depth < curlevel)
+			continue;
 
-	/* Discard cached connection, and clear reference counter. */
-	PQfinish(entry->conn);
-	entry->conntx = PGSQL_FDW_CONNTX_NONE;
-	entry->refs = 0;
-	entry->conn = NULL;
+		if (entry->xact_depth > curlevel)
+			elog(ERROR, "missed cleaning up remote subtransaction at level %d",
+				 entry->xact_depth);
 
-	PG_RETURN_TEXT_P(cstring_to_text("OK"));
+		if (event == SUBXACT_EVENT_PRE_COMMIT_SUB)
+		{
+			/* Commit all remote subtransactions during pre-commit */
+			snprintf(sql, sizeof(sql), "RELEASE SAVEPOINT s%d", curlevel);
+			res = PQexec(entry->conn, sql);
+			if (PQresultStatus(res) != PGRES_COMMAND_OK)
+				pgfdw_report_error(ERROR, res, true, sql);
+			PQclear(res);
+		}
+		else
+		{
+			/* Rollback all remote subtransactions during abort */
+			snprintf(sql, sizeof(sql),
+					 "ROLLBACK TO SAVEPOINT s%d; RELEASE SAVEPOINT s%d",
+					 curlevel, curlevel);
+			res = PQexec(entry->conn, sql);
+			if (PQresultStatus(res) != PGRES_COMMAND_OK)
+				pgfdw_report_error(WARNING, res, true, sql);
+			else
+				PQclear(res);
+		}
+
+		/* OK, we're outta that level of subtransaction */
+		entry->xact_depth--;
+	}
 }
