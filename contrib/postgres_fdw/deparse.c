@@ -25,6 +25,7 @@
 
 #include "postgres_fdw.h"
 
+#include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/transam.h"
@@ -360,9 +361,11 @@ void
 deparseSimpleSql(StringInfo buf,
 				 PlannerInfo *root,
 				 RelOptInfo *baserel,
-				 List *local_conds)
+				 List *local_conds,
+				 AttrNumber anum_rowid)
 {
 	RangeTblEntry *rte = root->simple_rte_array[baserel->relid];
+	Relation	rel;
 	Bitmapset  *attrs_used = NULL;
 	bool		have_wholerow;
 	bool		first;
@@ -382,6 +385,14 @@ deparseSimpleSql(StringInfo buf,
 					   &attrs_used);
 	}
 
+	/*
+	 * Add all the attributes used by RETURNING clause, if this foreign
+	 * table is target relation of writer commands.
+	 */
+	if (root->parse->resultRelation == baserel->relid)
+		pull_varattnos((Node *) root->parse->returningList,
+					   baserel->relid, &attrs_used);
+
 	/* If there's a whole-row reference, we'll need all the columns. */
 	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
 								  attrs_used);
@@ -395,8 +406,9 @@ deparseSimpleSql(StringInfo buf,
 	 * which at runtime.)  Note however that any dropped columns are ignored.
 	 */
 	appendStringInfo(buf, "SELECT ");
+	rel = heap_open(rte->relid, NoLock);
 	first = true;
-	for (attr = 1; attr <= baserel->max_attr; attr++)
+	for (attr = 1; attr <= RelationGetNumberOfAttributes(rel); attr++)
 	{
 		/* Ignore dropped attributes. */
 		if (get_rte_attribute_is_dropped(rte, attr))
@@ -412,6 +424,14 @@ deparseSimpleSql(StringInfo buf,
 			deparseColumnRef(buf, baserel->relid, attr, root);
 		else
 			appendStringInfo(buf, "NULL");
+	}
+	heap_close(rel, NoLock);
+
+	/* Remote citd is row-identifier of this FDW */
+	if (anum_rowid != InvalidAttrNumber)
+	{
+		appendStringInfo(buf, "%sctid", (first ? "" : ", "));
+		first = false;
 	}
 
 	/* Don't generate bad syntax if no undropped columns */
@@ -532,6 +552,132 @@ deparseAnalyzeSql(StringInfo buf, Relation rel)
 	 */
 	appendStringInfo(buf, " FROM ");
 	deparseRelation(buf, relid);
+}
+
+/*
+ * deparse RETURNING clause of INSERT/UPDATE/DELETE
+ */
+static void
+deparseReturningSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+					Relation frel)
+{
+	AttrNumber  i, nattrs = RelationGetNumberOfAttributes(frel);
+
+	appendStringInfo(buf, " RETURNING ");
+	for (i=0; i < nattrs; i++)
+	{
+		Form_pg_attribute attr = RelationGetDescr(frel)->attrs[i];
+
+		if (i > 0)
+			appendStringInfo(buf, ",");
+
+		if (attr->attisdropped)
+			appendStringInfo(buf, "null");
+		else
+		{
+			Var		var;
+
+			var.varno = rtindex;
+			var.varattno = attr->attnum;
+			deparseVar(buf, &var, root);
+		}
+	}
+}
+
+/*
+ * deparse remote INSERT statement
+ */
+void
+deparseInsertSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+				 List *targetAttrs, bool has_returning)
+{
+	RangeTblEntry  *rte = root->simple_rte_array[rtindex];
+	Relation		frel = heap_open(rte->relid, NoLock);
+	ListCell	   *lc;
+	AttrNumber		pindex = 1;
+
+	appendStringInfo(buf, "INSERT INTO ");
+	deparseRelation(buf, rte->relid);
+	appendStringInfo(buf, "(");
+
+	foreach (lc, targetAttrs)
+	{
+		Var		var;
+		Form_pg_attribute	attr
+			= RelationGetDescr(frel)->attrs[lfirst_int(lc) - 1];
+
+		Assert(!attr->attisdropped);
+		if (lc != list_head(targetAttrs))
+			appendStringInfo(buf, ",");
+
+		var.varno = rtindex;
+		var.varattno = attr->attnum;
+		deparseVar(buf, &var, root);
+	}
+	appendStringInfo(buf, ") VALUES (");
+	foreach (lc, targetAttrs)
+	{
+		appendStringInfo(buf, "%s$%d", (pindex == 1 ? "" : ","), pindex);
+		pindex++;
+	}
+	appendStringInfo(buf, ")");
+
+	if (has_returning)
+		deparseReturningSql(buf, root, rtindex, frel);
+
+	heap_close(frel, NoLock);
+}
+
+/*
+ * deparse remote UPDATE statement
+ */
+void
+deparseUpdateSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+				 List *targetAttrs, bool has_returning)
+{
+	RangeTblEntry  *rte = root->simple_rte_array[rtindex];
+	Relation		frel = heap_open(rte->relid, NoLock);
+	ListCell	   *lc;
+	AttrNumber		pindex = 2;
+
+	appendStringInfo(buf, "UPDATE ");
+	deparseRelation(buf, rte->relid);
+	appendStringInfo(buf, " SET ");
+
+	foreach (lc, targetAttrs)
+	{
+		Var		var;
+		Form_pg_attribute	attr
+			= RelationGetDescr(frel)->attrs[lfirst_int(lc) - 1];
+
+		Assert(!attr->attisdropped);
+
+		if (lc != list_head(targetAttrs))
+			appendStringInfo(buf, ",");
+
+		var.varno = rtindex;
+		var.varattno = attr->attnum;
+		deparseVar(buf, &var, root);
+		appendStringInfo(buf, "=$%d", pindex++);
+	}
+	appendStringInfo(buf, " WHERE ctid=$1");
+	if (has_returning)
+		deparseReturningSql(buf, root, rtindex, frel);
+
+	heap_close(frel, NoLock);
+}
+
+/*
+ * deparse remote DELETE statement
+ */
+void
+deparseDeleteSql(StringInfo buf, PlannerInfo *root, Index rtindex)
+{
+	RangeTblEntry  *rte = root->simple_rte_array[rtindex];
+
+	appendStringInfo(buf, "DELETE FROM ");
+	deparseRelation(buf, rte->relid);
+	appendStringInfo(buf, " WHERE ctid = $1");
 }
 
 /*

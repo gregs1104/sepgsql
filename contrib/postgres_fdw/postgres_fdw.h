@@ -42,12 +42,18 @@ extern void classifyConditions(PlannerInfo *root,
 extern void deparseSimpleSql(StringInfo buf,
 				 PlannerInfo *root,
 				 RelOptInfo *baserel,
-				 List *local_conds);
+				 List *local_conds,
+				 AttrNumber anum_rowid);
 extern void appendWhereClause(StringInfo buf,
 				  bool has_where,
 				  List *exprs,
 				  PlannerInfo *root);
 extern void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
 extern void deparseAnalyzeSql(StringInfo buf, Relation rel);
+extern void deparseInsertSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+							 List *targetAttrs, bool has_returning);
+extern void deparseUpdateSql(StringInfo buf, PlannerInfo *root, Index rtindex,
+							 List *targetAttrs, bool has_returning);
+extern void deparseDeleteSql(StringInfo buf, PlannerInfo *root, Index rtindex);
 
 #endif   /* POSTGRES_FDW_H */

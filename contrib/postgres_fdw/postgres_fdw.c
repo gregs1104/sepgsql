@@ -15,6 +15,7 @@
 #include "postgres_fdw.h"
 
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/vacuum.h"
@@ -51,6 +52,7 @@ typedef struct PgFdwRelationInfo
 	List	   *param_conds;
 	List	   *local_conds;
 	List	   *param_numbers;
+	AttrNumber	anum_rowid;
 
 	/* Cached catalog information. */
 	ForeignTable *table;
@@ -139,6 +141,24 @@ typedef struct PgFdwAnalyzeState
 } PgFdwAnalyzeState;
 
 /*
+ * Describes a state of modify request for a foreign table
+ */
+typedef struct PgFdwModifyState
+{
+	PGconn     *conn;
+	char       *query;
+	bool        has_returning;
+	List       *target_attrs;
+	char       *p_name;
+	int         p_nums;
+	Oid        *p_types;
+	FmgrInfo   *p_flinfo;
+	Oid        *r_ioparam;
+	FmgrInfo   *r_flinfo;
+	MemoryContext   es_query_cxt;
+} PgFdwModifyState;
+
+/*
  * Identify the attribute where data conversion fails.
  */
 typedef struct ConversionLocation
@@ -157,6 +177,11 @@ PG_FUNCTION_INFO_V1(postgres_fdw_handler);
 /*
  * FDW callback routines
  */
+static AttrNumber postgresGetForeignRelWidth(PlannerInfo *root,
+											 RelOptInfo *baserel,
+											 Relation foreignrel,
+											 bool inhparent,
+											 List *targetList);
 static void postgresGetForeignRelSize(PlannerInfo *root,
 						  RelOptInfo *baserel,
 						  Oid foreigntableid);
@@ -178,6 +203,23 @@ static void postgresEndForeignScan(ForeignScanState *node);
 static bool postgresAnalyzeForeignTable(Relation relation,
 							AcquireSampleRowsFunc *func,
 							BlockNumber *totalpages);
+static List *postgresPlanForeignModify(PlannerInfo *root,
+									   ModifyTable *plan,
+									   Index resultRelation,
+									   Plan *subplan);
+static void postgresBeginForeignModify(ModifyTableState *mtstate,
+									   ResultRelInfo *resultRelInfo,
+									   List *fdw_private,
+									   Plan *subplan,
+									   int eflags);
+static TupleTableSlot *postgresExecForeignInsert(ResultRelInfo *rinfo,
+												 TupleTableSlot *slot);
+static bool postgresExecForeignDelete(ResultRelInfo *rinfo,
+									  const char *rowid);
+static TupleTableSlot * postgresExecForeignUpdate(ResultRelInfo *rinfo,
+												  const char *rowid,
+												  TupleTableSlot *slot);
+static void postgresEndForeignModify(ResultRelInfo *rinfo);
 
 /*
  * Helper functions
@@ -215,6 +257,7 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 	FdwRoutine *routine = makeNode(FdwRoutine);
 
 	/* Required handler functions. */
+	routine->GetForeignRelWidth = postgresGetForeignRelWidth;
 	routine->GetForeignRelSize = postgresGetForeignRelSize;
 	routine->GetForeignPaths = postgresGetForeignPaths;
 	routine->GetForeignPlan = postgresGetForeignPlan;
@@ -223,11 +266,58 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 	routine->IterateForeignScan = postgresIterateForeignScan;
 	routine->ReScanForeignScan = postgresReScanForeignScan;
 	routine->EndForeignScan = postgresEndForeignScan;
+	routine->PlanForeignModify = postgresPlanForeignModify;
+	routine->BeginForeignModify = postgresBeginForeignModify;
+	routine->ExecForeignInsert = postgresExecForeignInsert;
+	routine->ExecForeignDelete = postgresExecForeignDelete;
+	routine->ExecForeignUpdate = postgresExecForeignUpdate;
+	routine->EndForeignModify = postgresEndForeignModify;
 
 	/* Optional handler functions. */
 	routine->AnalyzeForeignTable = postgresAnalyzeForeignTable;
 
 	PG_RETURN_POINTER(routine);
+}
+
+/*
+ * postgresGetForeignRelWidth
+ *		Informs how many columns (including pseudo ones) are needed.
+ */
+static AttrNumber
+postgresGetForeignRelWidth(PlannerInfo *root,
+						   RelOptInfo *baserel,
+						   Relation foreignrel,
+						   bool inhparent,
+						   List *targetList)
+{
+	/*
+	 * We use PgFdwRelationInfo to pass various information to subsequent
+	 * functions.
+	 */
+	PgFdwRelationInfo  *fpinfo = palloc0(sizeof(PgFdwRelationInfo));
+
+	baserel->fdw_private = fpinfo;
+
+	/*
+	 * If this foreign table is result relation of UPDATE or DELETE,
+	 * it needs to move a row-identifier from scanner-stage to
+	 * modifier-stage. If required, rewriteTargetListUD() appends
+	 * a target-entry with resjunk=true that contains just a Var-node
+	 * towards (number of attributes of foreign table + 1) column that
+	 * does not exist of course, however, we can utilize pseudo-column
+	 * to return information rather than data structure in the table-
+	 * declaration.
+	 */
+	fpinfo->anum_rowid = get_pseudo_rowid_column(baserel, targetList);
+	if (fpinfo->anum_rowid != InvalidAttrNumber)
+	{
+		RangeTblEntry *rte = rt_fetch(baserel->relid,
+									  root->parse->rtable);
+		rte->eref->colnames = lappend(rte->eref->colnames,
+									  makeString("ctid"));
+		return fpinfo->anum_rowid;
+	}
+	return RelationGetNumberOfAttributes(foreignrel);
 }
 
 /*
@@ -250,7 +340,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 {
 	bool		use_remote_estimate = false;
 	ListCell   *lc;
-	PgFdwRelationInfo *fpinfo;
+	PgFdwRelationInfo *fpinfo = baserel->fdw_private;
 	StringInfo	sql;
 	ForeignTable *table;
 	ForeignServer *server;
@@ -267,11 +357,6 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	List	   *local_conds;
 	List	   *param_numbers;
 
-	/*
-	 * We use PgFdwRelationInfo to pass various information to subsequent
-	 * functions.
-	 */
-	fpinfo = palloc0(sizeof(PgFdwRelationInfo));
 	initStringInfo(&fpinfo->sql);
 	sql = &fpinfo->sql;
 
@@ -310,7 +395,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 */
 	classifyConditions(root, baserel, &remote_conds, &param_conds,
 					   &local_conds, &param_numbers);
-	deparseSimpleSql(sql, root, baserel, local_conds);
+	deparseSimpleSql(sql, root, baserel, local_conds, fpinfo->anum_rowid);
 	if (list_length(remote_conds) > 0)
 		appendWhereClause(sql, true, remote_conds, root);
 
@@ -421,7 +506,6 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	fpinfo->param_numbers = param_numbers;
 	fpinfo->table = table;
 	fpinfo->server = server;
-	baserel->fdw_private = (void *) fpinfo;
 }
 
 /*
@@ -1361,6 +1445,399 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 
 		MemoryContextSwitchTo(oldcontext);
 	}
+}
+
+static List *
+postgresPlanForeignModify(PlannerInfo *root,
+						  ModifyTable *plan,
+						  Index resultRelation,
+						  Plan *subplan)
+{
+	CmdType		operation = plan->operation;
+	List	   *targetAttrs = NIL;
+	bool		has_returning = (!!plan->returningLists);
+	StringInfoData sql;
+
+	initStringInfo(&sql);
+
+	/*
+	 * XXX - FOR UPDATE should be added on the remote query in scanner-
+	 * stage to avoid unexpected concurrent update/delete of remote rows.
+	 */
+	if (operation == CMD_UPDATE || operation == CMD_DELETE)
+	{
+		ForeignScan	   *fscan;
+		Value		   *select_sql;
+
+		fscan = lookup_foreign_scan_plan(subplan, resultRelation);
+		if (!fscan)
+			elog(ERROR, "no underlying scan plan found in subplan tree");
+
+		select_sql = list_nth(fscan->fdw_private,
+							  FdwPrivateSelectSql);
+		appendStringInfo(&sql, "%s FOR UPDATE", strVal(select_sql));
+		strVal(select_sql) = pstrdup(sql.data);
+
+		resetStringInfo(&sql);
+	}
+
+	/*
+	 * XXX - In case of INSERT or UPDATE commands, it needs to list up
+	 * columns to be updated or inserted for performance optimization
+	 * and consistent behavior when DEFAULT is set on the remote table.
+	 */
+	if (operation == CMD_INSERT || operation == CMD_UPDATE)
+	{
+		RangeTblEntry  *rte = rt_fetch(resultRelation, root->parse->rtable);
+		Bitmapset	   *tmpset = bms_copy(rte->modifiedCols);
+		AttrNumber		col;
+
+		while ((col = bms_first_member(tmpset)) >= 0)
+		{
+			col += FirstLowInvalidHeapAttributeNumber;
+	        if (col <= InvalidAttrNumber)
+				elog(ERROR, "system-column update is not supported");
+			targetAttrs = lappend_int(targetAttrs, col);
+		}
+	}
+
+	switch (operation)
+	{
+		case CMD_INSERT:
+			deparseInsertSql(&sql, root, resultRelation,
+							 targetAttrs, has_returning);
+			elog(DEBUG3, "Remote INSERT query: %s", sql.data);
+			break;
+		case CMD_UPDATE:
+			deparseUpdateSql(&sql, root, resultRelation,
+							 targetAttrs, has_returning);
+			elog(DEBUG3, "Remote UPDATE query: %s", sql.data);
+			break;
+		case CMD_DELETE:
+			deparseDeleteSql(&sql, root, resultRelation);
+			elog(DEBUG3, "Remote DELETE query: %s", sql.data);
+			break;
+		default:
+			elog(ERROR, "unexpected operation: %d", (int) operation);
+	}
+	return list_make3(makeString(sql.data),
+					  makeInteger(has_returning),
+					  targetAttrs);
+}
+
+static void
+postgresBeginForeignModify(ModifyTableState *mtstate,
+						   ResultRelInfo *resultRelInfo,
+						   List *fdw_private,
+						   Plan *subplan,
+						   int eflags)
+{
+	PgFdwModifyState *fmstate;
+	CmdType			operation = mtstate->operation;
+	Relation		frel = resultRelInfo->ri_RelationDesc;
+	AttrNumber		n_params;
+	ListCell	   *lc;
+	ForeignTable   *ftable;
+	ForeignServer  *fserver;
+	UserMapping	   *fuser;
+	Oid				typefnoid;
+	bool			isvarlena;
+
+	/*
+	 * Construct PgFdwExecutionState
+	 */
+	fmstate = palloc0(sizeof(PgFdwModifyState));
+
+	ftable = GetForeignTable(RelationGetRelid(frel));
+	fserver = GetForeignServer(ftable->serverid);
+	fuser = GetUserMapping(GetOuterUserId(), fserver->serverid);
+
+	fmstate->query = strVal(linitial(fdw_private));
+	fmstate->has_returning = intVal(lsecond(fdw_private));
+	fmstate->target_attrs = lthird(fdw_private);
+	fmstate->conn = GetConnection(fserver, fuser);
+
+	n_params = list_length(fmstate->target_attrs) + 1;
+	fmstate->p_name = NULL;
+	fmstate->p_types = palloc0(sizeof(Oid) * n_params);
+	fmstate->p_flinfo = palloc0(sizeof(FmgrInfo) * n_params);
+
+	/* 1st parameter is ctid on UPDATE/DELETE */
+	if (operation == CMD_UPDATE || operation == CMD_DELETE)
+	{
+		fmstate->p_types[fmstate->p_nums] = TIDOID;
+		getTypeOutputInfo(TIDOID, &typefnoid, &isvarlena);
+		fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
+		fmstate->p_nums++;
+	}
+	/* following parameters are regular columns */
+	if (operation == CMD_UPDATE || operation == CMD_INSERT)
+	{
+		foreach (lc, fmstate->target_attrs)
+		{
+			Form_pg_attribute attr
+				= RelationGetDescr(frel)->attrs[lfirst_int(lc) - 1];
+
+			Assert(!attr->attisdropped);
+
+			fmstate->p_types[fmstate->p_nums] = attr->atttypid;
+			getTypeOutputInfo(attr->atttypid, &typefnoid, &isvarlena);
+			fmgr_info(typefnoid, &fmstate->p_flinfo[fmstate->p_nums]);
+			fmstate->p_nums++;
+		}
+	}
+	Assert(fmstate->p_nums <= n_params);
+
+	/* input handlers for returning clause */
+	if (fmstate->has_returning)
+	{
+		AttrNumber  i, nattrs = RelationGetNumberOfAttributes(frel);
+
+		fmstate->r_ioparam = palloc0(sizeof(Oid) * nattrs);
+		fmstate->r_flinfo = palloc0(sizeof(FmgrInfo) * nattrs);
+		for (i=0; i < nattrs; i++)
+		{
+			Form_pg_attribute attr = RelationGetDescr(frel)->attrs[i];
+
+			if (attr->attisdropped)
+				continue;
+
+			getTypeInputInfo(attr->atttypid, &typefnoid,
+							 &fmstate->r_ioparam[i]);
+			fmgr_info(typefnoid, &fmstate->r_flinfo[i]);
+		}
+	}
+	fmstate->es_query_cxt = mtstate->ps.state->es_query_cxt;
+	resultRelInfo->ri_fdw_state = fmstate;
+}
+
+static void
+prepare_foreign_modify(PgFdwModifyState *fmstate)
+{
+	static int	prep_id = 1;
+	char		prep_name[NAMEDATALEN];
+	PGresult   *res;
+
+	snprintf(prep_name, sizeof(prep_name),
+			 "pgsql_fdw_prep_%08x", prep_id++);
+
+	res = PQprepare(fmstate->conn,
+					prep_name,
+					fmstate->query,
+					fmstate->p_nums,
+					fmstate->p_types);
+	if (!res || PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		elog(ERROR, "could not prepare statement (%s): %s",
+			 fmstate->query, PQerrorMessage(fmstate->conn));
+	}
+	PQclear(res);
+
+	fmstate->p_name = MemoryContextStrdup(fmstate->es_query_cxt, prep_name);
+}
+
+static int
+setup_exec_prepared(ResultRelInfo *resultRelInfo,
+					const char *rowid, TupleTableSlot *slot,
+					const char *p_values[], int p_lengths[])
+{
+	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
+	int		pindex = 0;
+
+	/* 1st parameter is ctid */
+	if (rowid)
+	{
+		p_values[pindex] = rowid;
+		p_lengths[pindex] = strlen(rowid) + 1;
+		pindex++;
+	}
+
+	/* following parameters are as TupleDesc */
+	if (slot != NULL)
+	{
+		TupleDesc	tupdesc = slot->tts_tupleDescriptor;
+		ListCell   *lc;
+
+		foreach (lc, fmstate->target_attrs)
+		{
+	        Form_pg_attribute attr = tupdesc->attrs[lfirst_int(lc) - 1];
+			Datum	value;
+			bool	isnull;
+
+			Assert(!attr->attisdropped);
+
+			value = slot_getattr(slot, attr->attnum, &isnull);
+			if (isnull)
+			{
+				p_values[pindex] = NULL;
+				p_lengths[pindex] = 0;
+			}
+			else
+			{
+				p_values[pindex] =
+					OutputFunctionCall(&fmstate->p_flinfo[pindex], value);
+				p_lengths[pindex] = strlen(p_values[pindex]) + 1;
+			}
+			pindex++;
+		}
+	}
+	return pindex;
+}
+
+static void
+store_returning_result(PgFdwModifyState *fmstate,
+					   TupleTableSlot *slot, PGresult *res)
+{
+	TupleDesc	tupdesc = slot->tts_tupleDescriptor;
+	AttrNumber	i, nattrs = tupdesc->natts;
+	Datum	   *values = alloca(sizeof(Datum) * nattrs);
+	bool	   *isnull = alloca(sizeof(bool) * nattrs);
+	HeapTuple	newtup;
+
+	memset(values, 0, sizeof(Datum) * nattrs);
+	memset(isnull, 0, sizeof(bool) * nattrs);
+
+	for (i=0; i < nattrs; i++)
+	{
+		Form_pg_attribute attr = tupdesc->attrs[i];
+
+		if (attr->attisdropped || PQgetisnull(res, 0, i))
+			isnull[i] = true;
+		else
+		{
+			values[i] = InputFunctionCall(&fmstate->r_flinfo[i],
+										  PQgetvalue(res, 0, i),
+										  fmstate->r_ioparam[i],
+										  attr->atttypmod);
+		}
+	}
+	newtup = heap_form_tuple(tupdesc, values, isnull);
+	ExecStoreTuple(newtup, slot, InvalidBuffer, false);
+}
+
+static TupleTableSlot *
+postgresExecForeignInsert(ResultRelInfo *resultRelInfo,
+						  TupleTableSlot *slot)
+{
+	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
+	const char    **p_values  = alloca(sizeof(char *) * fmstate->p_nums);
+	int            *p_lengths = alloca(sizeof(int) * fmstate->p_nums);
+	AttrNumber      nattrs;
+	PGresult       *res;
+	int             n_rows;
+
+	if (!fmstate->p_name)
+		prepare_foreign_modify(fmstate);
+
+	nattrs = setup_exec_prepared(resultRelInfo,
+								 NULL, slot,
+								 p_values, p_lengths);
+	Assert(fmstate->p_nums == nattrs);
+
+	res = PQexecPrepared(fmstate->conn,
+						 fmstate->p_name,
+						 nattrs,
+						 p_values,
+						 p_lengths,
+						 NULL, 0);
+	if (!res || (!fmstate->has_returning ?
+				 PQresultStatus(res) != PGRES_COMMAND_OK :
+				 PQresultStatus(res) != PGRES_TUPLES_OK))
+		elog(ERROR, "could not execute prepared statement (%s): %s",
+			 fmstate->query, PQerrorMessage(fmstate->conn));
+	n_rows = atoi(PQcmdTuples(res));
+	if (n_rows > 0 && fmstate->has_returning)
+		store_returning_result(fmstate, slot, res);
+	PQclear(res);
+
+	return (n_rows > 0 ? slot : NULL);
+}
+
+static bool
+postgresExecForeignDelete(ResultRelInfo *resultRelInfo, const char *rowid)
+{
+	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
+	const char     *p_values[1];
+	int             p_lengths[1];
+	AttrNumber      nattrs;
+	PGresult       *res;
+	int             n_rows;
+
+	if (!fmstate->p_name)
+		prepare_foreign_modify(fmstate);
+
+	nattrs = setup_exec_prepared(resultRelInfo,
+								 rowid, NULL,
+								 p_values, p_lengths);
+	Assert(fmstate->p_nums == nattrs);
+
+	res = PQexecPrepared(fmstate->conn,
+						 fmstate->p_name,
+						 nattrs,
+						 p_values,
+						 p_lengths,
+						 NULL, 0);
+	if (!res ||  PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		PQclear(res);
+		elog(ERROR, "could not execute prepared statement (%s): %s",
+			 fmstate->query, PQerrorMessage(fmstate->conn));
+	}
+	n_rows = atoi(PQcmdTuples(res));
+    PQclear(res);
+
+	return (n_rows > 0 ? true : false);
+}
+
+static TupleTableSlot*
+postgresExecForeignUpdate(ResultRelInfo *resultRelInfo,
+						  const char *rowid, TupleTableSlot *slot)
+{
+	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
+	const char    **p_values  = alloca(sizeof(char *) * (fmstate->p_nums + 1));
+	int            *p_lengths = alloca(sizeof(int) * (fmstate->p_nums + 1));
+	AttrNumber      nattrs;
+	PGresult       *res;
+	int             n_rows;
+
+	if (!fmstate->p_name)
+		prepare_foreign_modify(fmstate);
+
+	nattrs = setup_exec_prepared(resultRelInfo,
+								 rowid, slot,
+								 p_values, p_lengths);
+	Assert(fmstate->p_nums == nattrs);
+
+	res = PQexecPrepared(fmstate->conn,
+						 fmstate->p_name,
+						 nattrs,
+						 p_values,
+						 p_lengths,
+						 NULL, 0);
+	if (!res || (!fmstate->has_returning ?
+				 PQresultStatus(res) != PGRES_COMMAND_OK :
+				 PQresultStatus(res) != PGRES_TUPLES_OK))
+	{
+		PQclear(res);
+		elog(ERROR, "could not execute prepared statement (%s): %s",
+			 fmstate->query, PQerrorMessage(fmstate->conn));
+	}
+	n_rows = atoi(PQcmdTuples(res));
+	if (n_rows > 0 && fmstate->has_returning)
+		store_returning_result(fmstate, slot, res);
+	PQclear(res);
+
+	return (n_rows > 0 ? slot : NULL);
+}
+
+static void
+postgresEndForeignModify(ResultRelInfo *resultRelInfo)
+{
+	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
+
+	ReleaseConnection(fmstate->conn);
+	fmstate->conn = NULL;
 }
 
 /*
