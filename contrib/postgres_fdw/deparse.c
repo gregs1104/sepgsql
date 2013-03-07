@@ -574,13 +574,7 @@ deparseReturningSql(StringInfo buf, PlannerInfo *root, Index rtindex,
 		if (attr->attisdropped)
 			appendStringInfo(buf, "null");
 		else
-		{
-			Var		var;
-
-			var.varno = rtindex;
-			var.varattno = attr->attnum;
-			deparseVar(buf, &var, root);
-		}
+			deparseColumnRef(buf, rtindex, attr->attnum, root);
 	}
 }
 
@@ -610,9 +604,7 @@ deparseInsertSql(StringInfo buf, PlannerInfo *root, Index rtindex,
 		if (lc != list_head(targetAttrs))
 			appendStringInfo(buf, ",");
 
-		var.varno = rtindex;
-		var.varattno = attr->attnum;
-		deparseVar(buf, &var, root);
+		deparseColumnRef(buf, rtindex, attr->attnum, root);
 	}
 	appendStringInfo(buf, ") VALUES (");
 	foreach (lc, targetAttrs)
@@ -655,9 +647,7 @@ deparseUpdateSql(StringInfo buf, PlannerInfo *root, Index rtindex,
 		if (lc != list_head(targetAttrs))
 			appendStringInfo(buf, ",");
 
-		var.varno = rtindex;
-		var.varattno = attr->attnum;
-		deparseVar(buf, &var, root);
+		deparseColumnRef(buf, rtindex, attr->attnum, root);
 		appendStringInfo(buf, "=$%d", pindex++);
 	}
 	appendStringInfo(buf, " WHERE ctid=$1");
