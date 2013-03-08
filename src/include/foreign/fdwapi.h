@@ -127,5 +127,6 @@ typedef struct FdwRoutine
 /* Functions in foreign/foreign.c */
 extern FdwRoutine *GetFdwRoutine(Oid fdwhandler);
 extern FdwRoutine *GetFdwRoutineByRelId(Oid relid);
+extern FdwRoutine *GetFdwRoutineForRelation(Relation relation, bool makecopy);
 
 #endif   /* FDWAPI_H */
