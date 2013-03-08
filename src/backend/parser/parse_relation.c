@@ -2087,20 +2087,7 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 	 * built (which can easily happen for rules).
 	 */
 	if (rte->rtekind == RTE_RELATION)
-	{
-		char   *attname = get_attname(rte->relid, attnum);
-
-		if (attname)
-			return attname;
-
-		/*
-		 * XXX - If FDW driver adds pseudo-columns, it may have attribute
-		 * number larger than number of relation's attribute. In this case,
-		 * get_attname() returns NULL and we fall back on alias list on eref.
-		 * It should not happen other than foreign tables.
-		 */
-		Assert(get_rel_relkind(rte->relid) == RELKIND_FOREIGN_TABLE);
-	}
+		return get_relid_attribute_name(rte->relid, attnum);
 
 	/*
 	 * Otherwise use the column name from eref.  There should always be one.

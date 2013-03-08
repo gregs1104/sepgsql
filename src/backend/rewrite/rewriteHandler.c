@@ -1165,13 +1165,11 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 					Relation target_relation)
 {
 	Var		   *var;
-	List	   *varList;
-	List	   *attNameList;
-	ListCell   *cell1;
-	ListCell   *cell2;
+	const char *attrname;
 	TargetEntry *tle;
 
 	if (target_relation->rd_rel->relkind == RELKIND_RELATION ||
+		target_relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE ||
 		target_relation->rd_rel->relkind == RELKIND_MATVIEW)
 	{
 		/*
@@ -1183,35 +1181,8 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 					  -1,
 					  InvalidOid,
 					  0);
-		varList = list_make1(var);
-		attNameList = list_make1("ctid");
-	}
-	else if (target_relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
-	{
-		/*
-		 * Emit Rowid so that executor can find the row to update or delete.
-		 */
-		var = makeVar(parsetree->resultRelation,
-					  RelationGetNumberOfAttributes(target_relation) + 1,
-					  CSTRINGOID,
-					  -2,
-					  InvalidOid,
-					  0);
-		varList = list_make1(var);
 
-		/*
-		 * Emit generic record Var so that executor will have the "old" view
-		 * row to pass the RETURNING clause (or upcoming triggers).
-		 */
-		var = makeVar(parsetree->resultRelation,
-					  InvalidAttrNumber,
-					  RECORDOID,
-					  -1,
-					  InvalidOid,
-					  0);
-		varList = lappend(varList, var);
-
-		attNameList = list_make2("rowid", "record");
+		attrname = "ctid";
 	}
 	else
 	{
@@ -1223,21 +1194,16 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 							  parsetree->resultRelation,
 							  0,
 							  false);
-		varList = list_make1(var);
-		attNameList = list_make1("wholerow");
+
+		attrname = "wholerow";
 	}
 
-	/*
-	 * Append them to targetList
-	 */
-	forboth (cell1, varList, cell2, attNameList)
-	{
-		tle = makeTargetEntry((Expr *)lfirst(cell1),
-							  list_length(parsetree->targetList) + 1,
-							  pstrdup((const char *)lfirst(cell2)),
-							  true);
-		parsetree->targetList = lappend(parsetree->targetList, tle);
-	}
+	tle = makeTargetEntry((Expr *) var,
+						  list_length(parsetree->targetList) + 1,
+						  pstrdup(attrname),
+						  true);
+
+	parsetree->targetList = lappend(parsetree->targetList, tle);
 }
 
 

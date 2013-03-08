@@ -268,11 +268,8 @@ typedef struct ProjectionInfo
  *						attribute numbers of the "original" tuple and the
  *						attribute numbers of the "clean" tuple.
  *	  resultSlot:		tuple slot used to hold cleaned tuple.
- *	  jf_junkRowidNo:	not used by junkfilter code.  Can be used by caller
- *						to remember the attno used to track a particular tuple
- *						being updated or deleted.
- *						(execMain.c stores the "ctid" attno here).
- *	  jf_junkRecordNo:	Also, the attno of whole-row reference.
+ *	  junkAttNo:		not used by junkfilter code.  Can be used by caller
+ *						to remember the attno of a specific junk attribute
  * ----------------
  */
 typedef struct JunkFilter
@@ -282,8 +279,7 @@ typedef struct JunkFilter
 	TupleDesc	jf_cleanTupType;
 	AttrNumber *jf_cleanMap;
 	TupleTableSlot *jf_resultSlot;
-	AttrNumber	jf_junkRowidNo;
-	AttrNumber	jf_junkRecordNo;
+	AttrNumber	jf_junkAttNo;
 } JunkFilter;
 
 /* ----------------

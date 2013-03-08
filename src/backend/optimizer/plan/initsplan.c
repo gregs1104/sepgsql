@@ -83,13 +83,9 @@ static void check_hashjoinable(RestrictInfo *restrictinfo);
  * is the only place that should call build_simple_rel with reloptkind
  * RELOPT_BASEREL.	(Note: build_simple_rel recurses internally to build
  * "other rel" RelOptInfos for the members of any appendrels we find here.)
- *
- * XXX - Also note that tlist needs to be pushed down into deeper level,
- * for construction of RelOptInfo relevant to foreign-tables with pseudo-
- * columns.
  */
 void
-add_base_rels_to_query(PlannerInfo *root, List *tlist, Node *jtnode)
+add_base_rels_to_query(PlannerInfo *root, Node *jtnode)
 {
 	if (jtnode == NULL)
 		return;
@@ -97,7 +93,7 @@ add_base_rels_to_query(PlannerInfo *root, List *tlist, Node *jtnode)
 	{
 		int			varno = ((RangeTblRef *) jtnode)->rtindex;
 
-		(void) build_simple_rel(root, varno, tlist, RELOPT_BASEREL);
+		(void) build_simple_rel(root, varno, RELOPT_BASEREL);
 	}
 	else if (IsA(jtnode, FromExpr))
 	{
@@ -105,14 +101,14 @@ add_base_rels_to_query(PlannerInfo *root, List *tlist, Node *jtnode)
 		ListCell   *l;
 
 		foreach(l, f->fromlist)
-			add_base_rels_to_query(root, tlist, lfirst(l));
+			add_base_rels_to_query(root, lfirst(l));
 	}
 	else if (IsA(jtnode, JoinExpr))
 	{
 		JoinExpr   *j = (JoinExpr *) jtnode;
 
-		add_base_rels_to_query(root, tlist, j->larg);
-		add_base_rels_to_query(root, tlist, j->rarg);
+		add_base_rels_to_query(root, j->larg);
+		add_base_rels_to_query(root, j->rarg);
 	}
 	else
 		elog(ERROR, "unrecognized node type: %d",

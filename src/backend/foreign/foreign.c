@@ -623,39 +623,6 @@ get_foreign_server_oid(const char *servername, bool missing_ok)
 }
 
 /*
- * get_pseudo_rowid_column
- *
- * It picks up an attribute number to be used for the pseudo rowid column,
- * if it exists.  It should be injected at rewriteHandler.c if the supplied query
- * is a UPDATE or DELETE command.  Elsewhere, it returns InvalidAttrNumber.
- */
-AttrNumber
-get_pseudo_rowid_column(RelOptInfo *baserel, List *targetList)
-{
-	ListCell   *cell;
-
-	foreach (cell, targetList)
-	{
-		TargetEntry *tle = lfirst(cell);
-
-		if (tle->resjunk &&
-			tle->resname && strcmp(tle->resname, "rowid") == 0)
-		{
-			Var	   *var;
-
-			if (!IsA(tle->expr, Var))
-				elog(ERROR, "unexpected node on junk rowid entry: %d",
-					 (int) nodeTag(tle->expr));
-
-			var = (Var *) tle->expr;
-			if (baserel->relid == var->varno)
-				return var->varattno;
-		}
-	}
-	return InvalidAttrNumber;
-}
-
-/*
  * lookup_foreign_scan_plan
  *
  * It looks up the ForeignScan plan node with the supplied range-table id.

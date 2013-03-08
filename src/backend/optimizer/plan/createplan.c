@@ -1944,8 +1944,6 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 	RelOptInfo *rel = best_path->path.parent;
 	Index		scan_relid = rel->relid;
 	RangeTblEntry *rte;
-	Relation	relation;
-	AttrNumber	num_attrs;
 	int			i;
 
 	/* it should be a base rel... */
@@ -2003,22 +2001,6 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 			break;
 		}
 	}
-
-	/*
-	 * Also, detect whether any pseudo columns are requested from rel.
-	 */
-	relation = heap_open(rte->relid, NoLock);
-	scan_plan->fsPseudoCol = false;
-	num_attrs = RelationGetNumberOfAttributes(relation);
-	for (i = num_attrs + 1; i <= rel->max_attr; i++)
-	{
-		if (!bms_is_empty(rel->attr_needed[i - rel->min_attr]))
-		{
-			scan_plan->fsPseudoCol = true;
-			break;
-		}
-	}
-	heap_close(relation, NoLock);
 
 	return scan_plan;
 }

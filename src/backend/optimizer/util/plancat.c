@@ -83,7 +83,7 @@ static List *build_index_tlist(PlannerInfo *root, IndexOptInfo *index,
  */
 void
 get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
-				  List *tlist, RelOptInfo *rel)
+				  RelOptInfo *rel)
 {
 	Index		varno = rel->relid;
 	Relation	relation;
@@ -106,30 +106,6 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	rel->min_attr = FirstLowInvalidHeapAttributeNumber + 1;
 	rel->max_attr = RelationGetNumberOfAttributes(relation);
 	rel->reltablespace = RelationGetForm(relation)->reltablespace;
-
-	/*
-	 * Adjust width of attr_needed slot in case FDW extension wants
-	 * to return pseudo-columns in addition to the columns in its
-	 * table definition.
-	 * GetForeignRelWidth, an optional FDW handler, enables a FDW
-	 * to save properties of a pseudo-column in its private field.
-	 * When the foreign table is the target of UPDATE/DELETE, the query rewriter
-	 * injects a "rowid" pseudo-column to track the remote row to be modified,
-	 * so the FDW has to track which varattno shall perform as "rowid".
-	 */
-	if (RelationGetForm(relation)->relkind == RELKIND_FOREIGN_TABLE)
-	{
-		FdwRoutine *fdwroutine = GetFdwRoutineByRelId(relationObjectId);
-
-		if (fdwroutine->GetForeignRelWidth)
-		{
-			rel->max_attr = fdwroutine->GetForeignRelWidth(root, rel,
-														   relation,
-														   inhparent,
-														   tlist);
-			Assert(rel->max_attr >= RelationGetNumberOfAttributes(relation));
-		}
-	}
 
 	Assert(rel->max_attr >= rel->min_attr);
 	rel->attr_needed = (Relids *)

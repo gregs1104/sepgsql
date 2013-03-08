@@ -267,7 +267,7 @@ ExecInsert(TupleTableSlot *slot,
 
 	if (canSetTag)
 	{
-		(estate->es_processed) ++;
+		(estate->es_processed)++;
 		estate->es_lastoid = newId;
 		setLastTid(&(tuple->t_self));
 	}
@@ -300,7 +300,7 @@ ExecInsert(TupleTableSlot *slot,
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
-ExecDelete(Datum rowid,
+ExecDelete(ItemPointer tupleid,
 		   HeapTupleHeader oldtuple,
 		   TupleTableSlot *planSlot,
 		   EPQState *epqstate,
@@ -325,7 +325,7 @@ ExecDelete(Datum rowid,
 		bool		dodelete;
 
 		dodelete = ExecBRDeleteTriggers(estate, epqstate, resultRelInfo,
-										(ItemPointer)DatumGetPointer(rowid));
+										tupleid);
 
 		if (!dodelete)			/* "do nothing" */
 			return NULL;
@@ -355,14 +355,12 @@ ExecDelete(Datum rowid,
 		bool		dodelete;
 
 		dodelete = fdwroutine->ExecForeignDelete(resultRelInfo,
-												 DatumGetCString(rowid));
+												 PointerGetDatum(tupleid));
 		if (!dodelete)
 			return NULL;		/* "do nothing" */
 	}
 	else
 	{
-		ItemPointer	tupleid = (ItemPointer) DatumGetPointer(rowid);
-
 		/*
 		 * delete the tuple
 		 *
@@ -458,11 +456,10 @@ ldelete:;
 	}
 
 	if (canSetTag)
-		(estate->es_processed) ++;
+		(estate->es_processed)++;
 
 	/* AFTER ROW DELETE Triggers */
-	ExecARDeleteTriggers(estate, resultRelInfo,
-						 (ItemPointer)DatumGetPointer(rowid));
+	ExecARDeleteTriggers(estate, resultRelInfo, tupleid);
 
 	/* Process RETURNING if present */
 	if (resultRelInfo->ri_projectReturning)
@@ -486,8 +483,7 @@ ldelete:;
 		}
 		else
 		{
-			ItemPointerCopy((ItemPointer)DatumGetPointer(rowid),
-							&deltuple.t_self);
+			deltuple.t_self = *tupleid;
 			if (!heap_fetch(resultRelationDesc, SnapshotAny,
 							&deltuple, &delbuffer, false, NULL))
 				elog(ERROR, "failed to fetch deleted tuple for DELETE RETURNING");
@@ -529,7 +525,7 @@ ldelete:;
  * ----------------------------------------------------------------
  */
 static TupleTableSlot *
-ExecUpdate(Datum rowid,
+ExecUpdate(ItemPointer tupleid,
 		   HeapTupleHeader oldtuple,
 		   TupleTableSlot *slot,
 		   TupleTableSlot *planSlot,
@@ -567,7 +563,7 @@ ExecUpdate(Datum rowid,
 		resultRelInfo->ri_TrigDesc->trig_update_before_row)
 	{
 		slot = ExecBRUpdateTriggers(estate, epqstate, resultRelInfo,
-									(ItemPointer)DatumGetPointer(rowid), slot);
+									tupleid, slot);
 
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
@@ -602,7 +598,7 @@ ExecUpdate(Datum rowid,
 		FdwRoutine *fdwroutine = resultRelInfo->ri_fdwroutine;
 
 		slot = fdwroutine->ExecForeignUpdate(resultRelInfo,
-											 DatumGetCString(rowid),
+											 PointerGetDatum(tupleid),
 											 slot);
 		if (slot == NULL)		/* "do nothing" */
 			return NULL;
@@ -613,7 +609,6 @@ ExecUpdate(Datum rowid,
 	else
 	{
 		LockTupleMode	lockmode;
-		ItemPointer	tupleid = (ItemPointer) DatumGetPointer(rowid);
 
 		/*
 		 * Check the constraints of the tuple
@@ -737,9 +732,8 @@ lreplace:;
 		(estate->es_processed) ++;
 
 	/* AFTER ROW UPDATE Triggers */
-	ExecARUpdateTriggers(estate, resultRelInfo,
-						 (ItemPointer) DatumGetPointer(rowid),
-						 tuple, recheckIndexes);
+	ExecARUpdateTriggers(estate, resultRelInfo, tupleid, tuple,
+						 recheckIndexes);
 
 	list_free(recheckIndexes);
 
@@ -819,7 +813,6 @@ ExecModifyTable(ModifyTableState *node)
 	TupleTableSlot *planSlot;
 	ItemPointer tupleid = NULL;
 	ItemPointerData tuple_ctid;
-	Datum		rowid = 0;
 	HeapTupleHeader oldtuple = NULL;
 
 	/*
@@ -908,7 +901,7 @@ ExecModifyTable(ModifyTableState *node)
 		if (junkfilter != NULL)
 		{
 			/*
-			 * extract the 'ctid', 'rowid' or 'wholerow' junk attribute.
+			 * extract the 'ctid' or 'wholerow' junk attribute.
 			 */
 			if (operation == CMD_UPDATE || operation == CMD_DELETE)
 			{
@@ -917,10 +910,11 @@ ExecModifyTable(ModifyTableState *node)
 				bool		isNull;
 
 				relkind = resultRelInfo->ri_RelationDesc->rd_rel->relkind;
-				if (relkind == RELKIND_RELATION)
+				if (relkind == RELKIND_RELATION ||
+					relkind == RELKIND_FOREIGN_TABLE)
 				{
 					datum = ExecGetJunkAttribute(slot,
-												 junkfilter->jf_junkRowidNo,
+												 junkfilter->jf_junkAttNo,
 												 &isNull);
 					/* shouldn't ever get a null result... */
 					if (isNull)
@@ -929,32 +923,12 @@ ExecModifyTable(ModifyTableState *node)
 					tupleid = (ItemPointer) DatumGetPointer(datum);
 					tuple_ctid = *tupleid;		/* be sure we don't free
 												 * ctid ! */
-					rowid = PointerGetDatum(&tuple_ctid);
-				}
-				else if (relkind == RELKIND_FOREIGN_TABLE)
-				{
-					datum = ExecGetJunkAttribute(slot,
-												 junkfilter->jf_junkRowidNo,
-												 &isNull);
-					/* shouldn't ever get a null result... */
-					if (isNull)
-						elog(ERROR, "rowid is NULL");
-
-					rowid = datum;
-
-					datum = ExecGetJunkAttribute(slot,
-												 junkfilter->jf_junkRecordNo,
-												 &isNull);
-					/* shouldn't ever get a null result... */
-					if (isNull)
-						elog(ERROR, "wholerow is NULL");
-
-					oldtuple = DatumGetHeapTupleHeader(datum);
+					tupleid = &tuple_ctid;
 				}
 				else
 				{
 					datum = ExecGetJunkAttribute(slot,
-												 junkfilter->jf_junkRecordNo,
+												 junkfilter->jf_junkAttNo,
 												 &isNull);
 					/* shouldn't ever get a null result... */
 					if (isNull)
@@ -977,11 +951,11 @@ ExecModifyTable(ModifyTableState *node)
 				slot = ExecInsert(slot, planSlot, estate, node->canSetTag);
 				break;
 			case CMD_UPDATE:
-				slot = ExecUpdate(rowid, oldtuple, slot, planSlot,
+				slot = ExecUpdate(tupleid, oldtuple, slot, planSlot,
 								&node->mt_epqstate, estate, node->canSetTag);
 				break;
 			case CMD_DELETE:
-				slot = ExecDelete(rowid, oldtuple, planSlot,
+				slot = ExecDelete(tupleid, oldtuple, planSlot,
 								&node->mt_epqstate, estate, node->canSetTag);
 				break;
 			default:
@@ -1269,27 +1243,17 @@ ExecInitModifyTable(ModifyTable *node, EState *estate, int eflags)
 				if (operation == CMD_UPDATE || operation == CMD_DELETE)
 				{
 					/* For UPDATE/DELETE, find the appropriate junk attr now */
-					if (relkind == RELKIND_RELATION)
+					if (relkind == RELKIND_RELATION ||
+						relkind == RELKIND_FOREIGN_TABLE)
 					{
-						j->jf_junkRowidNo = ExecFindJunkAttribute(j, "ctid");
-						if (!AttributeNumberIsValid(j->jf_junkRowidNo))
+						j->jf_junkAttNo = ExecFindJunkAttribute(j, "ctid");
+						if (!AttributeNumberIsValid(j->jf_junkAttNo))
 							elog(ERROR, "could not find junk ctid column");
-					}
-					else if (relkind == RELKIND_FOREIGN_TABLE)
-					{
-						j->jf_junkRowidNo = ExecFindJunkAttribute(j, "rowid");
-						if (!AttributeNumberIsValid(j->jf_junkRowidNo))
-							elog(ERROR, "could not find junk rowid column");
-						j->jf_junkRecordNo
-							= ExecFindJunkAttribute(j, "record");
-						if (!AttributeNumberIsValid(j->jf_junkRecordNo))
-							elog(ERROR, "could not find junk wholerow column");
 					}
 					else
 					{
-						j->jf_junkRecordNo
-							= ExecFindJunkAttribute(j, "wholerow");
-						if (!AttributeNumberIsValid(j->jf_junkRecordNo))
+						j->jf_junkAttNo = ExecFindJunkAttribute(j, "wholerow");
+						if (!AttributeNumberIsValid(j->jf_junkAttNo))
 							elog(ERROR, "could not find junk wholerow column");
 					}
 				}

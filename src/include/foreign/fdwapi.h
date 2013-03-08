@@ -23,12 +23,6 @@ struct ExplainState;
 /*
  * Callback function signatures --- see fdwhandler.sgml for more info.
  */
-typedef AttrNumber (*GetForeignRelWidth_function) (PlannerInfo *root,
-												   RelOptInfo *baserel,
-												   Relation foreignrel,
-												   bool inhparent,
-												   List *targetList);
-
 typedef void (*GetForeignRelSize_function) (PlannerInfo *root,
 														RelOptInfo *baserel,
 														Oid foreigntableid);
@@ -77,10 +71,10 @@ typedef void (*BeginForeignModify_function) (ModifyTableState *mtstate,
 typedef TupleTableSlot *(*ExecForeignInsert_function) (ResultRelInfo *rinfo,
 													   TupleTableSlot *slot);
 typedef TupleTableSlot *(*ExecForeignUpdate_function) (ResultRelInfo *rinfo,
-													   const char *rowid,
+													   Datum tupleid,
 													   TupleTableSlot *slot);
 typedef bool (*ExecForeignDelete_function) (ResultRelInfo *rinfo,
-											const char *rowid);
+											Datum tupleid);
 typedef void (*EndForeignModify_function) (ResultRelInfo *rinfo);
 
 /*
@@ -114,7 +108,6 @@ typedef struct FdwRoutine
 	 * not provided.
 	 */
 	AnalyzeForeignTable_function AnalyzeForeignTable;
-	GetForeignRelWidth_function GetForeignRelWidth;
 	PlanForeignModify_function PlanForeignModify;
 	BeginForeignModify_function	BeginForeignModify;
 	ExecForeignInsert_function ExecForeignInsert;

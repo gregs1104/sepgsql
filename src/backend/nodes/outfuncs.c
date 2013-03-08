@@ -563,7 +563,6 @@ _outForeignScan(StringInfo str, const ForeignScan *node)
 	WRITE_NODE_FIELD(fdw_exprs);
 	WRITE_NODE_FIELD(fdw_private);
 	WRITE_BOOL_FIELD(fsSystemCol);
-	WRITE_BOOL_FIELD(fsPseudoCol);
 }
 
 static void

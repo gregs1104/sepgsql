@@ -479,7 +479,6 @@ typedef struct ForeignScan
 	List	   *fdw_exprs;		/* expressions that FDW may evaluate */
 	List	   *fdw_private;	/* private data for FDW */
 	bool		fsSystemCol;	/* true if any "system column" is needed */
-	bool		fsPseudoCol;	/* true if any "pseudo column" is needed */
 } ForeignScan;
 
 
