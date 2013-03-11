@@ -43,11 +43,15 @@ ForeignNext(ForeignScanState *node)
 	TupleTableSlot *slot;
 	ForeignScan *plan = (ForeignScan *) node->ss.ps.plan;
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
+	ItemPointerData	tupleid;
 	MemoryContext oldcontext;
+
+	ItemPointerSetInvalid(&tupleid);
 
 	/* Call the Iterate function in short-lived context */
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
-	slot = node->fdwroutine->IterateForeignScan(node);
+	slot = node->fdwroutine->IterateForeignScan(node,
+												PointerGetDatum(&tupleid));
 	MemoryContextSwitchTo(oldcontext);
 
 	/*
@@ -61,6 +65,7 @@ ForeignNext(ForeignScanState *node)
 		HeapTuple	tup = ExecMaterializeSlot(slot);
 
 		tup->t_tableOid = RelationGetRelid(node->ss.ss_currentRelation);
+		ItemPointerCopy(&tupleid, &tup->t_self);
 	}
 
 	return slot;

@@ -52,7 +52,7 @@ typedef struct PgFdwRelationInfo
 	List	   *param_conds;
 	List	   *local_conds;
 	List	   *param_numbers;
-	AttrNumber	anum_rowid;
+	bool		needs_ctid;
 
 	/* Cached catalog information. */
 	ForeignTable *table;
@@ -80,6 +80,12 @@ enum FdwPrivateIndex
 	/* Integer list of param IDs of PARAM_EXEC Params used in SQL stmt */
 	FdwPrivateExternParamIds,
 
+	/*
+	 * True, if this scan is result relation of UPDATE/DELETE, thus it
+	 * has to take remote ctid to identify a particular row.
+	 */
+	FdwPrivateNeedsCtid,
+
 	/* # of elements stored in the list fdw_private */
 	FdwPrivateNum
 };
@@ -91,6 +97,7 @@ typedef struct PgFdwExecutionState
 {
 	Relation	rel;			/* relcache entry for the foreign table */
 	AttInMetadata *attinmeta;	/* attribute datatype conversion metadata */
+	bool		needs_ctid;		/* is remote ctid required to return? */
 
 	List	   *fdw_private;	/* FDW-private information from planner */
 
@@ -177,11 +184,6 @@ PG_FUNCTION_INFO_V1(postgres_fdw_handler);
 /*
  * FDW callback routines
  */
-static AttrNumber postgresGetForeignRelWidth(PlannerInfo *root,
-											 RelOptInfo *baserel,
-											 Relation foreignrel,
-											 bool inhparent,
-											 List *targetList);
 static void postgresGetForeignRelSize(PlannerInfo *root,
 						  RelOptInfo *baserel,
 						  Oid foreigntableid);
@@ -215,9 +217,9 @@ static void postgresBeginForeignModify(ModifyTableState *mtstate,
 static TupleTableSlot *postgresExecForeignInsert(ResultRelInfo *rinfo,
 												 TupleTableSlot *slot);
 static bool postgresExecForeignDelete(ResultRelInfo *rinfo,
-									  const char *rowid);
+									  Datum tupleid);
 static TupleTableSlot * postgresExecForeignUpdate(ResultRelInfo *rinfo,
-												  const char *rowid,
+												  Datum tupleid,
 												  TupleTableSlot *slot);
 static void postgresEndForeignModify(ResultRelInfo *rinfo);
 
@@ -243,6 +245,7 @@ static HeapTuple make_tuple_from_result_row(PGresult *res,
 						   int row,
 						   Relation rel,
 						   AttInMetadata *attinmeta,
+						   bool needs_ctid,
 						   MemoryContext temp_context);
 static void conversion_error_callback(void *arg);
 
@@ -257,7 +260,6 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 	FdwRoutine *routine = makeNode(FdwRoutine);
 
 	/* Required handler functions. */
-	routine->GetForeignRelWidth = postgresGetForeignRelWidth;
 	routine->GetForeignRelSize = postgresGetForeignRelSize;
 	routine->GetForeignPaths = postgresGetForeignPaths;
 	routine->GetForeignPlan = postgresGetForeignPlan;
@@ -280,47 +282,6 @@ postgres_fdw_handler(PG_FUNCTION_ARGS)
 }
 
 /*
- * postgresGetForeignRelWidth
- *		Informs how many columns (including pseudo ones) are needed.
- */
-static AttrNumber
-postgresGetForeignRelWidth(PlannerInfo *root,
-						   RelOptInfo *baserel,
-						   Relation foreignrel,
-						   bool inhparent,
-						   List *targetList)
-{
-	/*
-	 * We use PgFdwRelationInfo to pass various information to subsequent
-	 * functions.
-	 */
-	PgFdwRelationInfo  *fpinfo = palloc0(sizeof(PgFdwRelationInfo));
-
-	baserel->fdw_private = fpinfo;
-
-	/*
-	 * If this foreign table is result relation of UPDATE or DELETE,
-	 * it needs to move a row-identifier from scanner-stage to
-	 * modifier-stage. If required, rewriteTargetListUD() appends
-	 * a target-entry with resjunk=true that contains just a Var-node
-	 * towards (number of attributes of foreign table + 1) column that
-	 * does not exist of course, however, we can utilize pseudo-column
-	 * to return information rather than data structure in the table-
-	 * declaration.
-	 */
-	fpinfo->anum_rowid = get_pseudo_rowid_column(baserel, targetList);
-	if (fpinfo->anum_rowid != InvalidAttrNumber)
-	{
-		RangeTblEntry *rte = rt_fetch(baserel->relid,
-									  root->parse->rtable);
-		rte->eref->colnames = lappend(rte->eref->colnames,
-									  makeString("ctid"));
-		return fpinfo->anum_rowid;
-	}
-	return RelationGetNumberOfAttributes(foreignrel);
-}
-
-/*
  * postgresGetForeignRelSize
  *		Estimate # of rows and width of the result of the scan
  *
@@ -340,7 +301,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 {
 	bool		use_remote_estimate = false;
 	ListCell   *lc;
-	PgFdwRelationInfo *fpinfo = baserel->fdw_private;
+	PgFdwRelationInfo *fpinfo;
 	StringInfo	sql;
 	ForeignTable *table;
 	ForeignServer *server;
@@ -356,7 +317,13 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	List	   *param_conds;
 	List	   *local_conds;
 	List	   *param_numbers;
+	bool		needs_ctid;
 
+	/*
+	 * We use PgFdwRelationInfo to pass various information to subsequent
+	 * functions.
+	 */
+	fpinfo = palloc0(sizeof(PgFdwRelationInfo));
 	initStringInfo(&fpinfo->sql);
 	sql = &fpinfo->sql;
 
@@ -388,6 +355,12 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	}
 
 	/*
+	 * Determine whether this scan is needed for UPDATE/DELETE remote
+	 * tables. If so, remote "ctid" is additionally needed to fetch.
+	 */
+	needs_ctid = (root->parse->resultRelation == baserel->relid);
+
+	/*
 	 * Construct remote query which consists of SELECT, FROM, and WHERE
 	 * clauses.  Conditions which contain any Param node are excluded because
 	 * placeholder can't be used in EXPLAIN statement.  Such conditions are
@@ -395,7 +368,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 */
 	classifyConditions(root, baserel, &remote_conds, &param_conds,
 					   &local_conds, &param_numbers);
-	deparseSimpleSql(sql, root, baserel, local_conds, fpinfo->anum_rowid);
+	deparseSimpleSql(sql, root, baserel, local_conds, needs_ctid);
 	if (list_length(remote_conds) > 0)
 		appendWhereClause(sql, true, remote_conds, root);
 
@@ -506,6 +479,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	fpinfo->param_numbers = param_numbers;
 	fpinfo->table = table;
 	fpinfo->server = server;
+	fpinfo->needs_ctid = needs_ctid;
 }
 
 /*
@@ -563,8 +537,9 @@ postgresGetForeignPaths(PlannerInfo *root,
 	 * Build the fdw_private list that will be available to the executor.
 	 * Items in the list must match enum FdwPrivateIndex, above.
 	 */
-	fdw_private = list_make2(makeString(fpinfo->sql.data),
-							 fpinfo->param_numbers);
+	fdw_private = list_make3(makeString(fpinfo->sql.data),
+							 fpinfo->param_numbers,
+							 makeInteger(fpinfo->needs_ctid));
 
 	/*
 	 * Create simplest ForeignScan path node and add it to baserel.  This path
@@ -781,6 +756,10 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 		festate->param_values = NULL;
 	}
 	festate->extparams_done = false;
+
+	/* Does this scan needs to return remote ctid? */
+	festate->needs_ctid = (bool) intVal(list_nth(festate->fdw_private,
+												 FdwPrivateNeedsCtid));
 }
 
 /*
@@ -789,10 +768,12 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
  *		EOF.
  */
 static TupleTableSlot *
-postgresIterateForeignScan(ForeignScanState *node)
+postgresIterateForeignScan(ForeignScanState *node, Datum p_tupleid)
 {
 	PgFdwExecutionState *festate = (PgFdwExecutionState *) node->fdw_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+	ItenPointer		tupleid = (ItenPointer)DatumGetPointer(p_tupleid);
+	HeapTuple		tuple;
 
 	/*
 	 * If this is the first call after Begin or ReScan, we need to create the
@@ -817,10 +798,9 @@ postgresIterateForeignScan(ForeignScanState *node)
 	/*
 	 * Return the next tuple.
 	 */
-	ExecStoreTuple(festate->tuples[festate->next_tuple++],
-				   slot,
-				   InvalidBuffer,
-				   false);
+	tuple = festate->tuples[festate->next_tuple++];
+	ItemPointerCopy(&tuple->t_self, tupleid);
+	ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 
 	return slot;
 }
@@ -1118,6 +1098,7 @@ fetch_more_data(ForeignScanState *node)
 				make_tuple_from_result_row(res, i,
 										   festate->rel,
 										   festate->attinmeta,
+										   festate->needs_ctid,
 										   festate->temp_cxt);
 		}
 
@@ -1441,6 +1422,7 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 		astate->rows[pos] = make_tuple_from_result_row(res, row,
 													   astate->rel,
 													   astate->attinmeta,
+													   false,
 													   astate->temp_cxt);
 
 		MemoryContextSwitchTo(oldcontext);
@@ -1461,13 +1443,14 @@ postgresPlanForeignModify(PlannerInfo *root,
 	initStringInfo(&sql);
 
 	/*
-	 * XXX - FOR UPDATE should be added on the remote query in scanner-
-	 * stage to avoid unexpected concurrent update/delete of remote rows.
+	 * FOR UPDATE should be added on the remote query of scanner-stage
+	 * to avoid unexpected concurrent update/delete of remote rows.
 	 */
 	if (operation == CMD_UPDATE || operation == CMD_DELETE)
 	{
 		ForeignScan	   *fscan;
 		Value		   *select_sql;
+		Value		   *need_ctid;
 
 		fscan = lookup_foreign_scan_plan(subplan, resultRelation);
 		if (!fscan)
@@ -1639,7 +1622,7 @@ prepare_foreign_modify(PgFdwModifyState *fmstate)
 
 static int
 setup_exec_prepared(ResultRelInfo *resultRelInfo,
-					const char *rowid, TupleTableSlot *slot,
+					ItemPointer tupleid, TupleTableSlot *slot,
 					const char *p_values[], int p_lengths[])
 {
 	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
@@ -1648,8 +1631,11 @@ setup_exec_prepared(ResultRelInfo *resultRelInfo,
 	/* 1st parameter is ctid */
 	if (rowid)
 	{
-		p_values[pindex] = rowid;
-		p_lengths[pindex] = strlen(rowid) + 1;
+		Datum	ctid_str
+			= DirectFunctionCall1(tidout, PointerGetDatum(tupleid));
+
+		p_values[pindex] = DatumGetCString(ctid_str);
+		p_lengths[pindex] = strlen(p_values[pindex]) + 1;
 		pindex++;
 	}
 
@@ -1755,7 +1741,7 @@ postgresExecForeignInsert(ResultRelInfo *resultRelInfo,
 }
 
 static bool
-postgresExecForeignDelete(ResultRelInfo *resultRelInfo, const char *rowid)
+postgresExecForeignDelete(ResultRelInfo *resultRelInfo, Datum tupleid)
 {
 	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
 	const char     *p_values[1];
@@ -1768,7 +1754,7 @@ postgresExecForeignDelete(ResultRelInfo *resultRelInfo, const char *rowid)
 		prepare_foreign_modify(fmstate);
 
 	nattrs = setup_exec_prepared(resultRelInfo,
-								 rowid, NULL,
+								 (ItemPointer) tupleid, NULL,
 								 p_values, p_lengths);
 	Assert(fmstate->p_nums == nattrs);
 
@@ -1792,7 +1778,7 @@ postgresExecForeignDelete(ResultRelInfo *resultRelInfo, const char *rowid)
 
 static TupleTableSlot*
 postgresExecForeignUpdate(ResultRelInfo *resultRelInfo,
-						  const char *rowid, TupleTableSlot *slot)
+						  Datum tupleid, TupleTableSlot *slot)
 {
 	PgFdwModifyState *fmstate = resultRelInfo->ri_fdw_state;
 	const char    **p_values  = alloca(sizeof(char *) * (fmstate->p_nums + 1));
@@ -1805,7 +1791,7 @@ postgresExecForeignUpdate(ResultRelInfo *resultRelInfo,
 		prepare_foreign_modify(fmstate);
 
 	nattrs = setup_exec_prepared(resultRelInfo,
-								 rowid, slot,
+								 (ItemPointer) tupleid, slot,
 								 p_values, p_lengths);
 	Assert(fmstate->p_nums == nattrs);
 
@@ -1852,6 +1838,7 @@ make_tuple_from_result_row(PGresult *res,
 						   int row,
 						   Relation rel,
 						   AttInMetadata *attinmeta,
+						   bool needs_ctid,
 						   MemoryContext temp_context)
 {
 	HeapTuple	tuple;
@@ -1862,6 +1849,7 @@ make_tuple_from_result_row(PGresult *res,
 	ConversionLocation errpos;
 	ErrorContextCallback errcallback;
 	MemoryContext oldcontext;
+	ItemPointer	tupleid = NULL;
 	int			i;
 	int			j;
 
@@ -1926,6 +1914,17 @@ make_tuple_from_result_row(PGresult *res,
 		j++;
 	}
 
+	if (needs_ctid)
+	{
+		char   *ctid_str;
+
+		if (PQgetisnull(res, row, j))
+			elog(ERROR, "remote ctid was NULL");
+		ctid_str = PQgetvalue(res, row, j);
+
+		tupleid = (ItemPointer)DirectFunctionCall1(tidin, ctid_str);
+	}
+
 	/* Uninstall error context callback. */
 	error_context_stack = errcallback.previous;
 
@@ -1939,6 +1938,10 @@ make_tuple_from_result_row(PGresult *res,
 	MemoryContextSwitchTo(oldcontext);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
+	if (tupleid == NULL)
+		ItemPointerSetInvalid(&tuple->t_self);
+	else
+		ItemPointerCopy(tupleid, &tuple->t_self);
 
 	/* Clean up */
 	MemoryContextReset(temp_context);

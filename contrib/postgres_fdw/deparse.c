@@ -362,7 +362,7 @@ deparseSimpleSql(StringInfo buf,
 				 PlannerInfo *root,
 				 RelOptInfo *baserel,
 				 List *local_conds,
-				 AttrNumber anum_rowid)
+				 bool needs_ctid)
 {
 	RangeTblEntry *rte = root->simple_rte_array[baserel->relid];
 	Relation	rel;
@@ -384,7 +384,7 @@ deparseSimpleSql(StringInfo buf,
 		pull_varattnos((Node *) rinfo->clause, baserel->relid,
 					   &attrs_used);
 	}
-
+#if 0
 	/*
 	 * Add all the attributes used by RETURNING clause, if this foreign
 	 * table is target relation of writer commands.
@@ -392,7 +392,7 @@ deparseSimpleSql(StringInfo buf,
 	if (root->parse->resultRelation == baserel->relid)
 		pull_varattnos((Node *) root->parse->returningList,
 					   baserel->relid, &attrs_used);
-
+#endif
 	/* If there's a whole-row reference, we'll need all the columns. */
 	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
 								  attrs_used);
@@ -406,8 +406,13 @@ deparseSimpleSql(StringInfo buf,
 	 * which at runtime.)  Note however that any dropped columns are ignored.
 	 */
 	appendStringInfo(buf, "SELECT ");
-	rel = heap_open(rte->relid, NoLock);
 	first = true;
+	if (needs_ctid)
+	{
+		appendStringInfo(buf, "ctid");
+		first = false;
+	}
+	rel = heap_open(rte->relid, NoLock);
 	for (attr = 1; attr <= RelationGetNumberOfAttributes(rel); attr++)
 	{
 		/* Ignore dropped attributes. */
@@ -427,13 +432,6 @@ deparseSimpleSql(StringInfo buf,
 	}
 	heap_close(rel, NoLock);
 
-	/* Remote citd is row-identifier of this FDW */
-	if (anum_rowid != InvalidAttrNumber)
-	{
-		appendStringInfo(buf, "%sctid", (first ? "" : ", "));
-		first = false;
-	}
-
 	/* Don't generate bad syntax if no undropped columns */
 	if (first)
 		appendStringInfo(buf, "NULL");
@@ -443,6 +441,12 @@ deparseSimpleSql(StringInfo buf,
 	 */
 	appendStringInfo(buf, " FROM ");
 	deparseRelation(buf, rte->relid);
+
+	/*
+	 * Remote rows must be locked when it likely updated or deleted.
+	 */
+	if (needs_ctid)
+		appendStringInfo(buf, " FOR UPDATE");
 }
 
 /*
