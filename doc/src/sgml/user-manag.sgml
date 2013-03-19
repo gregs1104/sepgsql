@@ -464,7 +464,8 @@ DROP ROLE <replaceable>name</replaceable>;
    The following command set <literal>current_user = uname</literal>
    as row-security policy on the <literal>customer</literal> table.
 <screen>
-postgres=> ALTER TABLE customer SET ROW SECURITY (current_user = uname);
+postgres=> ALTER TABLE customer SET ROW SECURITY
+                                FOR ALL TO (current_user = uname);
 ALTER TABLE
 </screen>
    <xref linkend="SQL-EXPLAIN"> command shows how row-security policy
@@ -505,21 +506,20 @@ postgres=> EXPLAIN(costs off) SELECT * FROM customer WHERE f_leak(upasswd);
    policy is limited to the relation on which it is set.
 <screen>
 postgres=> EXPLAIN(costs off) SELECT * FROM t1 WHERE f_leak(y);
-                QUERY PLAN
--------------------------------------------
- Result
-   ->  Append
-         ->  Subquery Scan on t1
-               Filter: f_leak(t1.y)
-               ->  Seq Scan on t1 t1_1
-                     Filter: ((x % 2) = 0)
-         ->  Seq Scan on t2
-               Filter: f_leak(y)
-         ->  Subquery Scan on t3
-               Filter: f_leak(t3.y)
-               ->  Seq Scan on t3 t3_1
-                     Filter: ((x % 2) = 1)
-(12 rows)
+             QUERY PLAN
+-------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         Filter: f_leak(t1.y)
+         ->  Seq Scan on t1 t1_1
+               Filter: ((x % 2) = 0)
+   ->  Seq Scan on t2
+         Filter: f_leak(y)
+   ->  Subquery Scan on t3
+         Filter: f_leak(t3.y)
+         ->  Seq Scan on t3 t3_1
+               Filter: ((x % 2) = 1)
+(11 rows)
 </screen>
     In the above example, <literal>t1</literal> has inherited
     child table <literal>t2</literal> and <literal>t3</literal>,
