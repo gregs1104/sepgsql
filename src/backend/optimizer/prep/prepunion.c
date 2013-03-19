@@ -1610,13 +1610,14 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 									 QTW_IGNORE_RC_SUBQUERIES |
 									 QTW_IGNORE_RETURNING);
 		/*
-		 * XXX - Returning clause on the relation being replace with
-		 * row-security subquery shall be handled in a special way.
-		 * Var references to system column or whole-row reference should
-		 * be adjusted to reference artificial columns on behalf of the
-		 * underlying these columns, but RETURNING clause is an exception
-		 * because its Var-nodes are evaluated on the "raw" resule relation
-		 * in the modify table operation.
+		 * Returning clause on the relation being replaced with row-
+		 * security subquery shall be handled in a special way, because
+		 * of no system columns on subquery.
+		 * Var references to system column or whole-row reference need
+		 * to be adjusted to reference artificial columns on behalf of
+		 * the underlying these columns, however, RETURNGIN clause is
+		 * an exception because its Var nodes are evaluated towards
+		 * the "raw" target relation, not a fetched tuple.
 		 */
 		context.in_returning = true;
 		newnode->returningList = (List *)

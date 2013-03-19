@@ -124,9 +124,6 @@ lookup_artificial_column(PlannerInfo *root,
 		/*
 		 * If referenced artifical column is already constructed on the
 		 * target-list of row-security subquery, nothing to do any more.
-		 *
-		 * XXX - Even though it was attached as 'resjunk', this flag
-		 * shall be turned off because of references by user's query.
 		 */
 		if (IsA(subtle->expr, Var))
 		{
@@ -134,11 +131,7 @@ lookup_artificial_column(PlannerInfo *root,
 
 			Assert(subvar->varno == 1);
 			if (subvar->varattno == varattno)
-			{
-				if (subtle->resjunk)
-					subtle->resjunk = false;
 				return subtle->resno;
-			}
 		}
 	}
 
@@ -375,8 +368,8 @@ expand_rtentry_with_policy(PlannerInfo *root, Index rtindex,
 	if (rowmark)
 	{
 		/*
-		 * XXX - In case of inherited children, rti/prti of rowmark shall
-		 * be fixed up later.
+		 * In case of inherited children, rti/prti of rowmark shall be
+		 * fixed up later, on inheritance_planner().
 		 */
 		if (rowmark->rti == rowmark->prti)
 			rowmark->rti = rowmark->prti = list_length(parse->rtable);
@@ -702,10 +695,10 @@ apply_row_security_policy(PlannerInfo *root)
 		fixup_varnode_context context;
 
 		/*
-		 * XXX - Constructed Plan with row-level security policy depends
-		 * on properties of current used (database superuser can bypass
-		 * configured row-security policy), thus, it has to be invalidated
-		 * when its assumption was changed.
+		 * Constructed Plan with row-level security policy depends on
+		 * properties of current user (database superuser can bypass
+		 * configured row-security policy!), thus, it has to be
+		 * invalidated when its assumption was changed.
 		 */
 		if (!OidIsValid(glob->planUserId))
 		{
@@ -724,7 +717,7 @@ apply_row_security_policy(PlannerInfo *root)
 			Assert(glob->planUserId == GetUserId());
 
 		/*
-		 * XXX - Var-nodes that referenced RangeTblEntry to be replaced by
+		 * Var-nodes that referenced RangeTblEntry to be replaced by
 		 * row-security sub-query have to be adjusted for appropriate
 		 * reference to the underlying artificial column of the relation.
 		 */
