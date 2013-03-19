@@ -19,6 +19,7 @@
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_event_trigger.h"
@@ -51,6 +52,7 @@
 #include "commands/user.h"
 #include "parser/parse_func.h"
 #include "miscadmin.h"
+#include "rewrite/rewriteDefine.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -280,6 +282,8 @@ AlterObjectRename_internal(Relation rel, Oid objectId, const char *new_name)
 	simple_heap_update(rel, &oldtup->t_self, newtup);
 	CatalogUpdateIndexes(rel, newtup);
 
+	InvokeObjectPostAlterHook(classId, objectId, 0);
+
 	/* Release memory */
 	pfree(values);
 	pfree(nulls);
@@ -316,6 +320,7 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_TABLE:
 		case OBJECT_SEQUENCE:
 		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
 		case OBJECT_INDEX:
 		case OBJECT_FOREIGN_TABLE:
 			return RenameRelation(stmt);
@@ -323,6 +328,10 @@ ExecRenameStmt(RenameStmt *stmt)
 		case OBJECT_COLUMN:
 		case OBJECT_ATTRIBUTE:
 			return renameatt(stmt);
+
+		case OBJECT_RULE:
+			return RenameRewriteRule(stmt->relation, stmt->subname,
+									 stmt->newname);
 
 		case OBJECT_TRIGGER:
 			return renametrig(stmt);
@@ -388,6 +397,7 @@ ExecAlterObjectSchemaStmt(AlterObjectSchemaStmt *stmt)
 		case OBJECT_SEQUENCE:
 		case OBJECT_TABLE:
 		case OBJECT_VIEW:
+		case OBJECT_MATVIEW:
 			return AlterTableNamespace(stmt);
 
 		case OBJECT_DOMAIN:
@@ -649,6 +659,8 @@ AlterObjectNamespace_internal(Relation rel, Oid objid, Oid nspOid)
 	/* update dependencies to point to the new schema */
 	changeDependencyFor(classId, objid,
 						NamespaceRelationId, oldNspOid, nspOid);
+
+	InvokeObjectPostAlterHook(classId, objid, 0);
 
 	return oldNspOid;
 }
@@ -927,4 +939,6 @@ AlterObjectOwner_internal(Relation rel, Oid objectId, Oid new_ownerId)
 		pfree(nulls);
 		pfree(replaces);
 	}
+
+	InvokeObjectPostAlterHook(classId, objectId, 0);
 }

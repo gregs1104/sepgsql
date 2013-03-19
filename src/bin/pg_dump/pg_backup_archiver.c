@@ -21,7 +21,6 @@
  */
 
 #include "pg_backup_db.h"
-#include "dumpmem.h"
 #include "dumputils.h"
 
 #include <ctype.h>
@@ -2593,8 +2592,11 @@ _tocEntryIsACL(TocEntry *te)
 static void
 _doSetFixedOutputState(ArchiveHandle *AH)
 {
-	/* Disable statement_timeout in archive for pg_restore/psql  */
+	/* Disable statement_timeout since restore is probably slow */
 	ahprintf(AH, "SET statement_timeout = 0;\n");
+
+	/* Likewise for lock_timeout */
+	ahprintf(AH, "SET lock_timeout = 0;\n");
 
 	/* Select the correct character set encoding */
 	ahprintf(AH, "SET client_encoding = '%s';\n",
@@ -2909,7 +2911,8 @@ _getObjectDescription(PQExpBuffer buf, TocEntry *te, ArchiveHandle *AH)
 	const char *type = te->desc;
 
 	/* Use ALTER TABLE for views and sequences */
-	if (strcmp(type, "VIEW") == 0 || strcmp(type, "SEQUENCE") == 0)
+	if (strcmp(type, "VIEW") == 0 || strcmp(type, "SEQUENCE") == 0||
+		strcmp(type, "MATERIALIZED VIEW") == 0)
 		type = "TABLE";
 
 	/* objects named by a schema and name */
@@ -3141,6 +3144,7 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt, bool isDat
 			strcmp(te->desc, "TABLE") == 0 ||
 			strcmp(te->desc, "TYPE") == 0 ||
 			strcmp(te->desc, "VIEW") == 0 ||
+			strcmp(te->desc, "MATERIALIZED VIEW") == 0 ||
 			strcmp(te->desc, "SEQUENCE") == 0 ||
 			strcmp(te->desc, "FOREIGN TABLE") == 0 ||
 			strcmp(te->desc, "TEXT SEARCH DICTIONARY") == 0 ||

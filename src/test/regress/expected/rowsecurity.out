@@ -334,18 +334,17 @@ SELECT * FROM t1;
 (7 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1;
-                QUERY PLAN                 
--------------------------------------------
- Result
-   ->  Append
-         ->  Subquery Scan on t1
-               ->  Seq Scan on t1 t1_1
-                     Filter: ((a % 2) = 0)
-         ->  Subquery Scan on t2
-               ->  Seq Scan on t2 t2_1
-                     Filter: ((a % 2) = 1)
-         ->  Seq Scan on t3
-(9 rows)
+             QUERY PLAN              
+-------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         ->  Seq Scan on t1 t1_1
+               Filter: ((a % 2) = 0)
+   ->  Subquery Scan on t2
+         ->  Seq Scan on t2 t2_1
+               Filter: ((a % 2) = 1)
+   ->  Seq Scan on t3
+(8 rows)
 
 SELECT * FROM t1 WHERE f_leak(b);
 NOTICE:  f_leak => bbb
@@ -367,21 +366,20 @@ NOTICE:  f_leak => zzz
 (7 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b);
-                QUERY PLAN                 
--------------------------------------------
- Result
-   ->  Append
-         ->  Subquery Scan on t1
-               Filter: f_leak(t1.b)
-               ->  Seq Scan on t1 t1_1
-                     Filter: ((a % 2) = 0)
-         ->  Subquery Scan on t2
-               Filter: f_leak(t2.b)
-               ->  Seq Scan on t2 t2_1
-                     Filter: ((a % 2) = 1)
-         ->  Seq Scan on t3
-               Filter: f_leak(b)
-(12 rows)
+             QUERY PLAN              
+-------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         Filter: f_leak(t1.b)
+         ->  Seq Scan on t1 t1_1
+               Filter: ((a % 2) = 0)
+   ->  Subquery Scan on t2
+         Filter: f_leak(t2.b)
+         ->  Seq Scan on t2 t2_1
+               Filter: ((a % 2) = 1)
+   ->  Seq Scan on t3
+         Filter: f_leak(b)
+(11 rows)
 
 -- reference to system column
 SELECT oid, * FROM t1;
@@ -397,18 +395,17 @@ SELECT oid, * FROM t1;
 (7 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1;
-                QUERY PLAN                 
--------------------------------------------
- Result
-   ->  Append
-         ->  Subquery Scan on t1
-               ->  Seq Scan on t1 t1_1
-                     Filter: ((a % 2) = 0)
-         ->  Subquery Scan on t2
-               ->  Seq Scan on t2 t2_1
-                     Filter: ((a % 2) = 1)
-         ->  Seq Scan on t3
-(9 rows)
+             QUERY PLAN              
+-------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         ->  Seq Scan on t1 t1_1
+               Filter: ((a % 2) = 0)
+   ->  Subquery Scan on t2
+         ->  Seq Scan on t2 t2_1
+               Filter: ((a % 2) = 1)
+   ->  Seq Scan on t3
+(8 rows)
 
 -- reference to whole-row reference
 SELECT *,t1 FROM t1;
@@ -424,18 +421,17 @@ SELECT *,t1 FROM t1;
 (7 rows)
 
 EXPLAIN (costs off) SELECT *,t1 FROM t1;
-                QUERY PLAN                 
--------------------------------------------
- Result
-   ->  Append
-         ->  Subquery Scan on t1
-               ->  Seq Scan on t1 t1_1
-                     Filter: ((a % 2) = 0)
-         ->  Subquery Scan on t2
-               ->  Seq Scan on t2 t2_1
-                     Filter: ((a % 2) = 1)
-         ->  Seq Scan on t3
-(9 rows)
+             QUERY PLAN              
+-------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         ->  Seq Scan on t1 t1_1
+               Filter: ((a % 2) = 0)
+   ->  Subquery Scan on t2
+         ->  Seq Scan on t2 t2_1
+               Filter: ((a % 2) = 1)
+   ->  Seq Scan on t3
+(8 rows)
 
 -- for share/update lock
 SELECT * FROM t1 FOR SHARE;
@@ -451,19 +447,18 @@ SELECT * FROM t1 FOR SHARE;
 (7 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1 FOR SHARE;
-                   QUERY PLAN                    
--------------------------------------------------
+                QUERY PLAN                 
+-------------------------------------------
  LockRows
-   ->  Result
-         ->  Append
-               ->  Subquery Scan on t1
-                     ->  Seq Scan on t1 t1_1
-                           Filter: ((a % 2) = 0)
-               ->  Subquery Scan on t2
-                     ->  Seq Scan on t2 t2_1
-                           Filter: ((a % 2) = 1)
-               ->  Seq Scan on t3
-(10 rows)
+   ->  Append
+         ->  Subquery Scan on t1
+               ->  Seq Scan on t1 t1_1
+                     Filter: ((a % 2) = 0)
+         ->  Subquery Scan on t2
+               ->  Seq Scan on t2 t2_1
+                     Filter: ((a % 2) = 1)
+         ->  Seq Scan on t3
+(9 rows)
 
 SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
 NOTICE:  f_leak => bbb
@@ -485,22 +480,21 @@ NOTICE:  f_leak => zzz
 (7 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b) FOR SHARE;
-                   QUERY PLAN                    
--------------------------------------------------
+                QUERY PLAN                 
+-------------------------------------------
  LockRows
-   ->  Result
-         ->  Append
-               ->  Subquery Scan on t1
-                     Filter: f_leak(t1.b)
-                     ->  Seq Scan on t1 t1_1
-                           Filter: ((a % 2) = 0)
-               ->  Subquery Scan on t2
-                     Filter: f_leak(t2.b)
-                     ->  Seq Scan on t2 t2_1
-                           Filter: ((a % 2) = 1)
-               ->  Seq Scan on t3
-                     Filter: f_leak(b)
-(13 rows)
+   ->  Append
+         ->  Subquery Scan on t1
+               Filter: f_leak(t1.b)
+               ->  Seq Scan on t1 t1_1
+                     Filter: ((a % 2) = 0)
+         ->  Subquery Scan on t2
+               Filter: f_leak(t2.b)
+               ->  Seq Scan on t2 t2_1
+                     Filter: ((a % 2) = 1)
+         ->  Seq Scan on t3
+               Filter: f_leak(b)
+(12 rows)
 
 --
 -- COPY TO statement 
@@ -635,19 +629,18 @@ EXECUTE p1(2);
 (4 rows)
 
 EXPLAIN (costs off) EXECUTE p1(2);
-                        QUERY PLAN                        
-----------------------------------------------------------
- Result
-   ->  Append
-         ->  Subquery Scan on t1
-               ->  Seq Scan on t1 t1_1
-                     Filter: ((a <= 2) AND ((a % 2) = 0))
-         ->  Subquery Scan on t2
-               ->  Seq Scan on t2 t2_1
-                     Filter: ((a <= 2) AND ((a % 2) = 1))
-         ->  Seq Scan on t3
-               Filter: (a <= 2)
-(10 rows)
+                     QUERY PLAN                     
+----------------------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         ->  Seq Scan on t1 t1_1
+               Filter: ((a <= 2) AND ((a % 2) = 0))
+   ->  Subquery Scan on t2
+         ->  Seq Scan on t2 t2_1
+               Filter: ((a <= 2) AND ((a % 2) = 1))
+   ->  Seq Scan on t3
+         Filter: (a <= 2)
+(9 rows)
 
 -- superuser is allowed to bypass RLS checks
 RESET SESSION AUTHORIZATION;
@@ -679,17 +672,16 @@ NOTICE:  f_leak => zzz
 (11 rows)
 
 EXPLAIN (costs off) SELECT * FROM t1 WHERE f_leak(b);
-           QUERY PLAN            
----------------------------------
- Result
-   ->  Append
-         ->  Seq Scan on t1
-               Filter: f_leak(b)
-         ->  Seq Scan on t2
-               Filter: f_leak(b)
-         ->  Seq Scan on t3
-               Filter: f_leak(b)
-(8 rows)
+        QUERY PLAN         
+---------------------------
+ Append
+   ->  Seq Scan on t1
+         Filter: f_leak(b)
+   ->  Seq Scan on t2
+         Filter: f_leak(b)
+   ->  Seq Scan on t3
+         Filter: f_leak(b)
+(7 rows)
 
 -- plan cache should be invalidated
 EXECUTE p1(2);
@@ -704,17 +696,16 @@ EXECUTE p1(2);
 (6 rows)
 
 EXPLAIN (costs off) EXECUTE p1(2);
-           QUERY PLAN           
---------------------------------
- Result
-   ->  Append
-         ->  Seq Scan on t1
-               Filter: (a <= 2)
-         ->  Seq Scan on t2
-               Filter: (a <= 2)
-         ->  Seq Scan on t3
-               Filter: (a <= 2)
-(8 rows)
+        QUERY PLAN        
+--------------------------
+ Append
+   ->  Seq Scan on t1
+         Filter: (a <= 2)
+   ->  Seq Scan on t2
+         Filter: (a <= 2)
+   ->  Seq Scan on t3
+         Filter: (a <= 2)
+(7 rows)
 
 PREPARE p2(int) AS SELECT * FROM t1 WHERE a = $1;
 EXECUTE p2(2);
@@ -726,17 +717,16 @@ EXECUTE p2(2);
 (3 rows)
 
 EXPLAIN (costs off) EXECUTE p2(2);
-          QUERY PLAN           
--------------------------------
- Result
-   ->  Append
-         ->  Seq Scan on t1
-               Filter: (a = 2)
-         ->  Seq Scan on t2
-               Filter: (a = 2)
-         ->  Seq Scan on t3
-               Filter: (a = 2)
-(8 rows)
+       QUERY PLAN        
+-------------------------
+ Append
+   ->  Seq Scan on t1
+         Filter: (a = 2)
+   ->  Seq Scan on t2
+         Filter: (a = 2)
+   ->  Seq Scan on t3
+         Filter: (a = 2)
+(7 rows)
 
 -- also, case when privilege switch from superuser
 SET SESSION AUTHORIZATION rls_regress_user0;
@@ -748,19 +738,18 @@ EXECUTE p2(2);
 (2 rows)
 
 EXPLAIN (costs off) EXECUTE p2(2);
-                       QUERY PLAN                        
----------------------------------------------------------
- Result
-   ->  Append
-         ->  Subquery Scan on t1
-               ->  Seq Scan on t1 t1_1
-                     Filter: ((a = 2) AND ((a % 2) = 0))
-         ->  Subquery Scan on t2
-               ->  Seq Scan on t2 t2_1
-                     Filter: ((a = 2) AND ((a % 2) = 1))
-         ->  Seq Scan on t3
-               Filter: (a = 2)
-(10 rows)
+                    QUERY PLAN                     
+---------------------------------------------------
+ Append
+   ->  Subquery Scan on t1
+         ->  Seq Scan on t1 t1_1
+               Filter: ((a = 2) AND ((a % 2) = 0))
+   ->  Subquery Scan on t2
+         ->  Seq Scan on t2 t2_1
+               Filter: ((a = 2) AND ((a % 2) = 1))
+   ->  Seq Scan on t3
+         Filter: (a = 2)
+(9 rows)
 
 --
 -- UPDATE / DELETE and Row-level security
@@ -924,13 +913,16 @@ NOTICE:  f_leak => zzzzzz
 --
 ALTER TABLE category RESET ROW SECURITY FOR ALL;  -- too long qual
 \dt+
-                                                                List of relations
-       Schema       |   Name   | Type  |       Owner       |    Size    | Description |                       Row-security                        
---------------------+----------+-------+-------------------+------------+-------------+-----------------------------------------------------------
+                                                    List of relations
+       Schema       |   Name   | Type  |       Owner       |    Size    | Description |           Row-security           
+--------------------+----------+-------+-------------------+------------+-------------+----------------------------------
  rls_regress_schema | category | table | rls_regress_user0 | 16 kB      |             | 
  rls_regress_schema | document | table | rls_regress_user0 | 16 kB      |             | (dauthor = "current_user"())
- rls_regress_schema | s1       | table | rls_regress_user0 | 16 kB      |             | (a IN (SELECT v2.x FROM v2))
- rls_regress_schema | s2       | table | rls_regress_user0 | 16 kB      |             | (x IN (SELECT s1.a FROM s1 WHERE (s1.b ~~ '%d2%'::text)))
+ rls_regress_schema | s1       | table | rls_regress_user0 | 16 kB      |             | (a IN ( SELECT v2.x             +
+                    |          |       |                   |            |             |    FROM v2))
+ rls_regress_schema | s2       | table | rls_regress_user0 | 16 kB      |             | (x IN ( SELECT s1.a             +
+                    |          |       |                   |            |             |    FROM s1                      +
+                    |          |       |                   |            |             |   WHERE (s1.b ~~ '%d2%'::text)))
  rls_regress_schema | t1       | table | rls_regress_user0 | 16 kB      |             | ((a % 2) = 0)
  rls_regress_schema | t2       | table | rls_regress_user0 | 16 kB      |             | ((a % 2) = 1)
  rls_regress_schema | t3       | table | rls_regress_user0 | 16 kB      |             | 

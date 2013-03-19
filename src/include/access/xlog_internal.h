@@ -217,6 +217,13 @@ typedef struct xl_restore_point
 	char		rp_name[MAXFNAMELEN];
 } xl_restore_point;
 
+/* End of recovery mark, when we don't do an END_OF_RECOVERY checkpoint */
+typedef struct xl_end_of_recovery
+{
+	TimestampTz end_time;
+	TimeLineID	ThisTimeLineID; /* new TLI */
+	TimeLineID	PrevTimeLineID; /* previous TLI we forked off from */
+} xl_end_of_recovery;
 
 /*
  * XLogRecord is defined in xlog.h, but we avoid #including that to keep
@@ -227,7 +234,10 @@ struct XLogRecord;
 /*
  * Method table for resource managers.
  *
- * RmgrTable[] is indexed by RmgrId values (see rmgr.h).
+ * This struct must be kept in sync with the PG_RMGR definition in
+ * rmgr.c.
+ *
+ * RmgrTable[] is indexed by RmgrId values (see rmgrlist.h).
  */
 typedef struct RmgrData
 {
@@ -253,6 +263,7 @@ extern void GetOldestRestartPoint(XLogRecPtr *oldrecptr, TimeLineID *oldtli);
  * Exported for the functions in timeline.c and xlogarchive.c.  Only valid
  * in the startup process.
  */
+extern bool ArchiveRecoveryRequested;
 extern bool InArchiveRecovery;
 extern bool StandbyMode;
 extern char *recoveryRestoreCommand;
@@ -268,6 +279,7 @@ extern void ExecuteRecoveryCommand(char *command, char *commandName,
 extern void KeepFileRestoredFromArchive(char  *path, char *xlogfname);
 extern void XLogArchiveNotify(const char *xlog);
 extern void XLogArchiveNotifySeg(XLogSegNo segno);
+extern void XLogArchiveForceDone(const char *xlog);
 extern bool XLogArchiveCheckDone(const char *xlog);
 extern bool XLogArchiveIsBusy(const char *xlog);
 extern void XLogArchiveCleanup(const char *xlog);

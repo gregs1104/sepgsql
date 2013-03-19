@@ -111,6 +111,7 @@ typedef enum
 	DO_PRE_DATA_BOUNDARY,
 	DO_POST_DATA_BOUNDARY,
 	DO_EVENT_TRIGGER,
+	DO_REFRESH_MATVIEW,
 	DO_ROW_SECURITY,
 } DumpableObjectType;
 
@@ -244,6 +245,7 @@ typedef struct _tableInfo
 	bool		hastriggers;	/* does it have any triggers? */
 	bool		hasrowsec;		/* does it have any row-security policy? */
 	bool		hasoids;		/* does it have OIDs? */
+	bool		isscannable;	/* is valid for use in queries */
 	uint32		frozenxid;		/* for restore frozen xid */
 	Oid			toast_oid;		/* for restore toast frozen xid */
 	uint32		toast_frozenxid;	/* for restore toast frozen xid */

@@ -190,6 +190,7 @@ transformTopLevelStmt(ParseState *pstate, Node *parseTree)
 
 			ctas->query = parseTree;
 			ctas->into = stmt->intoClause;
+			ctas->relkind = OBJECT_TABLE;
 			ctas->is_select_into = true;
 
 			/*
@@ -321,6 +322,11 @@ analyze_requires_snapshot(Node *parseTree)
 		case T_ExplainStmt:
 		case T_CreateTableAsStmt:
 			/* yes, because we must analyze the contained statement */
+			result = true;
+			break;
+
+		case T_RefreshMatViewStmt:
+			/* yes, because the SELECT from pg_rewrite must be analyzed */
 			result = true;
 			break;
 
@@ -2117,7 +2123,8 @@ transformExplainStmt(ParseState *pstate, ExplainStmt *stmt)
 
 /*
  * transformCreateTableAsStmt -
- *	transform a CREATE TABLE AS (or SELECT ... INTO) Statement
+ *	transform a CREATE TABLE AS, SELECT ... INTO, or CREATE MATERIALIZED VIEW
+ *	Statement
  *
  * As with EXPLAIN, transform the contained statement now.
  */
@@ -2125,6 +2132,24 @@ static Query *
 transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 {
 	Query	   *result;
+
+	/*
+	 * Set relkind in IntoClause based on statement relkind.  These are
+	 * different types, because the parser users the ObjectType enumeration
+	 * and the executor uses RELKIND_* defines.
+	 */
+	switch (stmt->relkind)
+	{
+		case (OBJECT_TABLE):
+			stmt->into->relkind = RELKIND_RELATION;
+			break;
+		case (OBJECT_MATVIEW):
+			stmt->into->relkind = RELKIND_MATVIEW;
+			break;
+		default:
+			elog(ERROR, "unrecognized object relkind: %d",
+				 (int) stmt->relkind);
+	}
 
 	/* transform contained query */
 	stmt->query = (Node *) transformStmt(pstate, stmt->query);
@@ -2139,7 +2164,7 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 
 
 /*
- * Check for features that are not supported together with FOR [KEY] UPDATE/SHARE.
+ * Check for features that are not supported with FOR [KEY] UPDATE/SHARE.
  *
  * exported so planner can check again after rewriting, query pullup, etc
  */
@@ -2149,31 +2174,31 @@ CheckSelectLocking(Query *qry)
 	if (qry->setOperations)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("SELECT FOR UPDATE/SHARE/FOR KEY UPDATE/FOR KEY SHARE is not allowed with UNION/INTERSECT/EXCEPT")));
+				 errmsg("row-level locks are not allowed with UNION/INTERSECT/EXCEPT")));
 	if (qry->distinctClause != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("SELECT FOR UPDATE/SHARE/FOR KEY UPDATE/FOR KEY SHARE is not allowed with DISTINCT clause")));
+				 errmsg("row-level locks are not allowed with DISTINCT clause")));
 	if (qry->groupClause != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("SELECT FOR UPDATE/SHARE/FOR KEY UPDATE/FOR KEY SHARE is not allowed with GROUP BY clause")));
+				 errmsg("row-level locks are not allowed with GROUP BY clause")));
 	if (qry->havingQual != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-		errmsg("SELECT FOR UPDATE/SHARE/FOR KEY UPDATE/FOR KEY SHARE is not allowed with HAVING clause")));
+		errmsg("row-level locks are not allowed with HAVING clause")));
 	if (qry->hasAggs)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("SELECT FOR UPDATE/SHARE/FOR KEY UPDATE/FOR KEY SHARE is not allowed with aggregate functions")));
+				 errmsg("row-level locks are not allowed with aggregate functions")));
 	if (qry->hasWindowFuncs)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("SELECT FOR UPDATE/SHARE/FOR KEY UPDATE/FOR KEY SHARE is not allowed with window functions")));
+				 errmsg("row-level locks are not allowed with window functions")));
 	if (expression_returns_set((Node *) qry->targetList))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("SELECT FOR UPDATE/SHARE/FOR KEY UPDATE/FOR KEY SHARE is not allowed with set-returning functions in the target list")));
+				 errmsg("row-level locks are not allowed with set-returning functions in the target list")));
 }
 
 /*
@@ -2214,9 +2239,6 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 			switch (rte->rtekind)
 			{
 				case RTE_RELATION:
-					/* ignore foreign tables */
-					if (rte->relkind == RELKIND_FOREIGN_TABLE)
-						break;
 					applyLockingClause(qry, i,
 									   lc->strength, lc->noWait, pushedDown);
 					rte->requiredPerms |= ACL_SELECT_FOR_UPDATE;
@@ -2226,7 +2248,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 									   lc->strength, lc->noWait, pushedDown);
 
 					/*
-					 * FOR [KEY] UPDATE/SHARE of subquery is propagated to all of
+					 * FOR UPDATE/SHARE of subquery is propagated to all of
 					 * subquery's rels, too.  We could do this later (based on
 					 * the marking of the subquery RTE) but it is convenient
 					 * to have local knowledge in each query level about which
@@ -2252,7 +2274,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 			if (thisrel->catalogname || thisrel->schemaname)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
-						 errmsg("SELECT FOR UPDATE/SHARE/KEY UPDATE/KEY SHARE must specify unqualified relation names"),
+						 errmsg("row-level locks must specify unqualified relation names"),
 						 parser_errposition(pstate, thisrel->location)));
 
 			i = 0;
@@ -2266,12 +2288,6 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 					switch (rte->rtekind)
 					{
 						case RTE_RELATION:
-							if (rte->relkind == RELKIND_FOREIGN_TABLE)
-								ereport(ERROR,
-									 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									  errmsg("SELECT FOR UPDATE/SHARE/KEY UPDATE/KEY SHARE cannot be used with foreign table \"%s\"",
-											 rte->eref->aliasname),
-									  parser_errposition(pstate, thisrel->location)));
 							applyLockingClause(qry, i,
 											   lc->strength, lc->noWait,
 											   pushedDown);
@@ -2288,25 +2304,25 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 						case RTE_JOIN:
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									 errmsg("SELECT FOR UPDATE/SHARE/KEY UPDATE/KEY SHARE cannot be applied to a join"),
+									 errmsg("row-level locks cannot be applied to a join"),
 							 parser_errposition(pstate, thisrel->location)));
 							break;
 						case RTE_FUNCTION:
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									 errmsg("SELECT FOR UPDATE/SHARE/KEY UPDATE/KEY SHARE cannot be applied to a function"),
+									 errmsg("row-level locks cannot be applied to a function"),
 							 parser_errposition(pstate, thisrel->location)));
 							break;
 						case RTE_VALUES:
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									 errmsg("SELECT FOR UPDATE/SHARE/KEY UPDATE/KEY SHARE cannot be applied to VALUES"),
+									 errmsg("row-level locks cannot be applied to VALUES"),
 							 parser_errposition(pstate, thisrel->location)));
 							break;
 						case RTE_CTE:
 							ereport(ERROR,
 									(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-									 errmsg("SELECT FOR UPDATE/SHARE/KEY UPDATE/KEY SHARE cannot be applied to a WITH query"),
+									 errmsg("row-level locks cannot be applied to a WITH query"),
 							 parser_errposition(pstate, thisrel->location)));
 							break;
 						default:
@@ -2320,7 +2336,7 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 			if (rt == NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_UNDEFINED_TABLE),
-						 errmsg("relation \"%s\" in FOR UPDATE/SHARE/KEY UPDATE/KEY SHARE clause not found in FROM clause",
+						 errmsg("relation \"%s\" in row-level lock clause not found in FROM clause",
 								thisrel->relname),
 						 parser_errposition(pstate, thisrel->location)));
 		}

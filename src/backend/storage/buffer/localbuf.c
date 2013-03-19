@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "catalog/catalog.h"
+#include "common/relpath.h"
 #include "executor/instrument.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
@@ -496,14 +497,22 @@ void
 AtEOXact_LocalBuffers(bool isCommit)
 {
 #ifdef USE_ASSERT_CHECKING
-	if (assert_enabled)
+	if (assert_enabled && LocalRefCount)
 	{
+		int			RefCountErrors = 0;
 		int			i;
 
 		for (i = 0; i < NLocBuffer; i++)
 		{
-			Assert(LocalRefCount[i] == 0);
+			if (LocalRefCount[i] != 0)
+			{
+				Buffer	b = -i - 1;
+
+				PrintBufferLeakWarning(b);
+				RefCountErrors++;
+			}
 		}
+		Assert(RefCountErrors == 0);
 	}
 #endif
 }
@@ -522,12 +531,20 @@ AtProcExit_LocalBuffers(void)
 #ifdef USE_ASSERT_CHECKING
 	if (assert_enabled && LocalRefCount)
 	{
+		int			RefCountErrors = 0;
 		int			i;
 
 		for (i = 0; i < NLocBuffer; i++)
 		{
-			Assert(LocalRefCount[i] == 0);
+			if (LocalRefCount[i] != 0)
+			{
+				Buffer	b = -i - 1;
+
+				PrintBufferLeakWarning(b);
+				RefCountErrors++;
+			}
 		}
+		Assert(RefCountErrors == 0);
 	}
 #endif
 }

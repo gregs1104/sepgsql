@@ -39,6 +39,7 @@
 #include "catalog/dependency.h"
 #include "catalog/heap.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
@@ -1214,6 +1215,8 @@ AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
 				 stmt->newValNeighbor, stmt->newValIsAfter,
 				 stmt->skipIfExists);
 
+	InvokeObjectPostAlterHook(TypeRelationId, enum_type_oid, 0);
+
 	ReleaseSysCache(tup);
 
 	return enum_type_oid;
@@ -2190,6 +2193,8 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 							 defaultExpr,
 							 true);		/* Rebuild is true */
 
+	InvokeObjectPostAlterHook(TypeRelationId, domainoid, 0);
+
 	/* Clean up */
 	heap_close(rel, NoLock);
 	heap_freetuple(newtuple);
@@ -2264,11 +2269,22 @@ AlterDomainNotNull(List *names, bool notNull)
 					int			attnum = rtc->atts[i];
 
 					if (heap_attisnull(tuple, attnum))
+					{
+						/*
+						 * In principle the auxiliary information for this
+						 * error should be errdatatype(), but errtablecol()
+						 * seems considerably more useful in practice.  Since
+						 * this code only executes in an ALTER DOMAIN command,
+						 * the client should already know which domain is in
+						 * question.
+						 */
 						ereport(ERROR,
 								(errcode(ERRCODE_NOT_NULL_VIOLATION),
 								 errmsg("column \"%s\" of table \"%s\" contains null values",
 								NameStr(tupdesc->attrs[attnum - 1]->attname),
-										RelationGetRelationName(testrel))));
+										RelationGetRelationName(testrel)),
+								 errtablecol(testrel, attnum)));
+					}
 				}
 			}
 			heap_endscan(scan);
@@ -2287,6 +2303,8 @@ AlterDomainNotNull(List *names, bool notNull)
 	simple_heap_update(typrel, &tup->t_self, tup);
 
 	CatalogUpdateIndexes(typrel, tup);
+
+	InvokeObjectPostAlterHook(TypeRelationId, domainoid, 0);
 
 	/* Clean up */
 	heap_freetuple(tup);
@@ -2469,7 +2487,7 @@ AlterDomainAddConstraint(List *names, Node *newConstraint)
 	 * to pg_constraint.
 	 */
 
-	ccbin = domainAddConstraint(HeapTupleGetOid(tup), typTup->typnamespace,
+	ccbin = domainAddConstraint(domainoid, typTup->typnamespace,
 								typTup->typbasetype, typTup->typtypmod,
 								constr, NameStr(typTup->typname));
 
@@ -2575,6 +2593,10 @@ AlterDomainValidateConstraint(List *names, char *constrName)
 	copy_con->convalidated = true;
 	simple_heap_update(conrel, &copyTuple->t_self, copyTuple);
 	CatalogUpdateIndexes(conrel, copyTuple);
+
+	InvokeObjectPostAlterHook(ConstraintRelationId,
+							  HeapTupleGetOid(copyTuple), 0);
+
 	heap_freetuple(copyTuple);
 
 	systable_endscan(scan);
@@ -2641,11 +2663,22 @@ validateDomainConstraint(Oid domainoid, char *ccbin)
 													  &isNull, NULL);
 
 				if (!isNull && !DatumGetBool(conResult))
+				{
+					/*
+					 * In principle the auxiliary information for this error
+					 * should be errdomainconstraint(), but errtablecol()
+					 * seems considerably more useful in practice.  Since this
+					 * code only executes in an ALTER DOMAIN command, the
+					 * client should already know which domain is in question,
+					 * and which constraint too.
+					 */
 					ereport(ERROR,
 							(errcode(ERRCODE_CHECK_VIOLATION),
 							 errmsg("column \"%s\" of table \"%s\" contains values that violate the new constraint",
 								NameStr(tupdesc->attrs[attnum - 1]->attname),
-									RelationGetRelationName(testrel))));
+									RelationGetRelationName(testrel)),
+							 errtablecol(testrel, attnum)));
+				}
 			}
 
 			ResetExprContext(econtext);
@@ -2781,7 +2814,8 @@ get_rels_with_domain(Oid domainOid, LOCKMODE lockmode)
 												 format_type_be(domainOid));
 
 			/* Otherwise we can ignore views, composite types, etc */
-			if (rel->rd_rel->relkind != RELKIND_RELATION)
+			if (rel->rd_rel->relkind != RELKIND_RELATION &&
+				rel->rd_rel->relkind != RELKIND_MATVIEW)
 			{
 				relation_close(rel, lockmode);
 				continue;
@@ -2970,7 +3004,8 @@ domainAddConstraint(Oid domainOid, Oid domainNamespace, Oid baseTypeOid,
 						  ccsrc,	/* Source form of check constraint */
 						  true, /* is local */
 						  0,	/* inhcount */
-						  false);		/* connoinherit */
+						  false,	/* connoinherit */
+						  false);	/* is_internal */
 
 	/*
 	 * Return the compiled constraint expression so the calling routine can
@@ -3165,7 +3200,7 @@ RenameType(RenameStmt *stmt)
 	 * RenameRelationInternal will call RenameTypeInternal automatically.
 	 */
 	if (typTup->typtype == TYPTYPE_COMPOSITE)
-		RenameRelationInternal(typTup->typrelid, newTypeName);
+		RenameRelationInternal(typTup->typrelid, newTypeName, false);
 	else
 		RenameTypeInternal(typeOid, newTypeName,
 						   typTup->typnamespace);
@@ -3288,6 +3323,8 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
 			/* Update owner dependency reference */
 			changeDependencyOnOwner(TypeRelationId, typeOid, newOwnerId);
 
+			InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
+
 			/* If it has an array type, update that too */
 			if (OidIsValid(typTup->typarray))
 				AlterTypeOwnerInternal(typTup->typarray, newOwnerId, false);
@@ -3310,6 +3347,8 @@ AlterTypeOwner(List *names, Oid newOwnerId, ObjectType objecttype)
  *
  * hasDependEntry should be TRUE if type is expected to have a pg_shdepend
  * entry (ie, it's not a table rowtype nor an array type).
+ * is_primary_ops should be TRUE if this function is invoked with user's
+ * direct operation (e.g, shdepReassignOwned). Elsewhere, 
  */
 void
 AlterTypeOwnerInternal(Oid typeOid, Oid newOwnerId,
@@ -3342,6 +3381,8 @@ AlterTypeOwnerInternal(Oid typeOid, Oid newOwnerId,
 	/* If it has an array type, update that too */
 	if (OidIsValid(typTup->typarray))
 		AlterTypeOwnerInternal(typTup->typarray, newOwnerId, false);
+
+	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
 
 	/* Clean up */
 	heap_close(rel, RowExclusiveLock);
@@ -3529,6 +3570,8 @@ AlterTypeNamespaceInternal(Oid typeOid, Oid nspOid,
 								NamespaceRelationId, oldNspOid, nspOid) != 1)
 			elog(ERROR, "failed to change schema dependency for type %s",
 				 format_type_be(typeOid));
+
+	InvokeObjectPostAlterHook(TypeRelationId, typeOid, 0);
 
 	heap_freetuple(tup);
 
