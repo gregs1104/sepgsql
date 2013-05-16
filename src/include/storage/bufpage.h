@@ -15,6 +15,7 @@
 #define BUFPAGE_H
 
 #include "access/xlogdefs.h"
+#include "storage/block.h"
 #include "storage/item.h"
 #include "storage/off.h"
 
@@ -188,9 +189,12 @@ typedef PageHeaderData *PageHeader;
  * Release 8.3 uses 4; it changed the HeapTupleHeader layout again, and
  *		added the pd_flags field (by stealing some bits from pd_tli),
  *		as well as adding the pd_prune_xid field (which enlarges the header).
+ *
+ * As of Release 9.3, the checksum version must also be considered when
+ * handling pages.
  */
 #define PG_PAGE_LAYOUT_VERSION		4
-
+#define PG_DATA_CHECKSUM_VERSION	1
 
 /* ----------------------------------------------------------------
  *						page support macros
@@ -386,7 +390,7 @@ do { \
  */
 
 extern void PageInit(Page page, Size pageSize, Size specialSize);
-extern bool PageHeaderIsValid(PageHeader page);
+extern bool PageIsVerified(Page page, BlockNumber blkno);
 extern OffsetNumber PageAddItem(Page page, Item item, Size size,
 			OffsetNumber offsetNumber, bool overwrite, bool is_heap);
 extern Page PageGetTempPage(Page page);
@@ -399,5 +403,7 @@ extern Size PageGetExactFreeSpace(Page page);
 extern Size PageGetHeapFreeSpace(Page page);
 extern void PageIndexTupleDelete(Page page, OffsetNumber offset);
 extern void PageIndexMultiDelete(Page page, OffsetNumber *itemnos, int nitems);
+extern char *PageSetChecksumCopy(Page page, BlockNumber blkno);
+extern void PageSetChecksumInplace(Page page, BlockNumber blkno);
 
 #endif   /* BUFPAGE_H */

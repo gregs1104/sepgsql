@@ -119,6 +119,7 @@ static bool noclean = false;
 static bool do_sync = true;
 static bool sync_only = false;
 static bool show_setting = false;
+static bool data_checksums = false;
 static char *xlog_dir = "";
 
 
@@ -1441,8 +1442,10 @@ bootstrap_template1(void)
 	unsetenv("PGCLIENTENCODING");
 
 	snprintf(cmd, sizeof(cmd),
-			 "\"%s\" --boot -x1 %s %s",
-			 backend_exec, boot_options, talkargs);
+			 "\"%s\" --boot -x1 %s %s %s",
+			 backend_exec,
+			 data_checksums ? "-k" : "",
+			 boot_options, talkargs);
 
 	PG_CMD_OPEN;
 
@@ -2748,6 +2751,7 @@ usage(const char *progname)
 	printf(_("  -X, --xlogdir=XLOGDIR     location for the transaction log directory\n"));
 	printf(_("\nLess commonly used options:\n"));
 	printf(_("  -d, --debug               generate lots of debugging output\n"));
+	printf(_("  -k, --data-checksums      use data page checksums\n"));
 	printf(_("  -L DIRECTORY              where to find the input files\n"));
 	printf(_("  -n, --noclean             do not clean up after errors\n"));
 	printf(_("  -N, --nosync              do not wait for changes to be written safely to disk\n"));
@@ -3316,7 +3320,8 @@ warn_on_mount_point(int error)
 				_("It contains a lost+found directory, perhaps due to it being a mount point.\n"));
 
 	fprintf(stderr,
-			_("Using the top-level directory of a mount point is not recommended.\n"));
+			_("Using a mount point directly as the data directory is not recommended.\n"
+			  "Create a subdirectory under the mount point.\n"));
 }
 
 
@@ -3424,6 +3429,7 @@ main(int argc, char *argv[])
 		{"nosync", no_argument, NULL, 'N'},
 		{"sync-only", no_argument, NULL, 'S'},
 		{"xlogdir", required_argument, NULL, 'X'},
+		{"data-checksums", no_argument, NULL, 'k'},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3455,7 +3461,7 @@ main(int argc, char *argv[])
 
 	/* process command-line options */
 
-	while ((c = getopt_long(argc, argv, "dD:E:L:nNU:WA:sST:X:", long_options, &option_index)) != -1)
+	while ((c = getopt_long(argc, argv, "dD:E:kL:nNU:WA:sST:X:", long_options, &option_index)) != -1)
 	{
 		switch (c)
 		{
@@ -3503,6 +3509,9 @@ main(int argc, char *argv[])
 				break;
 			case 'S':
 				sync_only = true;
+				break;
+			case 'k':
+				data_checksums = true;
 				break;
 			case 'L':
 				share_path = pg_strdup(optarg);
@@ -3615,6 +3624,11 @@ main(int argc, char *argv[])
 	setup_locale_encoding();
 
 	setup_text_search();
+
+	if (data_checksums)
+		printf(_("Data page checksums are enabled.\n"));
+	else
+		printf(_("Data page checksums are disabled.\n"));
 	
 	printf("\n");
 

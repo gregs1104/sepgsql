@@ -48,8 +48,8 @@ typedef LockInfoData *LockInfo;
 
 
 /*
- * Cached lookup information for the index access method functions defined
- * by the pg_am row associated with an index relation.
+ * Cached lookup information for the frequently used index access method
+ * functions, defined by the pg_am row associated with an index relation.
  */
 typedef struct RelationAmInfo
 {
@@ -61,13 +61,7 @@ typedef struct RelationAmInfo
 	FmgrInfo	amendscan;
 	FmgrInfo	ammarkpos;
 	FmgrInfo	amrestrpos;
-	FmgrInfo	ambuild;
-	FmgrInfo	ambuildempty;
-	FmgrInfo	ambulkdelete;
-	FmgrInfo	amvacuumcleanup;
 	FmgrInfo	amcanreturn;
-	FmgrInfo	amcostestimate;
-	FmgrInfo	amoptions;
 } RelationAmInfo;
 
 
@@ -84,7 +78,6 @@ typedef struct RelationData
 	BackendId	rd_backend;		/* owning backend id, if temporary relation */
 	bool		rd_islocaltemp; /* rel is a temp rel of this session */
 	bool		rd_isnailed;	/* rel is nailed in cache */
-	bool		rd_isscannable; /* rel can be scanned */
 	bool		rd_isvalid;		/* relcache entry is valid */
 	char		rd_indexvalid;	/* state of rd_indexlist: 0 = not valid, 1 =
 								 * valid, 2 = temporarily forced */
@@ -408,6 +401,24 @@ typedef struct StdRdOptions
 #define RELATION_IS_OTHER_TEMP(relation) \
 	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP && \
 	 !(relation)->rd_islocaltemp)
+
+
+/*
+ * RelationIsScannable
+ * 		Currently can only be false for a materialized view which has not been
+ * 		populated by its query.  This is likely to get more complicated later,
+ * 		so use a macro which looks like a function.
+ */
+#define RelationIsScannable(relation) ((relation)->rd_rel->relispopulated)
+
+/*
+ * RelationIsPopulated
+ * 		Currently, we don't physically distinguish the "populated" and
+ *		"scannable" properties of matviews, but that may change later.
+ *		Hence, use the appropriate one of these macros in code tests.
+ */
+#define RelationIsPopulated(relation) ((relation)->rd_rel->relispopulated)
+
 
 /* routines in utils/cache/relcache.c */
 extern void RelationIncrementReferenceCount(Relation rel);

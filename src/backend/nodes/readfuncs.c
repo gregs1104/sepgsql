@@ -395,8 +395,8 @@ _readIntoClause(void)
 	READ_NODE_FIELD(options);
 	READ_ENUM_FIELD(onCommit, OnCommitAction);
 	READ_STRING_FIELD(tableSpaceName);
+	READ_NODE_FIELD(viewQuery);
 	READ_BOOL_FIELD(skipData);
-	READ_CHAR_FIELD(relkind);
 
 	READ_DONE();
 }
@@ -1192,7 +1192,6 @@ _readRangeTblEntry(void)
 		case RTE_RELATION:
 			READ_OID_FIELD(relid);
 			READ_CHAR_FIELD(relkind);
-			READ_BOOL_FIELD(isResultRel);
 			break;
 		case RTE_SUBQUERY:
 			READ_NODE_FIELD(subquery);

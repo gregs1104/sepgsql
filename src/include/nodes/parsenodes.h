@@ -716,7 +716,6 @@ typedef struct RangeTblEntry
 	 */
 	Oid			relid;			/* OID of the relation */
 	char		relkind;		/* relation kind (see pg_class.relkind) */
-	bool		isResultRel;	/* used in target of SELECT INTO or similar */
 
 	/*
 	 * Fields valid for a subquery RTE (else NULL):
@@ -1519,7 +1518,7 @@ typedef struct CreateStmt
 
 typedef enum ConstrType			/* types of constraints */
 {
-	CONSTR_NULL,				/* not SQL92, but a lot of people expect it */
+	CONSTR_NULL,				/* not standard SQL, but a lot of people expect it */
 	CONSTR_NOTNULL,
 	CONSTR_DEFAULT,
 	CONSTR_CHECK,
@@ -2471,7 +2470,7 @@ typedef struct CreateTableAsStmt
 	NodeTag		type;
 	Node	   *query;			/* the query (see comments above) */
 	IntoClause *into;			/* destination table */
-	ObjectType	relkind;		/* type of object */
+	ObjectType	relkind;		/* OBJECT_TABLE or OBJECT_MATVIEW */
 	bool		is_select_into; /* it was written as SELECT INTO */
 } CreateTableAsStmt;
 

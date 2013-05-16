@@ -60,6 +60,7 @@
 #include "utils/timestamp.h"
 #include "pg_trace.h"
 
+extern uint32 bootstrap_data_checksum_version;
 
 /* File path names (all relative to $PGDATA) */
 #define RECOVERY_COMMAND_FILE	"recovery.conf"
@@ -645,8 +646,10 @@ static void CreateEndOfRecoveryRecord(void);
 static void CheckPointGuts(XLogRecPtr checkPointRedo, int flags);
 static void KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo);
 
-static bool XLogCheckBuffer(XLogRecData *rdata, bool doPageWrites,
+static bool XLogCheckBuffer(XLogRecData *rdata, bool holdsExclusiveLock,
 				XLogRecPtr *lsn, BkpBlock *bkpb);
+static Buffer RestoreBackupBlockContents(XLogRecPtr lsn, BkpBlock bkpb,
+				char *blk, bool get_cleanup_lock, bool keep_buffer);
 static bool AdvanceXLInsertBuffer(bool new_segment);
 static bool XLogCheckpointNeeded(XLogSegNo new_segno);
 static void XLogWrite(XLogwrtRqst WriteRqst, bool flexible, bool xlog_switch);
@@ -819,7 +822,7 @@ begin:;
 				{
 					/* OK, put it in this slot */
 					dtbuf[i] = rdt->buffer;
-					if (XLogCheckBuffer(rdt, doPageWrites,
+					if (doPageWrites && XLogCheckBuffer(rdt, true,
 										&(dtbuf_lsn[i]), &(dtbuf_xlg[i])))
 					{
 						dtbuf_bkp[i] = true;
@@ -1240,7 +1243,7 @@ begin:;
  * save the buffer's LSN at *lsn.
  */
 static bool
-XLogCheckBuffer(XLogRecData *rdata, bool doPageWrites,
+XLogCheckBuffer(XLogRecData *rdata, bool holdsExclusiveLock,
 				XLogRecPtr *lsn, BkpBlock *bkpb)
 {
 	Page		page;
@@ -1248,15 +1251,17 @@ XLogCheckBuffer(XLogRecData *rdata, bool doPageWrites,
 	page = BufferGetPage(rdata->buffer);
 
 	/*
-	 * XXX We assume page LSN is first data on *every* page that can be passed
-	 * to XLogInsert, whether it otherwise has the standard page layout or
-	 * not. We don't need the buffer header lock for PageGetLSN because we
-	 * have exclusive lock on the page and/or the relation.
+	 * We assume page LSN is first data on *every* page that can be passed
+	 * to XLogInsert, whether it has the standard page layout or not. We
+	 * don't need to take the buffer header lock for PageGetLSN if we hold
+	 * an exclusive lock on the page and/or the relation.
 	 */
-	*lsn = PageGetLSN(page);
+	if (holdsExclusiveLock)
+		*lsn = PageGetLSN(page);
+	else
+		*lsn = BufferGetLSNAtomic(rdata->buffer);
 
-	if (doPageWrites &&
-		PageGetLSN(page) <= RedoRecPtr)
+	if (*lsn <= RedoRecPtr)
 	{
 		/*
 		 * The page needs to be backed up, so set up *bkpb
@@ -3144,8 +3149,6 @@ Buffer
 RestoreBackupBlock(XLogRecPtr lsn, XLogRecord *record, int block_index,
 				   bool get_cleanup_lock, bool keep_buffer)
 {
-	Buffer		buffer;
-	Page		page;
 	BkpBlock	bkpb;
 	char	   *blk;
 	int			i;
@@ -3163,37 +3166,8 @@ RestoreBackupBlock(XLogRecPtr lsn, XLogRecord *record, int block_index,
 		if (i == block_index)
 		{
 			/* Found it, apply the update */
-			buffer = XLogReadBufferExtended(bkpb.node, bkpb.fork, bkpb.block,
-											RBM_ZERO);
-			Assert(BufferIsValid(buffer));
-			if (get_cleanup_lock)
-				LockBufferForCleanup(buffer);
-			else
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-
-			page = (Page) BufferGetPage(buffer);
-
-			if (bkpb.hole_length == 0)
-			{
-				memcpy((char *) page, blk, BLCKSZ);
-			}
-			else
-			{
-				memcpy((char *) page, blk, bkpb.hole_offset);
-				/* must zero-fill the hole */
-				MemSet((char *) page + bkpb.hole_offset, 0, bkpb.hole_length);
-				memcpy((char *) page + (bkpb.hole_offset + bkpb.hole_length),
-					   blk + bkpb.hole_offset,
-					   BLCKSZ - (bkpb.hole_offset + bkpb.hole_length));
-			}
-
-			PageSetLSN(page, lsn);
-			MarkBufferDirty(buffer);
-
-			if (!keep_buffer)
-				UnlockReleaseBuffer(buffer);
-
-			return buffer;
+			return RestoreBackupBlockContents(lsn, bkpb, blk, get_cleanup_lock,
+											  keep_buffer);
 		}
 
 		blk += BLCKSZ - bkpb.hole_length;
@@ -3202,6 +3176,56 @@ RestoreBackupBlock(XLogRecPtr lsn, XLogRecord *record, int block_index,
 	/* Caller specified a bogus block_index */
 	elog(ERROR, "failed to restore block_index %d", block_index);
 	return InvalidBuffer;		/* keep compiler quiet */
+}
+
+/*
+ * Workhorse for RestoreBackupBlock usable without an xlog record
+ *
+ * Restores a full-page image from BkpBlock and a data pointer.
+ */
+static Buffer
+RestoreBackupBlockContents(XLogRecPtr lsn, BkpBlock bkpb, char *blk,
+						   bool get_cleanup_lock, bool keep_buffer)
+{
+	Buffer		buffer;
+	Page		page;
+
+	buffer = XLogReadBufferExtended(bkpb.node, bkpb.fork, bkpb.block,
+									RBM_ZERO);
+	Assert(BufferIsValid(buffer));
+	if (get_cleanup_lock)
+		LockBufferForCleanup(buffer);
+	else
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+	page = (Page) BufferGetPage(buffer);
+
+	if (bkpb.hole_length == 0)
+	{
+		memcpy((char *) page, blk, BLCKSZ);
+	}
+	else
+	{
+		memcpy((char *) page, blk, bkpb.hole_offset);
+		/* must zero-fill the hole */
+		MemSet((char *) page + bkpb.hole_offset, 0, bkpb.hole_length);
+		memcpy((char *) page + (bkpb.hole_offset + bkpb.hole_length),
+			   blk + bkpb.hole_offset,
+			   BLCKSZ - (bkpb.hole_offset + bkpb.hole_length));
+	}
+
+	/*
+	 * The checksum value on this page is currently invalid. We don't
+	 * need to reset it here since it will be set before being written.
+	 */
+
+	PageSetLSN(page, lsn);
+	MarkBufferDirty(buffer);
+
+	if (!keep_buffer)
+		UnlockReleaseBuffer(buffer);
+
+	return buffer;
 }
 
 /*
@@ -3767,6 +3791,16 @@ GetSystemIdentifier(void)
 }
 
 /*
+ * Are checksums enabled for data pages?
+ */
+bool
+DataChecksumsEnabled(void)
+{
+	Assert(ControlFile != NULL);
+	return (ControlFile->data_checksum_version > 0);
+}
+
+/*
  * Returns a fake LSN for unlogged relations.
  *
  * Each call generates an LSN that is greater than any previous value
@@ -4092,6 +4126,7 @@ BootStrapXLOG(void)
 	ControlFile->max_prepared_xacts = max_prepared_xacts;
 	ControlFile->max_locks_per_xact = max_locks_per_xact;
 	ControlFile->wal_level = wal_level;
+	ControlFile->data_checksum_version = bootstrap_data_checksum_version;
 
 	/* some additional ControlFile fields are set in WriteControlFile() */
 
@@ -7488,9 +7523,9 @@ CreateRestartPoint(int flags)
 }
 
 /*
- * Calculate the last segment that we need to retain because of
- * wal_keep_segments, by subtracting wal_keep_segments from
- * the given xlog location, recptr.
+ * Retreat *logSegNo to the last segment that we need to retain because of
+ * wal_keep_segments. This is calculated by subtracting wal_keep_segments
+ * from the given xlog location, recptr.
  */
 static void
 KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
@@ -7506,7 +7541,7 @@ KeepLogSeg(XLogRecPtr recptr, XLogSegNo *logSegNo)
 	if (segno <= wal_keep_segments)
 		segno = 1;
 	else
-		segno = *logSegNo - wal_keep_segments;
+		segno = segno - wal_keep_segments;
 
 	/* don't delete WAL segments newer than the calculated segment */
 	if (segno < *logSegNo)
@@ -7599,6 +7634,95 @@ XLogRestorePoint(const char *rpName)
 					rpName, (uint32) (RecPtr >> 32), (uint32) RecPtr)));
 
 	return RecPtr;
+}
+
+/*
+ * Write a backup block if needed when we are setting a hint. Note that
+ * this may be called for a variety of page types, not just heaps.
+ *
+ * Callable while holding just share lock on the buffer content.
+ *
+ * We can't use the plain backup block mechanism since that relies on the
+ * Buffer being exclusively locked. Since some modifications (setting LSN, hint
+ * bits) are allowed in a sharelocked buffer that can lead to wal checksum
+ * failures. So instead we copy the page and insert the copied data as normal
+ * record data.
+ *
+ * We only need to do something if page has not yet been full page written in
+ * this checkpoint round. The LSN of the inserted wal record is returned if we
+ * had to write, InvalidXLogRecPtr otherwise.
+ *
+ * It is possible that multiple concurrent backends could attempt to write WAL
+ * records. In that case, multiple copies of the same block would be recorded
+ * in separate WAL records by different backends, though that is still OK from
+ * a correctness perspective.
+ *
+ * Note that this only works for buffers that fit the standard page model,
+ * i.e. those for which buffer_std == true
+ */
+XLogRecPtr
+XLogSaveBufferForHint(Buffer buffer)
+{
+	XLogRecPtr recptr = InvalidXLogRecPtr;
+	XLogRecPtr lsn;
+	XLogRecData rdata[2];
+	BkpBlock bkpb;
+
+	/*
+	 * Ensure no checkpoint can change our view of RedoRecPtr.
+	 */
+	Assert(MyPgXact->delayChkpt);
+
+	/*
+	 * Update RedoRecPtr so XLogCheckBuffer can make the right decision
+	 */
+	GetRedoRecPtr();
+
+	/*
+	 * Setup phony rdata element for use within XLogCheckBuffer only.
+	 * We reuse and reset rdata for any actual WAL record insert.
+	 */
+	rdata[0].buffer = buffer;
+	rdata[0].buffer_std = true;
+
+	/*
+	 * Check buffer while not holding an exclusive lock.
+	 */
+	if (XLogCheckBuffer(rdata, false, &lsn, &bkpb))
+	{
+		char copied_buffer[BLCKSZ];
+		char *origdata = (char *) BufferGetBlock(buffer);
+
+		/*
+		 * Copy buffer so we don't have to worry about concurrent hint bit or
+		 * lsn updates. We assume pd_lower/upper cannot be changed without an
+		 * exclusive lock, so the contents bkp are not racy.
+		 */
+		memcpy(copied_buffer, origdata, bkpb.hole_offset);
+		memcpy(copied_buffer + bkpb.hole_offset,
+				origdata + bkpb.hole_offset + bkpb.hole_length,
+				BLCKSZ - bkpb.hole_offset - bkpb.hole_length);
+
+		/*
+		 * Header for backup block.
+		 */
+		rdata[0].data = (char *) &bkpb;
+		rdata[0].len = sizeof(BkpBlock);
+		rdata[0].buffer = InvalidBuffer;
+		rdata[0].next = &(rdata[1]);
+
+		/*
+		 * Save copy of the buffer.
+		 */
+		rdata[1].data = copied_buffer;
+		rdata[1].len = BLCKSZ - bkpb.hole_length;
+		rdata[1].buffer = InvalidBuffer;
+		rdata[1].next = NULL;
+
+		recptr = XLogInsert(RM_XLOG_ID, XLOG_HINT, rdata);
+	}
+
+	return recptr;
 }
 
 /*
@@ -7767,7 +7891,7 @@ xlog_redo(XLogRecPtr lsn, XLogRecord *record)
 {
 	uint8		info = record->xl_info & ~XLR_INFO_MASK;
 
-	/* Backup blocks are not used in xlog records */
+	/* Backup blocks are not used by XLOG rmgr */
 	Assert(!(record->xl_info & XLR_BKP_BLOCK_MASK));
 
 	if (info == XLOG_NEXTOID)
@@ -7960,6 +8084,30 @@ xlog_redo(XLogRecPtr lsn, XLogRecord *record)
 	else if (info == XLOG_RESTORE_POINT)
 	{
 		/* nothing to do here */
+	}
+	else if (info == XLOG_HINT)
+	{
+		char *data;
+		BkpBlock bkpb;
+
+		/*
+		 * Hint bit records contain a backup block stored "inline" in the normal
+		 * data since the locking when writing hint records isn't sufficient to
+		 * use the normal backup block mechanism, which assumes exclusive lock
+		 * on the buffer supplied.
+		 *
+		 * Since the only change in these backup block are hint bits, there are
+		 * no recovery conflicts generated.
+		 *
+		 * This also means there is no corresponding API call for this,
+		 * so an smgr implementation has no need to implement anything.
+		 * Which means nothing is needed in md.c etc
+		 */
+		data = XLogRecGetData(record);
+		memcpy(&bkpb, data, sizeof(BkpBlock));
+		data += sizeof(BkpBlock);
+
+		RestoreBackupBlockContents(lsn, bkpb, data, false, false);
 	}
 	else if (info == XLOG_BACKUP_END)
 	{
@@ -8264,7 +8412,7 @@ do_pg_start_backup(const char *backupidstr, bool fast, TimeLineID *starttli_p,
 
 	backup_started_in_recovery = RecoveryInProgress();
 
-	if (!superuser() && !is_authenticated_user_replication_role())
+	if (!superuser() && !has_rolreplication(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 		   errmsg("must be superuser or replication role to run a backup")));
@@ -8602,7 +8750,7 @@ do_pg_stop_backup(char *labelfile, bool waitforarchive, TimeLineID *stoptli_p)
 
 	backup_started_in_recovery = RecoveryInProgress();
 
-	if (!superuser() && !is_authenticated_user_replication_role())
+	if (!superuser() && !has_rolreplication(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 		 (errmsg("must be superuser or replication role to run a backup"))));
@@ -9450,7 +9598,7 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 						}
 						else
 						{
-							ptr = RecPtr;
+							ptr = tliRecPtr;
 							tli = tliOfPointInHistory(tliRecPtr, expectedTLEs);
 
 							if (curFileTLI > 0 && tli < curFileTLI)
@@ -9459,7 +9607,8 @@ WaitForWALToBecomeAvailable(XLogRecPtr RecPtr, bool randAccess,
 									 tli, curFileTLI);
 						}
 						curFileTLI = tli;
-						RequestXLogStreaming(curFileTLI, ptr, PrimaryConnInfo);
+						RequestXLogStreaming(tli, ptr, PrimaryConnInfo);
+						receivedUpto = 0;
 					}
 					/*
 					 * Move to XLOG_FROM_STREAM state in either case. We'll get
@@ -9758,19 +9907,7 @@ CheckForStandbyTrigger(void)
 			fast_promote = false;
 		}
 
-		/*
-		 * We only look for fast promote via the pg_ctl promote option.
-		 * It would be possible to extend trigger file support for the
-		 * fast promotion option but that wouldn't be backwards compatible
-		 * anyway and we're looking to focus further work on the promote
-		 * option as the right way to signal end of recovery.
-		 */
-		if (fast_promote)
-			ereport(LOG,
-				(errmsg("received fast promote request")));
-		else
-			ereport(LOG,
-				(errmsg("received promote request")));
+		ereport(LOG, (errmsg("received promote request")));
 
 		ResetPromoteTriggered();
 		triggered = true;
@@ -9786,6 +9923,7 @@ CheckForStandbyTrigger(void)
 				(errmsg("trigger file found: %s", TriggerFile)));
 		unlink(TriggerFile);
 		triggered = true;
+		fast_promote = true;
 		return true;
 	}
 	return false;

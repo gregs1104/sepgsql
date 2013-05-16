@@ -834,25 +834,3 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 
 	PG_RETURN_TEXT_P(cstring_to_text(path));
 }
-
-
-/*
- * Indicate whether a relation is scannable.
- *
- * Currently, this is always true except for a materialized view which has not
- * been populated.
- */
-Datum
-pg_relation_is_scannable(PG_FUNCTION_ARGS)
-{
-	Oid			relid;
-	Relation	relation;
-	bool		result;
-
-	relid = PG_GETARG_OID(0);
-	relation = RelationIdGetRelation(relid);
-	result = relation->rd_isscannable;
-	RelationClose(relation);
-
-	PG_RETURN_BOOL(result);
-}

@@ -210,7 +210,7 @@ DefineSequence(CreateSeqStmt *seq)
 	stmt->relation = seq->sequence;
 	stmt->inhRelations = NIL;
 	stmt->constraints = NIL;
-	stmt->options = list_make1(defWithOids(false));
+	stmt->options = NIL;
 	stmt->oncommit = ONCOMMIT_NOOP;
 	stmt->tablespacename = NULL;
 	stmt->if_not_exists = false;
@@ -1118,7 +1118,7 @@ read_seq_tuple(SeqTable elm, Relation rel, Buffer *buf, HeapTuple seqtuple)
 		HeapTupleHeaderSetXmax(seqtuple->t_data, InvalidTransactionId);
 		seqtuple->t_data->t_infomask &= ~HEAP_XMAX_COMMITTED;
 		seqtuple->t_data->t_infomask |= HEAP_XMAX_INVALID;
-		SetBufferCommitInfoNeedsSave(*buf);
+		MarkBufferDirtyHint(*buf);
 	}
 
 	seq = (Form_pg_sequence) GETSTRUCT(seqtuple);
@@ -1440,11 +1440,12 @@ process_owned_by(Relation seqrel, List *owned_by)
 		rel = makeRangeVarFromNameList(relname);
 		tablerel = relation_openrv(rel, AccessShareLock);
 
-		/* Must be a regular table */
-		if (tablerel->rd_rel->relkind != RELKIND_RELATION)
+		/* Must be a regular or foreign table */
+		if (!(tablerel->rd_rel->relkind == RELKIND_RELATION ||
+			  tablerel->rd_rel->relkind == RELKIND_FOREIGN_TABLE))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("referenced relation \"%s\" is not a table",
+					 errmsg("referenced relation \"%s\" is not a table or foreign table",
 							RelationGetRelationName(tablerel))));
 
 		/* We insist on same owner and schema */

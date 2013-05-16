@@ -21,8 +21,6 @@
  * NOTES
  *	  CAPITALS are used to represent terminal symbols.
  *	  non-capitals are used to represent non-terminals.
- *	  SQL92-specific syntax is separated from plain SQL/Postgres syntax
- *	  to help isolate the non-extensible portions of the parser.
  *
  *	  In general, nothing in this file should initiate database accesses
  *	  nor depend on changeable state (such as SET variables).  If you do
@@ -121,13 +119,6 @@ typedef struct PrivTarget
 #define CAS_NOT_VALID				0x10
 #define CAS_NO_INHERIT				0x20
 
-/*
- * In the IntoClause structure there is a char value which will eventually be
- * set to RELKIND_RELATION or RELKIND_MATVIEW based on the relkind field in
- * the statement-level structure, which is an ObjectType. Define the default
- * here, which should always be overridden later.
- */
-#define INTO_CLAUSE_RELKIND_DEFAULT	'\0'
 
 #define parser_yyerror(msg)  scanner_yyerror(msg, yyscanner)
 #define parser_errposition(pos)  scanner_errposition(pos, yyscanner)
@@ -1289,7 +1280,7 @@ schema_stmt:
  *
  * Set PG internal variable
  *	  SET name TO 'var_value'
- * Include SQL92 syntax (thomas 1997-10-22):
+ * Include SQL syntax (thomas 1997-10-22):
  *	  SET TIME ZONE 'var_value'
  *
  *****************************************************************************/
@@ -2812,7 +2803,7 @@ ColConstraint:
  * to make it explicit.
  * - thomas 1998-09-13
  *
- * WITH NULL and NULL are not SQL92-standard syntax elements,
+ * WITH NULL and NULL are not SQL-standard syntax elements,
  * so leave them out. Use DEFAULT NULL to explicitly indicate
  * that a column may have that value. WITH NULL leads to
  * shift/reduce conflicts with WITH TIME ZONE anyway.
@@ -3256,8 +3247,8 @@ create_as_target:
 					$$->options = $3;
 					$$->onCommit = $4;
 					$$->tableSpaceName = $5;
+					$$->viewQuery = NULL;
 					$$->skipData = false;		/* might get changed later */
-					$$->relkind = INTO_CLAUSE_RELKIND_DEFAULT;
 				}
 		;
 
@@ -3299,8 +3290,8 @@ create_mv_target:
 					$$->options = $3;
 					$$->onCommit = ONCOMMIT_NOOP;
 					$$->tableSpaceName = $4;
+					$$->viewQuery = NULL;		/* filled at analysis time */
 					$$->skipData = false;		/* might get changed later */
-					$$->relkind = INTO_CLAUSE_RELKIND_DEFAULT;
 				}
 		;
 
@@ -4503,7 +4494,6 @@ DropTrigStmt:
  *
  *		QUERIES :
  *				CREATE EVENT TRIGGER ...
- *				DROP EVENT TRIGGER ...
  *				ALTER EVENT TRIGGER ...
  *
  *****************************************************************************/
@@ -5220,20 +5210,25 @@ opt_restart_seqs:
  *	The COMMENT ON statement can take different forms based upon the type of
  *	the object associated with the comment. The form of the statement is:
  *
- *	COMMENT ON [ [ DATABASE | DOMAIN | INDEX | SEQUENCE | TABLE | TYPE | VIEW |
- *				   COLLATION | CONVERSION | LANGUAGE | OPERATOR CLASS |
- *				   LARGE OBJECT | CAST | COLUMN | SCHEMA | TABLESPACE |
- *				   EXTENSION | ROLE | TEXT SEARCH PARSER |
- *				   TEXT SEARCH DICTIONARY | TEXT SEARCH TEMPLATE |
- *				   TEXT SEARCH CONFIGURATION | FOREIGN TABLE |
- *				   FOREIGN DATA WRAPPER | SERVER | EVENT TRIGGER |
- *				   MATERIALIZED VIEW] <objname> |
+ *	COMMENT ON [ [ CONVERSION | COLLATION | DATABASE | DOMAIN |
+ *                 EXTENSION | EVENT TRIGGER | FOREIGN DATA WRAPPER |
+ *                 FOREIGN TABLE | INDEX | [PROCEDURAL] LANGUAGE |
+ *                 MATERIALIZED VIEW | ROLE | SCHEMA | SEQUENCE |
+ *                 SERVER | TABLE | TABLESPACE |
+ *                 TEXT SEARCH CONFIGURATION | TEXT SEARCH DICTIONARY |
+ *                 TEXT SEARCH PARSER | TEXT SEARCH TEMPLATE | TYPE |
+ *                 VIEW] <objname> |
  *				 AGGREGATE <aggname> (arg1, ...) |
- *				 FUNCTION <funcname> (arg1, arg2, ...) |
- *				 OPERATOR <op> (leftoperand_typ, rightoperand_typ) |
- *				 TRIGGER <triggername> ON <relname> |
+ *				 CAST (<src type> AS <dst type>) |
+ *				 COLUMN <relname>.<colname> |
  *				 CONSTRAINT <constraintname> ON <relname> |
- *				 RULE <rulename> ON <relname> ]
+ *				 FUNCTION <funcname> (arg1, arg2, ...) |
+ *				 LARGE OBJECT <oid> |
+ *				 OPERATOR <op> (leftoperand_typ, rightoperand_typ) |
+ *				 OPERATOR CLASS <name> USING <access-method> |
+ *				 OPERATOR FAMILY <name> USING <access-method> |
+ *				 RULE <rulename> ON <relname> |
+ *				 TRIGGER <triggername> ON <relname> ]
  *			   IS 'text'
  *
  *****************************************************************************/
@@ -5357,38 +5352,6 @@ CommentStmt:
 					n->comment = $7;
 					$$ = (Node *) n;
 				}
-			| COMMENT ON TEXT_P SEARCH PARSER any_name IS comment_text
-				{
-					CommentStmt *n = makeNode(CommentStmt);
-					n->objtype = OBJECT_TSPARSER;
-					n->objname = $6;
-					n->comment = $8;
-					$$ = (Node *) n;
-				}
-			| COMMENT ON TEXT_P SEARCH DICTIONARY any_name IS comment_text
-				{
-					CommentStmt *n = makeNode(CommentStmt);
-					n->objtype = OBJECT_TSDICTIONARY;
-					n->objname = $6;
-					n->comment = $8;
-					$$ = (Node *) n;
-				}
-			| COMMENT ON TEXT_P SEARCH TEMPLATE any_name IS comment_text
-				{
-					CommentStmt *n = makeNode(CommentStmt);
-					n->objtype = OBJECT_TSTEMPLATE;
-					n->objname = $6;
-					n->comment = $8;
-					$$ = (Node *) n;
-				}
-			| COMMENT ON TEXT_P SEARCH CONFIGURATION any_name IS comment_text
-				{
-					CommentStmt *n = makeNode(CommentStmt);
-					n->objtype = OBJECT_TSCONFIGURATION;
-					n->objname = $6;
-					n->comment = $8;
-					$$ = (Node *) n;
-				}
 		;
 
 comment_type:
@@ -5411,6 +5374,10 @@ comment_type:
 			| SERVER							{ $$ = OBJECT_FOREIGN_SERVER; }
 			| FOREIGN DATA_P WRAPPER			{ $$ = OBJECT_FDW; }
 			| EVENT TRIGGER						{ $$ = OBJECT_EVENT_TRIGGER; }
+			| TEXT_P SEARCH CONFIGURATION		{ $$ = OBJECT_TSCONFIGURATION; }
+			| TEXT_P SEARCH DICTIONARY			{ $$ = OBJECT_TSDICTIONARY; }
+			| TEXT_P SEARCH PARSER				{ $$ = OBJECT_TSPARSER; }
+			| TEXT_P SEARCH TEMPLATE			{ $$ = OBJECT_TSTEMPLATE; }
 		;
 
 comment_text:
@@ -9215,7 +9182,7 @@ select_clause:
  * As with select_no_parens, simple_select cannot have outer parentheses,
  * but can have parenthesized subclauses.
  *
- * Note that sort clauses cannot be included at this level --- SQL92 requires
+ * Note that sort clauses cannot be included at this level --- SQL requires
  *		SELECT foo UNION SELECT bar ORDER BY baz
  * to be parsed as
  *		(SELECT foo UNION SELECT bar) ORDER BY baz
@@ -9334,8 +9301,8 @@ into_clause:
 					$$->options = NIL;
 					$$->onCommit = ONCOMMIT_NOOP;
 					$$->tableSpaceName = NULL;
+					$$->viewQuery = NULL;
 					$$->skipData = false;
-					$$->relkind = INTO_CLAUSE_RELKIND_DEFAULT;
 				}
 			| /*EMPTY*/
 				{ $$ = NULL; }
@@ -9716,7 +9683,7 @@ table_ref:	relation_expr opt_alias_clause
 
 /*
  * It may seem silly to separate joined_table from table_ref, but there is
- * method in SQL92's madness: if you don't do it this way you get reduce-
+ * method in SQL's madness: if you don't do it this way you get reduce-
  * reduce conflicts, because it's not clear to the parser generator whether
  * to expect alias_clause after ')' or not.  For the same reason we must
  * treat 'JOIN' and 'join_type JOIN' separately, rather than allowing
@@ -10015,7 +9982,7 @@ TableFuncElement:	ColId Typename opt_collate_clause
 /*****************************************************************************
  *
  *	Type syntax
- *		SQL92 introduces a large amount of type-specific syntax.
+ *		SQL introduces a large amount of type-specific syntax.
  *		Define individual clauses to handle these cases, and use
  *		 the generic case to handle regular type-extensible Postgres syntax.
  *		- thomas 1997-10-10
@@ -10141,7 +10108,7 @@ opt_type_modifiers: '(' expr_list ')'				{ $$ = $2; }
 		;
 
 /*
- * SQL92 numeric data types
+ * SQL numeric data types
  */
 Numeric:	INT_P
 				{
@@ -10231,7 +10198,7 @@ opt_float:	'(' Iconst ')'
 		;
 
 /*
- * SQL92 bit-field data types
+ * SQL bit-field data types
  * The following implements BIT() and BIT VARYING().
  */
 Bit:		BitWithLength
@@ -10288,7 +10255,7 @@ BitWithoutLength:
 
 
 /*
- * SQL92 character data types
+ * SQL character data types
  * The following implements CHAR() and VARCHAR().
  */
 Character:  CharacterWithLength
@@ -10385,7 +10352,7 @@ opt_charset:
 		;
 
 /*
- * SQL92 date/time types
+ * SQL date/time types
  */
 ConstDatetime:
 			TIMESTAMP '(' Iconst ')' opt_timezone
@@ -10717,7 +10684,7 @@ a_expr:		c_expr									{ $$ = $1; }
 				}
 
 			/* NullTest clause
-			 * Define SQL92-style Null test clause.
+			 * Define SQL-style Null test clause.
 			 * Allow two forms described in the standard:
 			 *	a IS NULL
 			 *	a IS NOT NULL
@@ -11245,7 +11212,7 @@ func_expr:	func_name '(' ')' over_clause
 					/*
 					 * We consider AGGREGATE(*) to invoke a parameterless
 					 * aggregate.  This does the right thing for COUNT(*),
-					 * and there are no other aggregates in SQL92 that accept
+					 * and there are no other aggregates in SQL that accept
 					 * '*' as parameter.
 					 *
 					 * The FuncCall node is also marked agg_star = true,
@@ -11561,7 +11528,7 @@ func_expr:	func_name '(' ')' over_clause
 				}
 			| TRIM '(' BOTH trim_list ')'
 				{
-					/* various trim expressions are defined in SQL92
+					/* various trim expressions are defined in SQL
 					 * - thomas 1997-07-19
 					 */
 					FuncCall *n = makeNode(FuncCall);
@@ -12264,7 +12231,7 @@ in_expr:	select_with_parens
 		;
 
 /*
- * Define SQL92-style case clause.
+ * Define SQL-style CASE clause.
  * - Full specification
  *	CASE WHEN a = b THEN c ... ELSE d END
  * - Implicit argument

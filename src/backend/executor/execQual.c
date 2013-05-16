@@ -39,6 +39,7 @@
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/tupconvert.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_type.h"
 #include "commands/typecmds.h"
 #include "executor/execdebug.h"
@@ -1289,6 +1290,7 @@ init_fcache(Oid foid, Oid input_collation, FuncExprState *fcache,
 	aclresult = pg_proc_aclcheck(foid, GetUserId(), ACL_EXECUTE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, ACL_KIND_PROC, get_func_name(foid));
+	InvokeFunctionExecuteHook(foid);
 
 	/*
 	 * Safety check on nargs.  Under normal circumstances this should never
@@ -1799,11 +1801,19 @@ restart:
 				pgstat_end_function_usage(&fcusage,
 										rsinfo.isDone != ExprMultipleResult);
 			}
-			else
+			else if (fcache->func.fn_retset)
 			{
+				/* for a strict SRF, result for NULL is an empty set */
 				result = (Datum) 0;
 				*isNull = true;
 				*isDone = ExprEndResult;
+			}
+			else
+			{
+				/* for a strict non-SRF, result for NULL is a NULL */
+				result = (Datum) 0;
+				*isNull = true;
+				*isDone = ExprSingleResult;
 			}
 
 			/* Which protocol does function want to use? */
@@ -4223,6 +4233,7 @@ ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, ACL_KIND_PROC,
 						   get_func_name(acoerce->elemfuncid));
+		InvokeFunctionExecuteHook(acoerce->elemfuncid);
 
 		/* Set up the primary fmgr lookup information */
 		fmgr_info_cxt(acoerce->elemfuncid, &(astate->elemfunc),
@@ -4254,16 +4265,20 @@ ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
 /* ----------------------------------------------------------------
  *		ExecEvalCurrentOfExpr
  *
- * The planner must convert CURRENT OF into a TidScan qualification.
- * So, we have to be able to do ExecInitExpr on a CurrentOfExpr,
- * but we shouldn't ever actually execute it.
+ * The planner should convert CURRENT OF into a TidScan qualification, or some
+ * other special handling in a ForeignScan node.  So we have to be able to do
+ * ExecInitExpr on a CurrentOfExpr, but we shouldn't ever actually execute it.
+ * If we get here, we suppose we must be dealing with CURRENT OF on a foreign
+ * table whose FDW doesn't handle it, and complain accordingly.
  * ----------------------------------------------------------------
  */
 static Datum
 ExecEvalCurrentOfExpr(ExprState *exprstate, ExprContext *econtext,
 					  bool *isNull, ExprDoneCond *isDone)
 {
-	elog(ERROR, "CURRENT OF cannot be executed");
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("WHERE CURRENT OF is not supported for this table type")));
 	return 0;					/* keep compiler quiet */
 }
 

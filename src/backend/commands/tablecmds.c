@@ -52,6 +52,7 @@
 #include "commands/tablespace.h"
 #include "commands/trigger.h"
 #include "commands/typecmds.h"
+#include "common/relpath.h"
 #include "executor/executor.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -407,8 +408,6 @@ static void RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid,
 static void RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid,
 								 Oid oldrelid, void *arg);
 
-static bool isQueryUsingTempRelation_walker(Node *node, void *context);
-
 
 /* ----------------------------------------------------------------
  *		DefineRelation
@@ -560,7 +559,9 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId)
 	 */
 	descriptor = BuildDescForRelation(schema);
 
-	localHasOids = interpretOidsOption(stmt->options);
+	localHasOids = interpretOidsOption(stmt->options,
+									   (relkind == RELKIND_RELATION ||
+										relkind == RELKIND_FOREIGN_TABLE));
 	descriptor->tdhasoid = (localHasOids || parentOidCount > 0);
 
 	/*
@@ -8929,9 +8930,20 @@ copy_relation_data(SMgrRelation src, SMgrRelation dst,
 
 		smgrread(src, forkNum, blkno, buf);
 
+		if (!PageIsVerified(page, blkno))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("invalid page in block %u of relation %s",
+							blkno,
+							relpathbackend(src->smgr_rnode.node,
+										   src->smgr_rnode.backend,
+										   forkNum))));
+
 		/* XLOG stuff */
 		if (use_wal)
 			log_newpage(&dst->smgr_rnode.node, forkNum, blkno, page);
+
+		PageSetChecksumInplace(page, blkno);
 
 		/*
 		 * Now write the page.	We say isTemp = true even if it's not a temp
@@ -10533,71 +10545,20 @@ RangeVarCallbackForAlterRelation(const RangeVar *rv, Oid relid, Oid oldrelid,
 				 errmsg("\"%s\" is a composite type", rv->relname),
 				 errhint("Use ALTER TYPE instead.")));
 
-	if (reltype != OBJECT_FOREIGN_TABLE && relkind == RELKIND_FOREIGN_TABLE)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is a foreign table", rv->relname),
-				 errhint("Use ALTER FOREIGN TABLE instead.")));
-
 	/*
 	 * Don't allow ALTER TABLE .. SET SCHEMA on relations that can't be moved
 	 * to a different schema, such as indexes and TOAST tables.
 	 */
-	if (IsA(stmt, AlterObjectSchemaStmt) && relkind != RELKIND_RELATION
-		&& relkind != RELKIND_VIEW && relkind != RELKIND_MATVIEW
-		&& relkind != RELKIND_SEQUENCE && relkind != RELKIND_FOREIGN_TABLE)
+	if (IsA(stmt, AlterObjectSchemaStmt) &&
+		relkind != RELKIND_RELATION &&
+		relkind != RELKIND_VIEW &&
+		relkind != RELKIND_MATVIEW &&
+		relkind != RELKIND_SEQUENCE &&
+		relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 			errmsg("\"%s\" is not a table, view, sequence, or foreign table",
 				   rv->relname)));
 
 	ReleaseSysCache(tuple);
-}
-
-/*
- * Returns true iff any relation underlying this query is a temporary database
- * object (table, view, or materialized view).
- *
- */
-bool
-isQueryUsingTempRelation(Query *query)
-{
-	return isQueryUsingTempRelation_walker((Node *) query, NULL);
-}
-
-static bool
-isQueryUsingTempRelation_walker(Node *node, void *context)
-{
-	if (node == NULL)
-		return false;
-
-	if (IsA(node, Query))
-	{
-		Query	   *query = (Query *) node;
-		ListCell   *rtable;
-
-		foreach(rtable, query->rtable)
-		{
-			RangeTblEntry *rte = lfirst(rtable);
-
-			if (rte->rtekind == RTE_RELATION)
-			{
-				Relation	rel = heap_open(rte->relid, AccessShareLock);
-				char		relpersistence = rel->rd_rel->relpersistence;
-
-				heap_close(rel, AccessShareLock);
-				if (relpersistence == RELPERSISTENCE_TEMP)
-					return true;
-			}
-		}
-
-		return query_tree_walker(query,
-								 isQueryUsingTempRelation_walker,
-								 context,
-								 QTW_IGNORE_JOINALIASES);
-	}
-
-	return expression_tree_walker(node,
-								  isQueryUsingTempRelation_walker,
-								  context);
 }

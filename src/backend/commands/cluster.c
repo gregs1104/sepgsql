@@ -30,7 +30,6 @@
 #include "catalog/objectaccess.h"
 #include "catalog/toasting.h"
 #include "commands/cluster.h"
-#include "commands/matview.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
 #include "miscadmin.h"
@@ -381,13 +380,14 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose,
 		check_index_is_clusterable(OldHeap, indexOid, recheck, AccessExclusiveLock);
 
 	/*
-	 * Quietly ignore the request if the a materialized view is not scannable.
-	 * No harm is done because there is nothing no data to deal with, and we
-	 * don't want to throw an error if this is part of a multi-relation
-	 * request -- for example, CLUSTER was run on the entire database.
+	 * Quietly ignore the request if this is a materialized view which has not
+	 * been populated from its query. No harm is done because there is no data
+	 * to deal with, and we don't want to throw an error if this is part of a
+	 * multi-relation request -- for example, CLUSTER was run on the entire
+	 * database.
 	 */
 	if (OldHeap->rd_rel->relkind == RELKIND_MATVIEW &&
-		!OldHeap->rd_isscannable)
+		!RelationIsPopulated(OldHeap))
 	{
 		relation_close(OldHeap, AccessExclusiveLock);
 		return;
@@ -920,10 +920,6 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex,
 				(errmsg("vacuuming \"%s.%s\"",
 						get_namespace_name(RelationGetNamespace(OldHeap)),
 						RelationGetRelationName(OldHeap))));
-
-	if (OldHeap->rd_rel->relkind == RELKIND_MATVIEW)
-		/* Make sure the heap looks good even if no rows are written. */
-		SetRelationIsScannable(NewHeap);
 
 	/*
 	 * Scan through the OldHeap, either in OldIndex order or sequentially;

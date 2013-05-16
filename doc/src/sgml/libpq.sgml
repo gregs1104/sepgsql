@@ -1864,7 +1864,7 @@ int PQconnectionUsedPassword(const PGconn *conn);
        if SSL is not in use.
 
 <synopsis>
-SSL *PQgetssl(const PGconn *conn);
+void *PQgetssl(const PGconn *conn);
 </synopsis>
       </para>
 
@@ -1875,10 +1875,29 @@ SSL *PQgetssl(const PGconn *conn);
       </para>
 
       <para>
-       You must define <symbol>USE_SSL</symbol> in order to get the
-       correct prototype for this function. Doing so will also
-       automatically include <filename>ssl.h</filename> from
-       <productname>OpenSSL</productname>.
+       The actual return value is of type <type>SSL *</type>,
+       where <type>SSL</type> is a type defined by
+       the <productname>OpenSSL</productname> library, but it is not declared
+       this way to avoid requiring the <productname>OpenSSL</productname>
+       header files.  To use this function, code along the following lines
+       could be used:
+<programlisting><![CDATA[
+#include <libpq-fe.h>
+#include <openssl/ssl.h>
+
+...
+
+    SSL *ssl;
+
+    dbconn = PQconnectdb(...);
+    ...
+
+    ssl = PQgetssl(dbconn);
+    if (ssl)
+    {
+        /* use OpenSSL functions to access ssl */
+    }
+]]></programlisting>
       </para>
      </listitem>
     </varlistentry>
@@ -2581,11 +2600,11 @@ char *PQresultErrorField(const PGresult *res, int fieldcode);
          </varlistentry>
 
          <varlistentry id="libpq-pg-diag-sqlstate">
+          <term><symbol>PG_DIAG_SQLSTATE</></term>
           <indexterm>
            <primary>error codes</primary>
            <secondary>libpq</secondary>
           </indexterm>
-          <term><symbol>PG_DIAG_SQLSTATE</></term>
           <listitem>
            <para>
             The SQLSTATE code for the error. The SQLSTATE code identifies
@@ -7641,6 +7660,18 @@ CPPFLAGS += -I/usr/local/pgsql/include
      </para>
 
      <para>
+      If you
+      have <command>pkg-config</command><indexterm><primary>pkg-config</primary><secondary sortas="libpq">with
+      libpq</secondary></indexterm> installed, you can run instead:
+<screen>
+<prompt>$</prompt> pkg-config --cflags libpq
+<computeroutput>-I/usr/local/include</computeroutput>
+</screen>
+      Note that this will already include the <option>-I</option> in front of
+      the path.
+     </para>
+
+     <para>
       Failure to specify the correct option to the compiler will
       result in an error message such as:
 <screen>
@@ -7672,6 +7703,15 @@ cc -o testprog testprog1.o testprog2.o -L/usr/local/pgsql/lib -lpq
 <prompt>$</prompt> pg_config --libdir
 <computeroutput>/usr/local/pgsql/lib</computeroutput>
 </screen>
+     </para>
+
+     <para>
+      Or again use <command>pkg-config</command>:
+<screen>
+<prompt>$</prompt> pkg-config --libs libpq
+<computeroutput>-L/usr/local/pgsql/lib -lpq</computeroutput>
+</screen>
+      Note again that this prints the full options, not only the path.
      </para>
 
      <para>

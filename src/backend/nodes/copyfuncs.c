@@ -1032,8 +1032,8 @@ _copyIntoClause(const IntoClause *from)
 	COPY_NODE_FIELD(options);
 	COPY_SCALAR_FIELD(onCommit);
 	COPY_STRING_FIELD(tableSpaceName);
+	COPY_NODE_FIELD(viewQuery);
 	COPY_SCALAR_FIELD(skipData);
-	COPY_SCALAR_FIELD(relkind);
 
 	return newnode;
 }
@@ -1973,7 +1973,6 @@ _copyRangeTblEntry(const RangeTblEntry *from)
 	COPY_SCALAR_FIELD(rtekind);
 	COPY_SCALAR_FIELD(relid);
 	COPY_SCALAR_FIELD(relkind);
-	COPY_SCALAR_FIELD(isResultRel);
 	COPY_NODE_FIELD(subquery);
 	COPY_SCALAR_FIELD(security_barrier);
 	COPY_SCALAR_FIELD(rowsec_relid);
