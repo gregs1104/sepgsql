@@ -272,7 +272,7 @@ static void StoreCatalogInheritance1(Oid relationId, Oid parentOid,
 						 int16 seqNumber, Relation inhRelation);
 static int	findAttrByName(const char *attributeName, List *schema);
 static void AlterIndexNamespaces(Relation classRel, Relation rel,
-					 Oid oldNspOid, Oid newNspOid, ObjectAddresses *objsMoved);
+				   Oid oldNspOid, Oid newNspOid, ObjectAddresses *objsMoved);
 static void AlterSeqNamespaces(Relation classRel, Relation rel,
 				   Oid oldNspOid, Oid newNspOid, ObjectAddresses *objsMoved,
 				   LOCKMODE lockmode);
@@ -1142,7 +1142,7 @@ ExecuteTruncate(TruncateStmt *stmt)
 		{
 			Oid			heap_relid;
 			Oid			toast_relid;
-			MultiXactId	minmulti;
+			MultiXactId minmulti;
 
 			/*
 			 * This effectively deletes all rows in the table, and may be done
@@ -1676,14 +1676,14 @@ MergeAttributes(List *schema, List *supers, char relpersistence,
 										   &found_whole_row);
 
 				/*
-				 * For the moment we have to reject whole-row variables.
-				 * We could convert them, if we knew the new table's rowtype
-				 * OID, but that hasn't been assigned yet.
+				 * For the moment we have to reject whole-row variables. We
+				 * could convert them, if we knew the new table's rowtype OID,
+				 * but that hasn't been assigned yet.
 				 */
 				if (found_whole_row)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("cannot convert whole-row table reference"),
+						  errmsg("cannot convert whole-row table reference"),
 							 errdetail("Constraint \"%s\" contains a whole-row reference to table \"%s\".",
 									   name,
 									   RelationGetRelationName(relation))));
@@ -2123,7 +2123,7 @@ renameatt_internal(Oid myrelid,
 	Relation	targetrelation;
 	Relation	attrelation;
 	HeapTuple	atttup;
-	Form_pg_attribute	attform;
+	Form_pg_attribute attform;
 	int			attnum;
 
 	/*
@@ -2439,8 +2439,8 @@ RenameConstraint(RenameStmt *stmt)
 		rename_constraint_internal(relid, typid,
 								   stmt->subname,
 								   stmt->newname,
-								   stmt->relation ? interpretInhOption(stmt->relation->inhOpt) : false,	/* recursive? */
-								   false,	/* recursing? */
+		 stmt->relation ? interpretInhOption(stmt->relation->inhOpt) : false,	/* recursive? */
+								   false,		/* recursing? */
 								   0 /* expected inhcount */ );
 
 }
@@ -2798,7 +2798,7 @@ AlterTableGetLockLevel(List *cmds)
 			case AT_ColumnDefault:
 			case AT_ProcessedConstraint:		/* becomes AT_AddConstraint */
 			case AT_AddConstraintRecurse:		/* becomes AT_AddConstraint */
-			case AT_ReAddConstraint:			/* becomes AT_AddConstraint */
+			case AT_ReAddConstraint:	/* becomes AT_AddConstraint */
 			case AT_EnableTrig:
 			case AT_EnableAlwaysTrig:
 			case AT_EnableReplicaTrig:
@@ -3299,7 +3299,8 @@ ATExecCmd(List **wqueue, AlteredTableInfo *tab, Relation rel,
 			ATExecAddConstraint(wqueue, tab, rel, (Constraint *) cmd->def,
 								true, false, lockmode);
 			break;
-		case AT_ReAddConstraint:	/* Re-add pre-existing check constraint */
+		case AT_ReAddConstraint:		/* Re-add pre-existing check
+										 * constraint */
 			ATExecAddConstraint(wqueue, tab, rel, (Constraint *) cmd->def,
 								false, true, lockmode);
 			break;
@@ -3866,7 +3867,7 @@ ATRewriteTable(AlteredTableInfo *tab, Oid OIDNewHeap, LOCKMODE lockmode)
 					ereport(ERROR,
 							(errcode(ERRCODE_NOT_NULL_VIOLATION),
 							 errmsg("column \"%s\" contains null values",
-								NameStr(newTupDesc->attrs[attn]->attname)),
+								  NameStr(newTupDesc->attrs[attn]->attname)),
 							 errtablecol(oldrel, attn + 1)));
 			}
 
@@ -5577,10 +5578,10 @@ ATExecAddIndexConstraint(AlteredTableInfo *tab, Relation rel,
 							stmt->deferrable,
 							stmt->initdeferred,
 							stmt->primary,
-							true, /* update pg_index */
-							true, /* remove old dependencies */
+							true,		/* update pg_index */
+							true,		/* remove old dependencies */
 							allowSystemTableMods,
-							false);	/* is_internal */
+							false);		/* is_internal */
 
 	index_close(indexRel, NoLock);
 }
@@ -9050,14 +9051,14 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 		!parent_rel->rd_islocaltemp)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("cannot inherit from temporary relation of another session")));
+		errmsg("cannot inherit from temporary relation of another session")));
 
 	/* Ditto for the child */
 	if (child_rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
 		!child_rel->rd_islocaltemp)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("cannot inherit to temporary relation of another session")));
+		 errmsg("cannot inherit to temporary relation of another session")));
 
 	/*
 	 * Check for duplicates in the list of parents, and determine the highest
@@ -9591,9 +9592,9 @@ ATExecDropInherit(Relation rel, RangeVar *parent, LOCKMODE lockmode)
 						   RelationGetRelid(parent_rel));
 
 	/*
-	 * Post alter hook of this inherits. Since object_access_hook doesn't
-	 * take multiple object identifiers, we relay oid of parent relation
-	 * using auxiliary_id argument.
+	 * Post alter hook of this inherits. Since object_access_hook doesn't take
+	 * multiple object identifiers, we relay oid of parent relation using
+	 * auxiliary_id argument.
 	 */
 	InvokeObjectPostAlterHookArg(InheritsRelationId,
 								 RelationGetRelid(rel), 0,
@@ -10011,11 +10012,12 @@ AlterTableNamespaceInternal(Relation rel, Oid oldNspOid, Oid nspOid,
 void
 AlterRelationNamespaceInternal(Relation classRel, Oid relOid,
 							   Oid oldNspOid, Oid newNspOid,
-							   bool hasDependEntry, ObjectAddresses *objsMoved)
+							   bool hasDependEntry,
+							   ObjectAddresses *objsMoved)
 {
 	HeapTuple	classTup;
 	Form_pg_class classForm;
-	ObjectAddress	thisobj;
+	ObjectAddress thisobj;
 
 	classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relOid));
 	if (!HeapTupleIsValid(classTup))
@@ -10050,8 +10052,11 @@ AlterRelationNamespaceInternal(Relation classRel, Oid relOid,
 
 		/* Update dependency on schema if caller said so */
 		if (hasDependEntry &&
-			changeDependencyFor(RelationRelationId, relOid,
-								NamespaceRelationId, oldNspOid, newNspOid) != 1)
+			changeDependencyFor(RelationRelationId,
+								relOid,
+								NamespaceRelationId,
+								oldNspOid,
+								newNspOid) != 1)
 			elog(ERROR, "failed to change schema dependency for relation \"%s\"",
 				 NameStr(classForm->relname));
 
@@ -10274,6 +10279,7 @@ PreCommit_on_commit_actions(void)
 				/* Do nothing (there shouldn't be such entries, actually) */
 				break;
 			case ONCOMMIT_DELETE_ROWS:
+
 				/*
 				 * If this transaction hasn't accessed any temporary
 				 * relations, we can skip truncating ON COMMIT DELETE ROWS
@@ -10406,7 +10412,7 @@ AtEOSubXact_on_commit_actions(bool isCommit, SubTransactionId mySubid,
  * This is intended as a callback for RangeVarGetRelidExtended().  It allows
  * the relation to be locked only if (1) it's a plain table, materialized
  * view, or TOAST table and (2) the current user is the owner (or the
- * superuser).  This meets the permission-checking needs of CLUSTER, REINDEX
+ * superuser).	This meets the permission-checking needs of CLUSTER, REINDEX
  * TABLE, and REFRESH MATERIALIZED VIEW; we expose it here so that it can be
  * used by all.
  */

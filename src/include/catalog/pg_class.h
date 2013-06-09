@@ -67,7 +67,7 @@ CATALOG(pg_class,1259) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83) BKI_SCHEMA_MACRO
 	bool		relhastriggers; /* has (or has had) any TRIGGERs */
 	bool		relhasrowsecurity;	/* has (or has had) row-security policy */
 	bool		relhassubclass; /* has (or has had) derived classes */
-	bool		relispopulated;	/* matview currently holds query results */
+	bool		relispopulated; /* matview currently holds query results */
 	TransactionId relfrozenxid; /* all Xids < this are frozen in this rel */
 	TransactionId relminmxid;	/* all multixacts in this rel are >= this.
 								 * this is really a MultiXactId */

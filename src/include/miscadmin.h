@@ -343,7 +343,7 @@ typedef enum ProcessingMode
 
 extern ProcessingMode Mode;
 
-#define IsBootstrapProcessingMode()	(Mode == BootstrapProcessing)
+#define IsBootstrapProcessingMode() (Mode == BootstrapProcessing)
 #define IsInitProcessingMode()		(Mode == InitProcessing)
 #define IsNormalProcessingMode()	(Mode == NormalProcessing)
 
@@ -359,7 +359,7 @@ extern ProcessingMode Mode;
 
 
 /*
- * Auxiliary-process type identifiers.  These used to be in bootstrap.h
+ * Auxiliary-process type identifiers.	These used to be in bootstrap.h
  * but it seems saner to have them here, with the ProcessingMode stuff.
  * The MyAuxProcType global is defined and set in bootstrap.c.
  */
@@ -382,7 +382,7 @@ extern AuxProcType MyAuxProcType;
 
 #define AmBootstrapProcess()		(MyAuxProcType == BootstrapProcess)
 #define AmStartupProcess()			(MyAuxProcType == StartupProcess)
-#define AmBackgroundWriterProcess()	(MyAuxProcType == BgWriterProcess)
+#define AmBackgroundWriterProcess() (MyAuxProcType == BgWriterProcess)
 #define AmCheckpointerProcess()		(MyAuxProcType == CheckpointerProcess)
 #define AmWalWriterProcess()		(MyAuxProcType == WalWriterProcess)
 #define AmWalReceiverProcess()		(MyAuxProcType == WalReceiverProcess)
