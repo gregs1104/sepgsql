@@ -2703,6 +2703,10 @@ getRowSecurity(Archive *fout, TableInfo tblinfo[], int numTables)
 	int			i_rsecqual;
 	int			i, j, ntups;
 
+	/* row-security is not supported prior to v9.4 */
+	if (fout->remoteVersion < 90400)
+		return;
+
 	for (i=0; i < numTables; i++)
 	{
 		TableInfo  *tbinfo = &tblinfo[i];
