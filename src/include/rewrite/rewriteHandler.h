@@ -22,6 +22,6 @@ extern void	QueryRewriteExpr(Node *node, List *activeRIRs);
 extern void AcquireRewriteLocks(Query *parsetree, bool forUpdatePushedDown);
 
 extern Node *build_column_default(Relation rel, int attrno);
-extern bool relation_is_updatable(Oid reloid, int req_events);
+extern int	relation_is_updatable(Oid reloid, bool include_triggers);
 
 #endif   /* REWRITEHANDLER_H */
