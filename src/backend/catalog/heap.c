@@ -781,7 +781,6 @@ InsertPgClassTuple(Relation pg_class_desc,
 	values[Anum_pg_class_reltuples - 1] = Float4GetDatum(rd_rel->reltuples);
 	values[Anum_pg_class_relallvisible - 1] = Int32GetDatum(rd_rel->relallvisible);
 	values[Anum_pg_class_reltoastrelid - 1] = ObjectIdGetDatum(rd_rel->reltoastrelid);
-	values[Anum_pg_class_reltoastidxid - 1] = ObjectIdGetDatum(rd_rel->reltoastidxid);
 	values[Anum_pg_class_relhasindex - 1] = BoolGetDatum(rd_rel->relhasindex);
 	values[Anum_pg_class_relisshared - 1] = BoolGetDatum(rd_rel->relisshared);
 	values[Anum_pg_class_relpersistence - 1] = CharGetDatum(rd_rel->relpersistence);
@@ -1154,9 +1153,8 @@ heap_create_with_catalog(const char *relname,
 	/*
 	 * Decide whether to create an array type over the relation's rowtype. We
 	 * do not create any array types for system catalogs (ie, those made
-	 * during initdb).	We create array types for regular relations, views,
-	 * composite types and foreign tables ... but not, eg, for toast tables or
-	 * sequences.
+	 * during initdb). We do not create them where the use of a relation as
+	 * such is an implementation detail: toast tables, sequences and indexes.
 	 */
 	if (IsUnderPostmaster && (relkind == RELKIND_RELATION ||
 							  relkind == RELKIND_VIEW ||
@@ -1387,7 +1385,7 @@ RelationRemoveInheritance(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(catalogRelation, InheritsRelidSeqnoIndexId, true,
-							  SnapshotNow, 1, &key);
+							  NULL, 1, &key);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 		simple_heap_delete(catalogRelation, &tuple->t_self);
@@ -1451,7 +1449,7 @@ DeleteAttributeTuples(Oid relid)
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(attrel, AttributeRelidNumIndexId, true,
-							  SnapshotNow, 1, key);
+							  NULL, 1, key);
 
 	/* Delete all the matching tuples */
 	while ((atttup = systable_getnext(scan)) != NULL)
@@ -1492,7 +1490,7 @@ DeleteSystemAttributeTuples(Oid relid)
 				Int16GetDatum(0));
 
 	scan = systable_beginscan(attrel, AttributeRelidNumIndexId, true,
-							  SnapshotNow, 2, key);
+							  NULL, 2, key);
 
 	/* Delete all the matching tuples */
 	while ((atttup = systable_getnext(scan)) != NULL)
@@ -1624,7 +1622,7 @@ RemoveAttrDefault(Oid relid, AttrNumber attnum,
 				Int16GetDatum(attnum));
 
 	scan = systable_beginscan(attrdef_rel, AttrDefaultIndexId, true,
-							  SnapshotNow, 2, scankeys);
+							  NULL, 2, scankeys);
 
 	/* There should be at most one matching tuple, but we loop anyway */
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
@@ -1678,7 +1676,7 @@ RemoveAttrDefaultById(Oid attrdefId)
 				ObjectIdGetDatum(attrdefId));
 
 	scan = systable_beginscan(attrdef_rel, AttrDefaultOidIndexId, true,
-							  SnapshotNow, 1, scankeys);
+							  NULL, 1, scankeys);
 
 	tuple = systable_getnext(scan);
 	if (!HeapTupleIsValid(tuple))
@@ -2375,7 +2373,7 @@ MergeWithExistingConstraint(Relation rel, char *ccname, Node *expr,
 				ObjectIdGetDatum(RelationGetNamespace(rel)));
 
 	conscan = systable_beginscan(conDesc, ConstraintNameNspIndexId, true,
-								 SnapshotNow, 2, skey);
+								 NULL, 2, skey);
 
 	while (HeapTupleIsValid(tup = systable_getnext(conscan)))
 	{
@@ -2641,7 +2639,7 @@ RemoveStatistics(Oid relid, AttrNumber attnum)
 	}
 
 	scan = systable_beginscan(pgstatistic, StatisticRelidAttnumInhIndexId, true,
-							  SnapshotNow, nkeys, key);
+							  NULL, nkeys, key);
 
 	/* we must loop even when attnum != 0, in case of inherited stats */
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
@@ -2886,7 +2884,7 @@ heap_truncate_find_FKs(List *relationIds)
 	fkeyRel = heap_open(ConstraintRelationId, AccessShareLock);
 
 	fkeyScan = systable_beginscan(fkeyRel, InvalidOid, false,
-								  SnapshotNow, 0, NULL);
+								  NULL, 0, NULL);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(fkeyScan)))
 	{

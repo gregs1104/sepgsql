@@ -38,6 +38,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
@@ -257,6 +258,8 @@ DefineQueryRewrite(char *rulename,
 
 	/*
 	 * Verify relation is of a type that rules can sensibly be applied to.
+	 * Internal callers can target materialized views, but transformRuleStmt()
+	 * blocks them for users.  Don't mention them in the error message.
 	 */
 	if (event_relation->rd_rel->relkind != RELKIND_RELATION &&
 		event_relation->rd_rel->relkind != RELKIND_MATVIEW &&
@@ -418,14 +421,17 @@ DefineQueryRewrite(char *rulename,
 			event_relation->rd_rel->relkind != RELKIND_MATVIEW)
 		{
 			HeapScanDesc scanDesc;
+			Snapshot	snapshot;
 
-			scanDesc = heap_beginscan(event_relation, SnapshotNow, 0, NULL);
+			snapshot = RegisterSnapshot(GetLatestSnapshot());
+			scanDesc = heap_beginscan(event_relation, snapshot, 0, NULL);
 			if (heap_getnext(scanDesc, ForwardScanDirection) != NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("could not convert table \"%s\" to a view because it is not empty",
 								RelationGetRelationName(event_relation))));
 			heap_endscan(scanDesc);
+			UnregisterSnapshot(snapshot);
 
 			if (event_relation->rd_rel->relhastriggers)
 				ereport(ERROR,
@@ -575,8 +581,8 @@ DefineQueryRewrite(char *rulename,
 
 		/*
 		 * Fix pg_class entry to look like a normal view's, including setting
-		 * the correct relkind and removal of reltoastrelid/reltoastidxid of
-		 * the toast table we potentially removed above.
+		 * the correct relkind and removal of reltoastrelid of the toast table
+		 * we potentially removed above.
 		 */
 		classTup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(event_relid));
 		if (!HeapTupleIsValid(classTup))
@@ -588,7 +594,6 @@ DefineQueryRewrite(char *rulename,
 		classForm->reltuples = 0;
 		classForm->relallvisible = 0;
 		classForm->reltoastrelid = InvalidOid;
-		classForm->reltoastidxid = InvalidOid;
 		classForm->relhasindex = false;
 		classForm->relkind = RELKIND_VIEW;
 		classForm->relhasoids = false;

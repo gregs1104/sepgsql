@@ -1606,6 +1606,8 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible, bool xlog_switch)
 		{
 			char	   *from;
 			Size		nbytes;
+			Size		nleft;
+			int			written;
 
 			/* Need to seek in the file? */
 			if (openLogOff != startoffset)
@@ -1622,19 +1624,25 @@ XLogWrite(XLogwrtRqst WriteRqst, bool flexible, bool xlog_switch)
 			/* OK to write the page(s) */
 			from = XLogCtl->pages + startidx * (Size) XLOG_BLCKSZ;
 			nbytes = npages * (Size) XLOG_BLCKSZ;
-			errno = 0;
-			if (write(openLogFile, from, nbytes) != nbytes)
+			nleft = nbytes;
+			do
 			{
-				/* if write didn't set errno, assume no disk space */
-				if (errno == 0)
-					errno = ENOSPC;
-				ereport(PANIC,
-						(errcode_for_file_access(),
-						 errmsg("could not write to log file %s "
-								"at offset %u, length %lu: %m",
-								XLogFileNameP(ThisTimeLineID, openLogSegNo),
-								openLogOff, (unsigned long) nbytes)));
-			}
+				errno = 0;
+				written  = write(openLogFile, from, nleft);
+				if (written <= 0)
+				{
+					if (errno == EINTR)
+						continue;
+					ereport(PANIC,
+							(errcode_for_file_access(),
+							 errmsg("could not write to log file %s "
+									"at offset %u, length %lu: %m",
+									XLogFileNameP(ThisTimeLineID, openLogSegNo),
+									openLogOff, (unsigned long) nbytes)));
+				}
+				nleft -= written;
+				from += written;
+			} while (nleft > 0);
 
 			/* Update state for write */
 			openLogOff += nbytes;
@@ -2248,11 +2256,9 @@ XLogFileInit(XLogSegNo logsegno, bool *use_existent, bool use_lock)
 {
 	char		path[MAXPGPATH];
 	char		tmppath[MAXPGPATH];
-	char	   *zbuffer;
 	XLogSegNo	installed_segno;
 	int			max_advance;
 	int			fd;
-	int			nbytes;
 
 	XLogFilePath(path, ThisTimeLineID, logsegno);
 
@@ -2286,16 +2292,6 @@ XLogFileInit(XLogSegNo logsegno, bool *use_existent, bool use_lock)
 
 	unlink(tmppath);
 
-	/*
-	 * Allocate a buffer full of zeros. This is done before opening the file
-	 * so that we don't leak the file descriptor if palloc fails.
-	 *
-	 * Note: palloc zbuffer, instead of just using a local char array, to
-	 * ensure it is reasonably well-aligned; this may save a few cycles
-	 * transferring data to the kernel.
-	 */
-	zbuffer = (char *) palloc0(XLOG_BLCKSZ);
-
 	/* do not use get_sync_bit() here --- want to fsync only at end of fill */
 	fd = BasicOpenFile(tmppath, O_RDWR | O_CREAT | O_EXCL | PG_BINARY,
 					   S_IRUSR | S_IWUSR);
@@ -2304,38 +2300,73 @@ XLogFileInit(XLogSegNo logsegno, bool *use_existent, bool use_lock)
 				(errcode_for_file_access(),
 				 errmsg("could not create file \"%s\": %m", tmppath)));
 
-	/*
-	 * Zero-fill the file.	We have to do this the hard way to ensure that all
-	 * the file space has really been allocated --- on platforms that allow
-	 * "holes" in files, just seeking to the end doesn't allocate intermediate
-	 * space.  This way, we know that we have all the space and (after the
-	 * fsync below) that all the indirect blocks are down on disk.	Therefore,
-	 * fdatasync(2) or O_DSYNC will be sufficient to sync future writes to the
-	 * log file.
-	 */
-	for (nbytes = 0; nbytes < XLogSegSize; nbytes += XLOG_BLCKSZ)
+#ifdef HAVE_POSIX_FALLOCATE
 	{
-		errno = 0;
-		if ((int) write(fd, zbuffer, XLOG_BLCKSZ) != (int) XLOG_BLCKSZ)
-		{
-			int			save_errno = errno;
+		errno = posix_fallocate(fd, 0, XLogSegSize);
 
-			/*
-			 * If we fail to make the file, delete it to release disk space
-			 */
-			unlink(tmppath);
+		if (errno)
+		{
+			int errno_saved = errno;
 
 			close(fd);
-
-			/* if write didn't set errno, assume problem is no disk space */
-			errno = save_errno ? save_errno : ENOSPC;
+			unlink(tmppath);
+			errno = errno_saved;
 
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not write to file \"%s\": %m", tmppath)));
+					 errmsg("could not allocate space for file \"%s\" using posix_fallocate: %m",
+							tmppath)));
 		}
 	}
-	pfree(zbuffer);
+#else /* !HAVE_POSIX_FALLOCATE */
+	{
+		/*
+		 * Allocate a buffer full of zeros. This is done before opening the
+		 * file so that we don't leak the file descriptor if palloc fails.
+		 *
+		 * Note: palloc zbuffer, instead of just using a local char array, to
+		 * ensure it is reasonably well-aligned; this may save a few cycles
+		 * transferring data to the kernel.
+		 */
+
+		char	*zbuffer = (char *) palloc0(XLOG_BLCKSZ);
+		int		 nbytes;
+
+		/*
+		 * Zero-fill the file. We have to do this the hard way to ensure that
+		 * all the file space has really been allocated --- on platforms that
+		 * allow "holes" in files, just seeking to the end doesn't allocate
+		 * intermediate space.  This way, we know that we have all the space
+		 * and (after the fsync below) that all the indirect blocks are down on
+		 * disk. Therefore, fdatasync(2) or O_DSYNC will be sufficient to sync
+		 * future writes to the log file.
+		 */
+		for (nbytes = 0; nbytes < XLogSegSize; nbytes += XLOG_BLCKSZ)
+		{
+			errno = 0;
+			if ((int) write(fd, zbuffer, XLOG_BLCKSZ) != (int) XLOG_BLCKSZ)
+			{
+				int			save_errno = errno;
+
+				/*
+				 * If we fail to make the file, delete it to release disk space
+				 */
+				unlink(tmppath);
+
+				close(fd);
+
+				/* if write didn't set errno, assume no disk space */
+				errno = save_errno ? save_errno : ENOSPC;
+
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write to file \"%s\": %m",
+								tmppath)));
+			}
+		}
+		pfree(zbuffer);
+	}
+#endif /* HAVE_POSIX_FALLOCATE */
 
 	if (pg_fsync(fd) != 0)
 	{
@@ -4126,6 +4157,7 @@ BootStrapXLOG(void)
 
 	/* Set important parameter values for use when replaying WAL */
 	ControlFile->MaxConnections = MaxConnections;
+	ControlFile->max_worker_processes = max_worker_processes;
 	ControlFile->max_prepared_xacts = max_prepared_xacts;
 	ControlFile->max_locks_per_xact = max_locks_per_xact;
 	ControlFile->wal_level = wal_level;
@@ -4833,6 +4865,9 @@ CheckRequiredParameterValues(void)
 		RecoveryRequiresIntParameter("max_connections",
 									 MaxConnections,
 									 ControlFile->MaxConnections);
+		RecoveryRequiresIntParameter("max_worker_processes",
+									 max_worker_processes,
+									 ControlFile->max_worker_processes);
 		RecoveryRequiresIntParameter("max_prepared_transactions",
 									 max_prepared_xacts,
 									 ControlFile->max_prepared_xacts);
@@ -7762,6 +7797,7 @@ XLogReportParameters(void)
 {
 	if (wal_level != ControlFile->wal_level ||
 		MaxConnections != ControlFile->MaxConnections ||
+		max_worker_processes != ControlFile->max_worker_processes ||
 		max_prepared_xacts != ControlFile->max_prepared_xacts ||
 		max_locks_per_xact != ControlFile->max_locks_per_xact)
 	{
@@ -7778,6 +7814,7 @@ XLogReportParameters(void)
 			xl_parameter_change xlrec;
 
 			xlrec.MaxConnections = MaxConnections;
+			xlrec.max_worker_processes = max_worker_processes;
 			xlrec.max_prepared_xacts = max_prepared_xacts;
 			xlrec.max_locks_per_xact = max_locks_per_xact;
 			xlrec.wal_level = wal_level;
@@ -7791,6 +7828,7 @@ XLogReportParameters(void)
 		}
 
 		ControlFile->MaxConnections = MaxConnections;
+		ControlFile->max_worker_processes = max_worker_processes;
 		ControlFile->max_prepared_xacts = max_prepared_xacts;
 		ControlFile->max_locks_per_xact = max_locks_per_xact;
 		ControlFile->wal_level = wal_level;
@@ -8176,6 +8214,7 @@ xlog_redo(XLogRecPtr lsn, XLogRecord *record)
 
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 		ControlFile->MaxConnections = xlrec.MaxConnections;
+		ControlFile->max_worker_processes = xlrec.max_worker_processes;
 		ControlFile->max_prepared_xacts = xlrec.max_prepared_xacts;
 		ControlFile->max_locks_per_xact = xlrec.max_locks_per_xact;
 		ControlFile->wal_level = xlrec.wal_level;
