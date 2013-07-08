@@ -2775,7 +2775,7 @@ dumpRowSecurity(Archive *fout, RowSecurityInfo *rsinfo)
 	PQExpBuffer	delqry;
 	const char *cmd;
 
-	if (dataOnly)
+	if (dataOnly || !tbinfo->hasrowsec)
 		return;
 
 	query = createPQExpBuffer();
