@@ -22,6 +22,10 @@ extern void	QueryRewriteExpr(Node *node, List *activeRIRs);
 extern void AcquireRewriteLocks(Query *parsetree, bool forUpdatePushedDown);
 
 extern Node *build_column_default(Relation rel, int attrno);
+extern Query *get_view_query(Relation view);
+extern const char *view_is_auto_updatable(Relation view);
+extern const char *view_query_is_auto_updatable(Query *viewquery,
+										 bool security_barrier);
 extern int	relation_is_updatable(Oid reloid, bool include_triggers);
 
 #endif   /* REWRITEHANDLER_H */
