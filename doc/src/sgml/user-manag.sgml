@@ -442,7 +442,7 @@ DROP ROLE <replaceable>name</replaceable>;
  <sect1 id="row-security">
   <title>Row-security</title>
   <para>
-   <productname>PostgreSQL</productname> v9.3 or later provides
+   <productname>PostgreSQL</productname> v9.4 or later provides
    row-security feature, like several commercial database
    management system. It allows table owner to assign a particular
    condition that performs as a security policy of the table; only
