@@ -134,17 +134,15 @@ BackgroundWorkerShmemInit(void)
 		Assert(found);
 }
 
+/*
+ * Search the postmaster's backend-private list of RegisteredBgWorker objects
+ * for the one that maps to the given slot number.
+ */
 static RegisteredBgWorker *
 FindRegisteredWorkerBySlotNumber(int slotno)
 {
 	slist_iter	siter;
 
-	/*
-	 * Copy contents of worker list into shared memory.  Record the
-	 * shared memory slot assigned to each worker.  This ensures
-	 * a 1-to-1 correspondence betwen the postmaster's private list and
-	 * the array in shared memory.
-	 */
 	slist_foreach(siter, &BackgroundWorkerList)
 	{
 		RegisteredBgWorker *rw;
@@ -158,7 +156,7 @@ FindRegisteredWorkerBySlotNumber(int slotno)
 }
 
 /*
- * Notice changes to shared_memory made by other backends.  This code
+ * Notice changes to shared memory made by other backends.  This code
  * runs in the postmaster, so we must be very careful not to assume that
  * shared memory contents are sane.  Otherwise, a rogue backend could take
  * out the postmaster.
@@ -247,8 +245,6 @@ BackgroundWorkerStateChange(void)
 		rw->rw_worker.bgw_restart_time = slot->worker.bgw_restart_time;
 		rw->rw_worker.bgw_main = slot->worker.bgw_main;
 		rw->rw_worker.bgw_main_arg = slot->worker.bgw_main_arg;
-		rw->rw_worker.bgw_sighup = slot->worker.bgw_sighup;
-		rw->rw_worker.bgw_sigterm = slot->worker.bgw_sigterm;
 
 		/* Initialize postmaster bookkeeping. */
 		rw->rw_backend = NULL;
@@ -259,7 +255,7 @@ BackgroundWorkerStateChange(void)
 
 		/* Log it! */
 		ereport(LOG,
-				(errmsg("registering background worker: %s",
+				(errmsg("registering background worker \"%s\"",
 					rw->rw_worker.bgw_name)));
 
 		slist_push_head(&BackgroundWorkerList, &rw->rw_lnode);
@@ -269,24 +265,29 @@ BackgroundWorkerStateChange(void)
 /*
  * Forget about a background worker that's no longer needed.
  *
- * At present, this only happens when a background worker marked
- * BGW_NEVER_RESTART exits.  This function should only be invoked in
- * the postmaster.
+ * The worker must be identified by passing an slist_mutable_iter that
+ * points to it.  This convention allows deletion of workers during
+ * searches of the worker list, and saves having to search the list again.
+ *
+ * This function must be invoked only in the postmaster.
  */
 void
-ForgetBackgroundWorker(RegisteredBgWorker *rw)
+ForgetBackgroundWorker(slist_mutable_iter *cur)
 {
+	RegisteredBgWorker *rw;
 	BackgroundWorkerSlot *slot;
+
+	rw = slist_container(RegisteredBgWorker, rw_lnode, cur->cur);
 
 	Assert(rw->rw_shmem_slot < max_worker_processes);
 	slot = &BackgroundWorkerData->slot[rw->rw_shmem_slot];
 	slot->in_use = false;
 
 	ereport(LOG,
-			(errmsg("unregistering background worker: %s",
+			(errmsg("unregistering background worker \"%s\"",
 				rw->rw_worker.bgw_name)));
 
-	slist_delete(&BackgroundWorkerList, &rw->rw_lnode);
+	slist_delete_current(cur);
 	free(rw);
 }
 
@@ -367,7 +368,7 @@ RegisterBackgroundWorker(BackgroundWorker *worker)
 
 	if (!IsUnderPostmaster)
 		ereport(LOG,
-			(errmsg("registering background worker: %s", worker->bgw_name)));
+			(errmsg("registering background worker \"%s\"", worker->bgw_name)));
 
 	if (!process_shared_preload_libraries_in_progress)
 	{

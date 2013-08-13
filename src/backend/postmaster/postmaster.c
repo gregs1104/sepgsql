@@ -1452,7 +1452,7 @@ DetermineSleepTime(struct timeval * timeout)
 
 			if (rw->rw_worker.bgw_restart_time == BGW_NEVER_RESTART)
 			{
-				ForgetBackgroundWorker(rw);
+				ForgetBackgroundWorker(&siter);
 				continue;
 			}
 
@@ -3328,19 +3328,21 @@ PostmasterStateMachine(void)
 		 * PM_WAIT_BACKENDS state ends when we have no regular backends
 		 * (including autovac workers), no bgworkers (including unconnected
 		 * ones), and no walwriter, autovac launcher or bgwriter.  If we are
-		 * doing crash recovery then we expect the checkpointer to exit as
-		 * well, otherwise not. The archiver, stats, and syslogger processes
-		 * are disregarded since they are not connected to shared memory; we
-		 * also disregard dead_end children here. Walsenders are also
-		 * disregarded, they will be terminated later after writing the
-		 * checkpoint record, like the archiver process.
+		 * doing crash recovery or an immediate shutdown then we expect
+		 * the checkpointer to exit as well, otherwise not. The archiver,
+		 * stats, and syslogger processes are disregarded since
+		 * they are not connected to shared memory; we also disregard
+		 * dead_end children here. Walsenders are also disregarded,
+		 * they will be terminated later after writing the checkpoint record,
+		 * like the archiver process.
 		 */
 		if (CountChildren(BACKEND_TYPE_NORMAL | BACKEND_TYPE_WORKER) == 0 &&
 			CountUnconnectedWorkers() == 0 &&
 			StartupPID == 0 &&
 			WalReceiverPID == 0 &&
 			BgWriterPID == 0 &&
-			(CheckpointerPID == 0 || !FatalError) &&
+			(CheckpointerPID == 0 ||
+			 (!FatalError && Shutdown < ImmediateShutdown)) &&
 			WalWriterPID == 0 &&
 			AutoVacPID == 0)
 		{
@@ -5222,7 +5224,7 @@ BackgroundWorkerInitializeConnection(char *dbname, char *username)
 	/* it had better not gotten out of "init" mode yet */
 	if (!IsInitProcessingMode())
 		ereport(ERROR,
-				(errmsg("invalid processing mode in bgworker")));
+				(errmsg("invalid processing mode in background worker")));
 	SetProcessingMode(NormalProcessing);
 }
 
@@ -5357,17 +5359,8 @@ do_start_bgworker(void)
 		pqsignal(SIGUSR1, bgworker_sigusr1_handler);
 		pqsignal(SIGFPE, SIG_IGN);
 	}
-
-	/* SIGTERM and SIGHUP are configurable */
-	if (worker->bgw_sigterm)
-		pqsignal(SIGTERM, worker->bgw_sigterm);
-	else
-		pqsignal(SIGTERM, bgworker_die);
-
-	if (worker->bgw_sighup)
-		pqsignal(SIGHUP, worker->bgw_sighup);
-	else
-		pqsignal(SIGHUP, SIG_IGN);
+	pqsignal(SIGTERM, bgworker_die);
+	pqsignal(SIGHUP, SIG_IGN);
 
 	pqsignal(SIGQUIT, bgworker_quickdie);
 	InitializeTimeouts();		/* establishes SIGALRM handler */
@@ -5650,7 +5643,7 @@ StartOneBackgroundWorker(void)
 		{
 			if (rw->rw_worker.bgw_restart_time == BGW_NEVER_RESTART)
 			{
-				ForgetBackgroundWorker(rw);
+				ForgetBackgroundWorker(&iter);
 				continue;
 			}
 
