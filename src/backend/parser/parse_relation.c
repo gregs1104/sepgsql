@@ -2058,25 +2058,6 @@ expandRelAttrs(ParseState *pstate, RangeTblEntry *rte,
 }
 
 /*
- * getrelid
- *
- * Get OID of the relation corresponding to the given range index.
- * Note that InvalidOid will be returned if the RTE is for neither
- * relation nor sub-query originated from a relation
- */
-Oid
-getrelid(Index rangeindex, List *rangetable)
-{
-	RangeTblEntry  *rte = rt_fetch(rangeindex, rangetable);
-
-	if (rte->rtekind == RTE_RELATION)
-		return rte->relid;
-	if (rte->rtekind == RTE_SUBQUERY)
-		return rte->rowsec_relid;
-	return InvalidOid;
-}
-
-/*
  * get_rte_attribute_name
  *		Get an attribute name from a RangeTblEntry
  *

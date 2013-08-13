@@ -37,7 +37,8 @@
 
 
 static List *expand_targetlist(List *tlist, int command_type,
-				Index result_relation, List *range_table);
+							   Index result_relation, Index source_relation,
+							   List *range_table);
 
 /*
  * lookup_varattno
@@ -91,6 +92,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 {
 	Query	   *parse = root->parse;
 	int			result_relation = parse->resultRelation;
+	int			source_relation = parse->sourceRelation;
 	List	   *range_table = parse->rtable;
 	CmdType		command_type = parse->commandType;
 	ListCell   *lc;
@@ -114,11 +116,10 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 	 */
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE)
 	{
-		Index	source_relation = (parse->sourceRelation > 0 ?
-								   parse->sourceRelation :
-								   result_relation);
 		tlist = expand_targetlist(tlist, command_type,
-								  source_relation, range_table);
+								  result_relation,
+								  source_relation,
+								  range_table);
 	}
 
 	/*
@@ -177,7 +178,7 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
 			/* Not a table, so we need the whole row as a junk var */
 			var = makeWholeRowVar(rt_fetch(rc->rti, range_table),
 								  rc->rti,
-								  lookup_varattno(0, rc->rti, range_table),
+								  0,
 								  false);
 			snprintf(resname, sizeof(resname), "wholerow%u", rc->rowmarkId);
 			tle = makeTargetEntry((Expr *) var,
@@ -242,7 +243,8 @@ preprocess_targetlist(PlannerInfo *root, List *tlist)
  */
 static List *
 expand_targetlist(List *tlist, int command_type,
-				  Index result_relation, List *range_table)
+				  Index result_relation, Index source_relation,
+				  List *range_table)
 {
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
@@ -264,6 +266,9 @@ expand_targetlist(List *tlist, int command_type,
 	rel = heap_open(getrelid(result_relation, range_table), NoLock);
 
 	numattrs = RelationGetNumberOfAttributes(rel);
+
+	if (source_relation == 0)
+		source_relation = result_relation;
 
 	for (attrno = 1; attrno <= numattrs; attrno++)
 	{
@@ -345,9 +350,9 @@ expand_targetlist(List *tlist, int command_type,
 				case CMD_UPDATE:
 					if (!att_tup->attisdropped)
 					{
-						new_expr = (Node *) makeVar(result_relation,
+						new_expr = (Node *) makeVar(source_relation,
 													lookup_varattno(attrno,
-														result_relation,
+														source_relation,
 														range_table),
 													atttype,
 													atttypmod,

@@ -1614,7 +1614,7 @@ adjust_appendrel_attrs(PlannerInfo *root, Node *node, AppendRelInfo *appinfo)
 		 * security subquery shall be handled in a special way, because
 		 * of no system columns on subquery.
 		 * Var references to system column or whole-row reference need
-		 * to be adjusted to reference artificial columns on behalf of
+		 * to be adjusted to reference pseudo columns on behalf of
 		 * the underlying these columns, however, RETURNGIN clause is
 		 * an exception because its Var nodes are evaluated towards
 		 * the "raw" target relation, not a fetched tuple.
@@ -1682,7 +1682,7 @@ fixup_var_on_rowsec_subquery(RangeTblEntry *rte, Var *var)
 		else
 			Assert(IsA(subtle->expr, Const));
 	}
-	elog(ERROR, "could not find artificial column of %d, relid %u",
+	elog(ERROR, "could not find pseudo column of %d, relid %u",
 		 var->varattno, var->varno);
 	return NULL;
 }

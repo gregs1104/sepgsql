@@ -35,14 +35,14 @@
 row_security_policy_hook_type	row_security_policy_hook = NULL;
 
 /*
- * make_artificial_column
+ * make_pseudo_column
  *
  * It makes a target-entry node that references underlying column.
  * Its tle->expr is usualy Var node, but may be Const for dummy NULL
  * if the supplied attribute was already dropped.
  */
 static TargetEntry *
-make_artificial_column(RangeTblEntry *subrte, AttrNumber attnum)
+make_pseudo_column(RangeTblEntry *subrte, AttrNumber attnum)
 {
 	Expr   *expr;
 	char   *resname;
@@ -97,7 +97,7 @@ make_artificial_column(RangeTblEntry *subrte, AttrNumber attnum)
 }
 
 /*
- * lookup_artificial_column
+ * lookup_pseudo_column
  *
  * It looks-up resource number of the target-entry relevant to the given
  * Var-node that references the row-security subquery. If required column
@@ -105,8 +105,8 @@ make_artificial_column(RangeTblEntry *subrte, AttrNumber attnum)
  * and returns its resource number.
  */
 static AttrNumber
-lookup_artificial_column(PlannerInfo *root,
-						 RangeTblEntry *rte, AttrNumber varattno)
+lookup_pseudo_column(PlannerInfo *root,
+					 RangeTblEntry *rte, AttrNumber varattno)
 {
 	Query		   *subqry;
 	RangeTblEntry  *subrte;
@@ -140,7 +140,7 @@ lookup_artificial_column(PlannerInfo *root,
 	 * so let's create a new artifical column on demand.
 	 */
 	subrte = rt_fetch((Index) 1, subqry->rtable);
-	subtle = make_artificial_column(subrte, varattno);
+	subtle = make_pseudo_column(subrte, varattno);
 	subtle->resno = list_length(subqry->targetList) + 1;
 
 	subqry->targetList = lappend(subqry->targetList, subtle);
@@ -153,7 +153,7 @@ lookup_artificial_column(PlannerInfo *root,
  * fixup_varnode_walker
  *
  * It recursively fixes up references to the relation to be replaced by
- * row-security sub-query, and adds artificial columns relevant to the
+ * row-security sub-query, and adds pseudo columns relevant to the
  * underlying system columns or whole row-reference on demand.
  */
 typedef struct {
@@ -177,50 +177,43 @@ fixup_varnode_walker(Node *node, fixup_varnode_context *context)
 
 		/*
 		 * Ignore it, if Var node does not reference the Query currently
-		 * we focues on.
+		 * we focus on.
 		 */
 		if (var->varlevelsup != context->varlevelsup)
 			return false;
 
-		/*
-		 * Var nodes that reference the relation being replaced by row-
-		 * security sub-query has to be adjusted; to reference the sub-
-		 * query, instead of the original relation.
-		 */
-		if (context->vartrans[var->varno] != 0)
+		if (context->vartrans[var->varno] > 0)
 		{
-			rte = rt_fetch(context->vartrans[var->varno], rtable);
-			if (rte->rtekind == RTE_SUBQUERY &&
-				rte->subquery->querySource == QSRC_ROW_SECURITY)
-			{
-				var->varno = var->varnoold = context->vartrans[var->varno];
-				var->varattno = lookup_artificial_column(context->root,
-														 rte, var->varattno);
-			}
+			Index	rtindex_trans = context->vartrans[var->varno];
+
+			rte = rt_fetch(rtindex_trans, rtable);
+			Assert(rte->rtekind == RTE_SUBQUERY &&
+				   rte->subquery->querySource == QSRC_ROW_SECURITY);
+
+			var->varno = var->varnoold = rtindex_trans;
+			var->varattno = lookup_pseudo_column(context->root, rte,
+													 var->varattno);
 		}
 		else
 		{
 			rte = rt_fetch(var->varno, rtable);
-			if (!rte->inh)
-				return false;
-
-			foreach (cell, context->root->append_rel_list)
+			if (rte->rtekind == RTE_RELATION && rte->inh)
 			{
-				AppendRelInfo  *appinfo = lfirst(cell);
-				RangeTblEntry  *child_rte;
+				foreach (cell, context->root->append_rel_list)
+				{
+					AppendRelInfo  *appinfo = lfirst(cell);
+					RangeTblEntry  *child_rte;
 
-				if (appinfo->parent_relid != var->varno)
-					continue;
+					if (appinfo->parent_relid != var->varno)
+						continue;
 
-				if (var->varattno > InvalidAttrNumber)
-					continue;
-
-				child_rte = rt_fetch(appinfo->child_relid, rtable);
-				if (child_rte->rtekind == RTE_SUBQUERY &&
-					child_rte->subquery->querySource == QSRC_ROW_SECURITY)
-					(void) lookup_artificial_column(context->root,
+					child_rte = rt_fetch(appinfo->child_relid, rtable);
+					if (child_rte->rtekind == RTE_SUBQUERY &&
+						child_rte->subquery->querySource == QSRC_ROW_SECURITY)
+						(void) lookup_pseudo_column(context->root,
 													child_rte,
 													var->varattno);
+				}
 			}
 		}
 	}
@@ -281,13 +274,12 @@ check_infinite_recursion(PlannerInfo *root, Oid relid)
  *
  * It extends a range-table entry of row-security sub-query with supplied
  * security policy, and append it on the parse->rtable.
- * This sub-query contains artificial columns that reference underlying
+ * This sub-query contains pseudo columns that reference underlying
  * regular columns (at least, references to system column or whole of
  * table reference shall be added on demand), and simple scan on the
  * target relation.
  * Any Var nodes that referenced the relation pointed by rtindex shall
  * be adjusted to reference this sub-query instead. walker
- *
  */
 static Index
 expand_rtentry_with_policy(PlannerInfo *root, Index rtindex,
@@ -343,7 +335,7 @@ expand_rtentry_with_policy(PlannerInfo *root, Index rtindex,
 
 	for (attnum = 1; attnum <= nattrs; attnum++)
 	{
-		subtle = make_artificial_column(subrte, attnum);
+		subtle = make_pseudo_column(subrte, attnum);
 		subtle->resno = list_length(targetList) + 1;
 		Assert(subtle->resno == attnum);
 
@@ -363,23 +355,22 @@ expand_rtentry_with_policy(PlannerInfo *root, Index rtindex,
 
 	parse->rtable = lappend(parse->rtable, newrte);
 
-	/* Push-down rowmark, if needed */
+	/*
+	 * Fix up PlanRowMark if needed, then add references to 'tableoid' and
+	 * 'ctid' that shall be added to handle row-level locking.
+	 * Also see preprocess_targetlist() that adds some junk attributes.
+	 */
 	rowmark = get_plan_rowmark(root->rowMarks, rtindex);
 	if (rowmark)
 	{
-		/*
-		 * In case of inherited children, rti/prti of rowmark shall be
-		 * fixed up later, on inheritance_planner().
-		 */
 		if (rowmark->rti == rowmark->prti)
 			rowmark->rti = rowmark->prti = list_length(parse->rtable);
 		else
 			rowmark->rti = list_length(parse->rtable);
 
-		lookup_artificial_column(root, newrte, SelfItemPointerAttributeNumber);
-		lookup_artificial_column(root, newrte, TableOidAttributeNumber);
+		lookup_pseudo_column(root, newrte, SelfItemPointerAttributeNumber);
+		lookup_pseudo_column(root, newrte, TableOidAttributeNumber);
 	}
-
 	return list_length(parse->rtable);
 }
 
@@ -531,14 +522,13 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 {
 	Query		   *parse = root->parse;
 	RangeTblEntry  *rte = rt_fetch(rtindex, parse->rtable);
+	Relation		rel;
+	Expr		   *qual;
+	int				flags;
 	bool			result = false;
 
 	if (!rte->inh)
 	{
-		Relation	rel;
-		Expr	   *qual;
-		int			flags = 0;
-
 		rel = heap_open(rte->relid, NoLock);
 		qual = pull_row_security_policy(cmd, rel, &flags);
 		if (qual)
@@ -553,6 +543,20 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 	}
 	else
 	{
+		/*
+		 * In case when relation has inherited children, we try to apply
+		 * row-level security policy of them if configured.
+		 * In addition to regular replacement with a sub-query, we need
+		 * to adjust rtindex of AppendRelInfo and varno of translated_vars.
+		 * It makes sub-queries perform like regular relations being
+		 * inherited from a particular parent relation. So, a table scan
+		 * may have underlying a relation scan and two sub-query scans for
+		 * instance. If it is result relation of UPDATE or DELETE command,
+		 * rtindex to the original relation (regular relation) has to be
+		 * kept because sub-query cannot perform as an updatable relation.
+		 * So, we save it on child_result of AppendRelInfo; that shall be
+		 * used to track relations to be modified at inheritance_planner().
+		 */
 		ListCell   *lc1, *lc2;
 
 		foreach (lc1, root->append_rel_list)
@@ -565,12 +569,18 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 			if (apply_row_security_relation(root, vartrans, cmd,
 											apinfo->child_relid))
 			{
+				/*
+				 * Save the rtindex of actual relation to be modified,
+				 * if parent relation is result relation of this query.
+				 */
 				if (parse->resultRelation == rtindex)
 					apinfo->child_result = apinfo->child_relid;
+
 				apinfo->child_relid = vartrans[apinfo->child_relid];
+				/* Adjust varno to reference pseudo columns */
 				foreach (lc2, apinfo->translated_vars)
 				{
-					Var    *var = lfirst(lc2);
+					Var	   *var = lfirst(lc2);
 
 					if (var)
 						var->varno = apinfo->child_relid;
@@ -585,7 +595,8 @@ apply_row_security_relation(PlannerInfo *root, Index *vartrans,
 /*
  * apply_row_security_recursive
  *
- * walker on join-tree
+ * It walks on the given join-tree to replace relations with row-level
+ * security policy by a simple sub-query.
  */
 static bool
 apply_row_security_recursive(PlannerInfo *root, Index *vartrans, Node *jtnode)
@@ -719,7 +730,7 @@ apply_row_security_policy(PlannerInfo *root)
 		/*
 		 * Var-nodes that referenced RangeTblEntry to be replaced by
 		 * row-security sub-query have to be adjusted for appropriate
-		 * reference to the underlying artificial column of the relation.
+		 * reference to the underlying pseudo column of the relation.
 		 */
 		context.root = root;
 		context.varlevelsup = 0;
