@@ -2158,7 +2158,7 @@ getObjectDescription(const ObjectAddress *object)
 							BTEqualStrategyNumber, F_OIDEQ,
 							ObjectIdGetDatum(object->objectId));
 				sscan = systable_beginscan(rsec_rel, RowSecurityOidIndexId,
-										   true, SnapshotNow, 1, &skey);
+										   true, NULL, 1, &skey);
 				tuple = systable_getnext(sscan);
 				if (!HeapTupleIsValid(tuple))
 					elog(ERROR, "could not find tuple for row-security %u",

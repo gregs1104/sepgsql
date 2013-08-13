@@ -52,7 +52,7 @@ RelationBuildRowSecurity(Relation relation)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(RelationGetRelid(relation)));
 	sscan = systable_beginscan(catalog, RowSecurityRelidIndexId, true,
-							   SnapshotNow, 1, &skey);
+							   NULL, 1, &skey);
 	PG_TRY();
 	{
 		while (HeapTupleIsValid(tuple = systable_getnext(sscan)))
@@ -165,7 +165,7 @@ InsertOrUpdatePolicyRow(Relation relation, char rseccmd, Node *clause)
 				BTEqualStrategyNumber, F_CHAREQ,
 				CharGetDatum(rseccmd));
 	sscan = systable_beginscan(catalog, RowSecurityRelidIndexId, true,
-							   SnapshotNow, 2, skeys);
+							   NULL, 2, skeys);
 	oldtup = systable_getnext(sscan);
 	if (HeapTupleIsValid(oldtup))
 	{
@@ -263,7 +263,7 @@ RemoveRowSecurityById(Oid rowsecId)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(rowsecId));
 	sscan = systable_beginscan(catalog, RowSecurityOidIndexId, true,
-							   SnapshotNow, 1, &skey);
+							   NULL, 1, &skey);
 	tuple = systable_getnext(sscan);
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "could not find tuple for row-security %u", rowsecId);
