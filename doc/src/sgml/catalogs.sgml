@@ -234,7 +234,7 @@
      </row>
 
      <row>
-      <entry><link linkend="catalog-pg-rowlevelsec"><structname>pg_rowlevelsec</structname></link></entry>
+      <entry><link linkend="catalog-pg-rowsecurity"><structname>pg_rowsecuritylevelsec</structname></link></entry>
       <entry>row-level security policy of relation</entry>
      </row>
 
@@ -5128,7 +5128,7 @@
  </sect1>
 
  <sect1 id="catalog-pg-rowsecurity">
-  <title><structname>pg_rowlevelsec</structname></title>
+  <title><structname>pg_rowsecurity</structname></title>
 
   <indexterm zone="catalog-pg-rowsecurity">
    <primary>pg_rowsecurity</primary>
@@ -5165,15 +5165,15 @@
       <entry><structfield>rsecqual</structfield></entry>
       <entry><type>pg_node_tree</type></entry>
       <entry></entry>
-      <entry>An expression tree to be performed as rowl-security policy</entry>
+      <entry>An expression tree to be performed as row-security policy</entry>
      </row>
     </tbody>
    </tgroup>
   </table>
   <note>
    <para>
-    <literal>pg_class.relhasrowlevelsec</literal>
-    must be true if a table has row-level security policy in this catalog.
+    <literal>pg_class.relhasrowsecurity</literal>
+    must be true if a table has row-security policy in this catalog.
    </para>
   </note>
  </sect1>
