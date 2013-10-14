@@ -867,6 +867,21 @@ typedef struct ForeignPath
 } ForeignPath;
 
 /*
+ * CustomPath represents a scan using custom logic
+ *
+ * custom_name is identifier of custom scan provider, and custom_flags is
+ * a set of CUSTOM_FLAGS_* bits to control its behavior. custom_private
+ * stores private data to be managed by extension. 
+ */
+typedef struct CustomPath
+{
+	Path		path;
+	const char *custom_name;		/* name of custom scan provider */
+	int			custom_flags;		/* CUSTOM_FLAGS_* in nodeCustom.h */
+	List	   *custom_private;		/* can be used for private data */
+} CustomPath;
+
+/*
  * AppendPath represents an Append plan, ie, successive execution of
  * several member plans.
  *

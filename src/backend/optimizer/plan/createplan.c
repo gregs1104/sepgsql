@@ -21,6 +21,7 @@
 
 #include "access/skey.h"
 #include "catalog/pg_class.h"
+#include "executor/nodeCustom.h"
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -77,6 +78,9 @@ static WorkTableScan *create_worktablescan_plan(PlannerInfo *root, Path *best_pa
 						  List *tlist, List *scan_clauses);
 static ForeignScan *create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 						List *tlist, List *scan_clauses);
+static CustomScan *create_customscan_plan(PlannerInfo *root,
+										  CustomPath *best_path,
+										  List *tlist, List *scan_clauses);
 static NestLoop *create_nestloop_plan(PlannerInfo *root, NestPath *best_path,
 					 Plan *outer_plan, Plan *inner_plan);
 static MergeJoin *create_mergejoin_plan(PlannerInfo *root, MergePath *best_path,
@@ -409,6 +413,13 @@ create_scan_plan(PlannerInfo *root, Path *best_path)
 													(ForeignPath *) best_path,
 													tlist,
 													scan_clauses);
+			break;
+
+		case T_CustomScan:
+			plan = (Plan *) create_customscan_plan(root,
+												   (CustomPath *) best_path,
+												   tlist,
+												   scan_clauses);
 			break;
 
 		default:
@@ -2016,6 +2027,189 @@ create_foreignscan_plan(PlannerInfo *root, ForeignPath *best_path,
 	return scan_plan;
 }
 
+/*
+ * create_customscan_plan
+ *   Returns a custom-scan plan for the base relation scanned by 'best_path'
+ *   with restriction clauses 'scan_clauses' and targetlist 'tlist'.
+ */
+static CustomScan *
+create_customscan_plan(PlannerInfo *root,
+					   CustomPath *best_path,
+					   List *tlist,
+					   List *scan_clauses)
+{
+	CustomProvider *provider = get_custom_provider(best_path->custom_name);
+	CustomScan	   *scan_plan = makeNode(CustomScan);
+	Index			scan_relid = best_path->path.parent->relid;
+
+	scan_plan->custom_name = pstrdup(best_path->custom_name);
+	scan_plan->custom_flags = best_path->custom_flags;
+	scan_plan->custom_private = NIL;
+	scan_plan->custom_exprs = NULL;
+
+	if (scan_relid > 0)
+	{
+		RangeTblEntry  *rte = planner_rt_fetch(scan_relid, root);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			Assert(best_path->path.parent->reloptkind == RELOPT_BASEREL);
+		}
+		else if (rte->rtekind == RTE_JOIN)
+		{
+			Assert(best_path->path.parent->reloptkind == RELOPT_JOINREL);
+		}
+		else if (rte->rtekind == RTE_SUBQUERY)
+		{
+			if (best_path->path.param_info)
+			{
+				List   *subplan_params
+					= best_path->path.parent->subplan_params;
+				process_subquery_nestloop_params(root, subplan_params);
+			}
+			scan_plan->subqry_plan = best_path->path.parent->subplan;
+		}
+		else if (rte->rtekind == RTE_FUNCTION)
+		{
+			Node   *func_expr = rte->funcexpr;
+
+			if (best_path->path.param_info)
+				func_expr = replace_nestloop_params(root, func_expr);
+
+			scan_plan->funcexpr = func_expr;
+			scan_plan->funcordinality = rte->funcordinality;
+			scan_plan->funccolnames = rte->eref->colnames;
+			scan_plan->funccoltypes = rte->funccoltypes;
+			scan_plan->funccoltypmods = rte->funccoltypmods;
+			scan_plan->funccolcollations = rte->funccolcollations;
+		}
+		else if (rte->rtekind == RTE_VALUES)
+		{
+			scan_plan->values_lists = rte->values_lists;
+		}
+		else if (rte->rtekind == RTE_CTE)
+		{
+			if (!rte->self_reference)
+			{
+				/*
+				 * Logic come from create_ctescan_plan because this custom-
+				 * scan shall perform equivalent to CteScan.
+				 */
+				PlannerInfo	   *cteroot = root;
+				Index			levelsup = rte->ctelevelsup;
+				SubPlan		   *ctesplan = NULL;
+				ListCell	   *lc;
+				int				ndx;
+				int				plan_id;
+
+				/*
+				 * Find the referenced CTE, and locate the SubPlan previously
+				 * made for it.
+				 */
+				while (levelsup-- > 0)
+				{
+					cteroot = cteroot->parent_root;
+					if (!cteroot)	/* shouldn't happen */
+						elog(ERROR, "bad levelsup for CTE \"%s\"",
+							 rte->ctename);
+				}
+
+				ndx = 0;
+				foreach(lc, cteroot->parse->cteList)
+				{
+					CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+					if (strcmp(cte->ctename, rte->ctename) == 0)
+						break;
+					ndx++;
+				}
+				if (lc == NULL)		/* shouldn't happen */
+					elog(ERROR, "could not find CTE \"%s\"", rte->ctename);
+				if (ndx >= list_length(cteroot->cte_plan_ids))
+					elog(ERROR, "could not find plan for CTE \"%s\"",
+						 rte->ctename);
+				plan_id = list_nth_int(cteroot->cte_plan_ids, ndx);
+				Assert(plan_id > 0);
+
+				foreach(lc, cteroot->init_plans)
+				{
+					ctesplan = (SubPlan *) lfirst(lc);
+					if (ctesplan->plan_id == plan_id)
+						break;
+				}
+				if (lc == NULL)		/* shouldn't happen */
+					elog(ERROR, "could not find plan for CTE \"%s\"",
+						 rte->ctename);
+
+				scan_plan->ctePlanId = plan_id;
+				scan_plan->cteParam = linitial_int(ctesplan->setParam);
+			}
+			else
+			{
+				/*
+				 * Logic come from create_worktablescan_plan because this
+				 * custom-scan shall perform equivalent to WorkTableScan.
+				 */
+				PlannerInfo	   *cteroot = root;
+				Index			levelsup = rte->ctelevelsup;
+
+				if (levelsup == 0)		/* shouldn't happen */
+					elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
+				levelsup--;
+				while (levelsup-- > 0)
+				{
+					cteroot = cteroot->parent_root;
+					if (!cteroot)		/* shouldn't happen */
+						elog(ERROR, "bad levelsup for CTE \"%s\"",
+							 rte->ctename);
+				}
+				if (cteroot->wt_param_id < 0)	/* shouldn't happen */
+					elog(ERROR, "could not find param ID for CTE \"%s\"",
+						 rte->ctename);
+				scan_plan->wtParam = cteroot->wt_param_id;
+			}
+		}
+		else
+		{
+			elog(ERROR, "unexpected rtekind on CustomPath(%s): %d",
+				 scan_plan->custom_name, (int)rte->rtekind);
+		}
+	}
+	/* Sort clauses into best execution order */
+	scan_clauses = order_qual_clauses(root, scan_clauses);
+
+	scan_plan->scan.plan.targetlist = tlist;
+	scan_plan->scan.plan.qual = scan_clauses;
+	scan_plan->scan.plan.lefttree = NULL;
+	scan_plan->scan.plan.righttree = NULL;
+	scan_plan->scan.scanrelid = scan_relid;
+
+	/*
+	 * Let custom scan provider perform to set up this custom-scan plan
+	 * according to the given path information. 
+	 */
+	provider->SetupCustomScan(root, best_path, scan_plan);
+
+	/* Copy cost data from Path to Plan; no need to make callback do this */
+	copy_path_costsize(&scan_plan->scan.plan, &best_path->path);
+
+    /*
+     * Replace any outer-relation variables with nestloop params in the qual
+     * and fdw_exprs expressions.  We do this last so that the FDW doesn't
+     * have to be involved.  (Note that parts of fdw_exprs could have come
+     * from join clauses, so doing this beforehand on the scan_clauses
+     * wouldn't work.)
+     */
+	if (best_path->path.param_info)
+	{
+		scan_plan->scan.plan.qual = (List *)
+			replace_nestloop_params(root, (Node *) scan_plan->scan.plan.qual);
+		scan_plan->custom_exprs = (List *)
+			replace_nestloop_params(root, (Node *) scan_plan->custom_exprs);
+	}
+
+	return scan_plan;
+}
 
 /*****************************************************************************
  *

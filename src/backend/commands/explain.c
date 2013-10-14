@@ -19,6 +19,7 @@
 #include "commands/defrem.h"
 #include "commands/prepare.h"
 #include "executor/hashjoin.h"
+#include "executor/nodeCustom.h"
 #include "foreign/fdwapi.h"
 #include "optimizer/clauses.h"
 #include "parser/parsetree.h"
@@ -84,6 +85,7 @@ static void show_hash_info(HashState *hashstate, ExplainState *es);
 static void show_instrumentation_count(const char *qlabel, int which,
 						   PlanState *planstate, ExplainState *es);
 static void show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es);
+static void show_customscan_info(CustomScanState *cstate, ExplainState *es);
 static const char *explain_get_index_name(Oid indexId);
 static void ExplainIndexScanDetails(Oid indexid, ScanDirection indexorderdir,
 						ExplainState *es);
@@ -683,6 +685,11 @@ ExplainPreScanNode(PlanState *planstate, Bitmapset **rels_used)
 			*rels_used = bms_add_member(*rels_used,
 										((Scan *) plan)->scanrelid);
 			break;
+		case T_CustomScan:
+			if (((Scan *) plan)->scanrelid > 0)
+				*rels_used = bms_add_member(*rels_used,
+											((Scan *) plan)->scanrelid);
+			break;
 		case T_ModifyTable:
 			/* cf ExplainModifyTarget */
 			*rels_used = bms_add_member(*rels_used,
@@ -809,6 +816,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	const char *sname;			/* node type name for non-text output */
 	const char *strategy = NULL;
 	const char *operation = NULL;
+	char		namebuf[NAMEDATALEN + 32];
 	int			save_indent = es->indent;
 	bool		haschildren;
 
@@ -896,6 +904,13 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			break;
 		case T_ForeignScan:
 			pname = sname = "Foreign Scan";
+			break;
+		case T_CustomScan:
+			snprintf(namebuf, sizeof(namebuf), "Custom Scan (%s)",
+					 ((CustomScan *) plan)->custom_name);
+			pname = pstrdup(namebuf);
+			sname = "Custom Scan";
+			operation = ((CustomScan *) plan)->custom_name;
 			break;
 		case T_Material:
 			pname = sname = "Materialize";
@@ -1012,6 +1027,10 @@ ExplainNode(PlanState *planstate, List *ancestors,
 		case T_WorkTableScan:
 		case T_ForeignScan:
 			ExplainScanTarget((Scan *) plan, es);
+			break;
+		case T_CustomScan:
+			if (((Scan *) plan)->scanrelid > 0)
+				ExplainScanTarget((Scan *) plan, es);
 			break;
 		case T_IndexScan:
 			{
@@ -1290,6 +1309,17 @@ ExplainNode(PlanState *planstate, List *ancestors,
 				show_instrumentation_count("Rows Removed by Filter", 1,
 										   planstate, es);
 			show_foreignscan_info((ForeignScanState *) planstate, es);
+			break;
+		case T_CustomScan:
+			if (((CustomScan *)plan)->funcexpr != NULL && es->verbose)
+				show_expression(((CustomScan *)plan)->funcexpr,
+								"Function Call", planstate, ancestors,
+								es->verbose, es);
+			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
+			if (plan->qual)
+				show_instrumentation_count("Rows Removed by Filter", 1,
+										   planstate, es);
+			show_customscan_info((CustomScanState *) planstate, es);
 			break;
 		case T_NestLoop:
 			show_upper_qual(((NestLoop *) plan)->join.joinqual,
@@ -1858,6 +1888,19 @@ show_foreignscan_info(ForeignScanState *fsstate, ExplainState *es)
 }
 
 /*
+ * Show extra information for a CustomScan node.
+ */
+static void
+show_customscan_info(CustomScanState *cstate, ExplainState *es)
+{
+	CustomProvider *provider = cstate->custom_provider;
+
+	/* Let custom scan provider emit whatever fields it wants */
+	if (provider->ExplainCustomScan != NULL)
+		provider->ExplainCustomScan(cstate, es);
+}
+
+/*
  * Fetch the name of an index in an EXPLAIN
  *
  * We allow plugins to get control here so that plans involving hypothetical
@@ -2024,6 +2067,43 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			Assert(rte->self_reference);
 			objectname = rte->ctename;
 			objecttag = "CTE Name";
+			break;
+		case T_CustomScan:
+			if (rte->rtekind == RTE_RELATION)
+			{
+				objectname = get_rel_name(rte->relid);
+				if (es->verbose)
+					namespace =
+						get_namespace_name(get_rel_namespace(rte->relid));
+				objecttag = "Relation Name";
+			}
+			else if (rte->rtekind == RTE_FUNCTION)
+			{
+				Node	   *funcexpr;
+
+				/*
+				 * If the expression is still a function call, we can get the
+				 * real name of the function.  Otherwise, punt (this can
+				 * happen if the optimizer simplified away the function call,
+				 * for example).
+				 */
+				funcexpr = ((FunctionScan *) plan)->funcexpr;
+				if (funcexpr && IsA(funcexpr, FuncExpr))
+				{
+					Oid			funcid = ((FuncExpr *) funcexpr)->funcid;
+
+					objectname = get_func_name(funcid);
+					if (es->verbose)
+						namespace =
+							get_namespace_name(get_func_namespace(funcid));
+				}
+				objecttag = "Function Name";
+			}
+			else if (rte->rtekind == RTE_CTE)
+			{
+				objectname = rte->ctename;
+				objecttag = "CTE Name";
+			}
 			break;
 		default:
 			break;

@@ -1494,6 +1494,23 @@ typedef struct ForeignScanState
 	void	   *fdw_state;		/* foreign-data wrapper can keep state here */
 } ForeignScanState;
 
+/* ----------------
+ *	 CustomScanState information
+ *
+ *		CustomScan nodes are used to scan various relations using custom
+ *		logic.
+ * ----------------
+ */
+typedef struct CustomScanState
+{
+	ScanState	ss;
+
+	/* use struct pointer to avoid including nodeCustom.h here */
+	struct CustomProvider *custom_provider;
+	int			custom_flags;
+	void	   *custom_state;
+} CustomScanState;
+
 /* ----------------------------------------------------------------
  *				 Join State Information
  * ----------------------------------------------------------------

@@ -21,6 +21,7 @@
 #include "executor/nodeBitmapIndexscan.h"
 #include "executor/nodeBitmapOr.h"
 #include "executor/nodeCtescan.h"
+#include "executor/nodeCustom.h"
 #include "executor/nodeForeignscan.h"
 #include "executor/nodeFunctionscan.h"
 #include "executor/nodeGroup.h"
@@ -195,6 +196,10 @@ ExecReScan(PlanState *node)
 
 		case T_ForeignScanState:
 			ExecReScanForeignScan((ForeignScanState *) node);
+			break;
+
+		case T_CustomScanState:
+			ExecReScanCustomScan((CustomScanState *) node);
 			break;
 
 		case T_NestLoopState:

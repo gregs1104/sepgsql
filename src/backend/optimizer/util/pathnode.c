@@ -1738,6 +1738,46 @@ create_foreignscan_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * create_customscan_path
+ *    Creates a path corresponding to a scan of a relation based on logic
+ *    logic being provided by extensions.
+ *
+ * This function is never called from core PostgreSQL. An usual usage is
+ * invocation from callbacks on add_scan_path_hook. We don't have any
+ * assumption on the custom scan logic, thus, caller is responsible to
+ * set adequate cost estimation here.
+ */
+CustomPath *
+create_customscan_path(PlannerInfo *root,
+					   RelOptInfo *baserel,
+					   double rows,
+					   Cost startup_cost,
+					   Cost total_cost,
+					   List *pathkeys,
+					   Relids required_outer,
+					   const char *custom_name,
+					   uint32 custom_flags,
+					   List *custom_private)
+{
+	CustomPath *pathnode = makeNode(CustomPath);
+
+	pathnode->path.pathtype = T_CustomScan;
+	pathnode->path.parent = baserel;
+	pathnode->path.param_info = get_baserel_parampathinfo(root, baserel,
+														  required_outer);
+	pathnode->path.rows = rows;
+	pathnode->path.startup_cost = startup_cost;
+	pathnode->path.total_cost = total_cost;
+	pathnode->path.pathkeys = pathkeys;
+
+	pathnode->custom_name = pstrdup(custom_name);
+	pathnode->custom_flags = custom_flags;
+	pathnode->custom_private = custom_private;
+
+	return pathnode;
+}
+
+/*
  * calc_nestloop_required_outer
  *	  Compute the required_outer set for a nestloop join path
  *

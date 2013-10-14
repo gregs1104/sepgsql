@@ -29,6 +29,31 @@ typedef RelOptInfo *(*join_search_hook_type) (PlannerInfo *root,
 														  List *initial_rels);
 extern PGDLLIMPORT join_search_hook_type join_search_hook;
 
+/* Hook for plugins to add custom scan path, in addition to default ones */
+typedef void (*add_scan_path_hook_type)(PlannerInfo *root,
+										RelOptInfo *baserel,
+										RangeTblEntry *rte);
+extern PGDLLIMPORT add_scan_path_hook_type add_scan_path_hook;
+
+#define add_custom_scan_paths(root,baserel,rte)				\
+	do {														\
+		if (add_scan_path_hook)										\
+			(*add_scan_path_hook)((root),(baserel),(rte));			\
+	} while(0)
+
+/* Hook for plugins to add custom join path, in addition to default ones */
+typedef void (*add_join_path_hook_type)(PlannerInfo *root,
+										RelOptInfo *joinrel,
+										RelOptInfo *outerrel,
+										RelOptInfo *innerrel,
+										JoinType jointype,
+										SpecialJoinInfo *sjinfo,
+										List *restrictlist,
+										List *mergeclause_list,
+										SemiAntiJoinFactors *semifactors,
+										Relids param_source_rels,
+										Relids extra_lateral_rels);
+extern PGDLLIMPORT add_join_path_hook_type add_join_path_hook;
 
 extern RelOptInfo *make_one_rel(PlannerInfo *root, List *joinlist);
 extern RelOptInfo *standard_join_search(PlannerInfo *root, int levels_needed,

@@ -568,6 +568,33 @@ _outForeignScan(StringInfo str, const ForeignScan *node)
 }
 
 static void
+_outCustomScan(StringInfo str, const CustomScan *node)
+{
+	WRITE_NODE_TYPE("CUSTOMSCAN");
+
+	_outScanInfo(str, (const Scan *) node);
+
+	WRITE_NODE_FIELD(subqry_plan);
+
+	WRITE_NODE_FIELD(funcexpr);
+	WRITE_NODE_FIELD(funccolnames);
+	WRITE_NODE_FIELD(funccoltypes);
+	WRITE_NODE_FIELD(funccoltypmods);
+	WRITE_NODE_FIELD(funccolcollations);
+	WRITE_BOOL_FIELD(funcordinality);
+
+	WRITE_NODE_FIELD(values_lists);
+
+	WRITE_INT_FIELD(ctePlanId);
+	WRITE_INT_FIELD(cteParam);
+
+	WRITE_STRING_FIELD(custom_name);
+	WRITE_INT_FIELD(custom_flags);
+	WRITE_NODE_FIELD(custom_private);
+	WRITE_NODE_FIELD(custom_exprs);
+}
+
+static void
 _outJoin(StringInfo str, const Join *node)
 {
 	WRITE_NODE_TYPE("JOIN");
@@ -2813,6 +2840,9 @@ _outNode(StringInfo str, const void *obj)
 				break;
 			case T_ForeignScan:
 				_outForeignScan(str, obj);
+				break;
+			case T_CustomScan:
+				_outCustomScan(str, obj);
 				break;
 			case T_Join:
 				_outJoin(str, obj);

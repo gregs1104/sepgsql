@@ -21,6 +21,8 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
 
+/* Hook for plugins to add custom join paths */
+add_join_path_hook_type add_join_path_hook = NULL;
 
 #define PATH_PARAM_BY_REL(path, rel)  \
 	((path)->param_info && bms_overlap(PATH_REQ_OUTER(path), (rel)->relids))
@@ -259,6 +261,22 @@ add_paths_to_joinrel(PlannerInfo *root,
 							 restrictlist, jointype,
 							 sjinfo, &semifactors,
 							 param_source_rels, extra_lateral_rels);
+
+	/*
+	 * 5. Also consider paths being provided with custom execution provider.
+	 */
+	if (add_join_path_hook)
+		(*add_join_path_hook)(root,
+							  joinrel,
+							  outerrel,
+							  innerrel,
+							  jointype,
+							  sjinfo,
+							  restrictlist,
+							  mergeclause_list,
+							  &semifactors,
+							  param_source_rels,
+							  extra_lateral_rels);
 }
 
 /*
