@@ -19,6 +19,7 @@
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/vacuum.h"
+#include "executor/nodeCustom.h"
 #include "foreign/fdwapi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -329,6 +330,12 @@ static HeapTuple make_tuple_from_result_row(PGresult *res,
 						   MemoryContext temp_context);
 static void conversion_error_callback(void *arg);
 
+void		_PG_init(void);
+
+/*
+ * Static variables
+ */
+static add_join_path_hook_type	add_join_path_next = NULL;
 
 /*
  * Foreign-data wrapper handler function: return a struct with pointers
@@ -444,7 +451,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 * Identify which baserestrictinfo clauses can be sent to the remote
 	 * server and which can't.
 	 */
-	classifyConditions(root, baserel,
+	classifyConditions(root, baserel, baserel->baserestrictinfo,
 					   &fpinfo->remote_conds, &fpinfo->local_conds);
 
 	/*
@@ -770,7 +777,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 					 &retrieved_attrs);
 	if (remote_conds)
 		appendWhereClause(&sql, root, baserel, remote_conds,
-						  true, &params_list);
+						  true, false, &params_list);
 
 	/*
 	 * Add FOR UPDATE/SHARE if appropriate.  We apply locking during the
@@ -1704,10 +1711,10 @@ estimate_path_cost_size(PlannerInfo *root,
 						 &retrieved_attrs);
 		if (fpinfo->remote_conds)
 			appendWhereClause(&sql, root, baserel, fpinfo->remote_conds,
-							  true, NULL);
+							  true, false, NULL);
 		if (join_conds)
 			appendWhereClause(&sql, root, baserel, join_conds,
-							  (fpinfo->remote_conds == NIL), NULL);
+							  (fpinfo->remote_conds == NIL), false, NULL);
 
 		/* Get the remote estimate */
 		conn = GetConnection(fpinfo->server, fpinfo->user, false);
@@ -2652,4 +2659,419 @@ conversion_error_callback(void *arg)
 		errcontext("column \"%s\" of foreign table \"%s\"",
 				   NameStr(tupdesc->attrs[errpos->cur_attno - 1]->attname),
 				   RelationGetRelationName(errpos->rel));
+}
+
+/*
+ * Remote JOIN support
+ *
+ *
+ *
+ *
+ *
+ *
+ */
+List *
+packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
+{
+	List   *result = NIL;
+
+	result = lappend(result, list_make2_oid(jinfo->fdw_server_oid,
+											jinfo->fdw_user_oid));
+	result = lappend(result, makeString(bms_to_string(jinfo->relids)));
+	result = lappend(result, makeInteger((long) jinfo->jointype));
+	result = lappend(result, jinfo->outer_rel);
+	result = lappend(result, jinfo->inner_rel);
+	result = lappend(result, jinfo->remote_conds);
+	result = lappend(result, jinfo->local_conds);
+	result = lappend(result, jinfo->select_vars);
+	result = lappend(result, makeString(jinfo->select_qry));
+
+	return result;
+}
+
+void
+unpackPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo, List *custom_private)
+{
+	ListCell   *lc = list_head(custom_private);
+
+	memset(jinfo, 0, sizeof(PgRemoteJoinInfo));
+	jinfo->fdw_server_oid = linitial_oid(lfirst(lc));
+	jinfo->fdw_user_oid = lsecond_oid(lfirst(lc));
+	jinfo->relids = bms_from_string(strVal(lfirst((lc = lnext(lc)))));
+	jinfo->jointype = (JoinType) intVal(lfirst((lc = lnext(lc))));
+	jinfo->outer_rel = lfirst((lc = lnext(lc)));
+	jinfo->inner_rel = lfirst((lc = lnext(lc)));
+	jinfo->remote_conds = lfirst((lc = lnext(lc)));
+	jinfo->local_conds = lfirst((lc = lnext(lc)));
+	jinfo->select_vars = lfirst((lc = lnext(lc)));
+	jinfo->select_qry = strVal((lc = lnext(lc)));
+}
+
+#if 0
+static void
+dumpPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
+{
+	elog(INFO, "fdw_server_oid = %u fdw_user_oid = %u",
+		 jinfo->fdw_server_oid, jinfo->fdw_user_oid);
+	elog(INFO, "relids = %08x", jinfo->relids->words[0]);
+	elog(INFO, "jointype = %d", (int)jinfo->jointype);
+	elog(INFO, "outer_rel = %s", nodeToString(jinfo->outer_rel));
+	elog(INFO, "inner_rel = %s", nodeToString(jinfo->inner_rel));
+	elog(INFO, "remote_conds = %s", nodeToString(jinfo->remote_conds));
+	elog(INFO, "local_conds = %s", nodeToString(jinfo->local_conds));
+	elog(INFO, "select_vars = %s", nodeToString(jinfo->select_vars));
+	elog(INFO, "select_qry = %s", nodeToString(jinfo->select_qry));
+}
+#endif
+
+/******/
+static bool
+is_self_managed_relation(PlannerInfo *root, RelOptInfo *rel,
+						 Oid *fdw_server_oid, Oid *fdw_user_oid,
+						 Node **relinfo,
+						 List **remote_conds, List **local_conds)
+{
+	if (rel->reloptkind == RELOPT_BASEREL)
+	{
+		PgFdwRelationInfo  *fpinfo;
+		RangeTblEntry	   *rte;
+
+		/* Is it a foreign table managed by postgres_fdw? */
+		if (rel->rtekind != RTE_RELATION ||
+			rel->fdwroutine == NULL ||
+			rel->fdwroutine->GetForeignRelSize != postgresGetForeignRelSize)
+			return false;
+
+		/*
+		 * Inform the caller its server-id and local user-id also.
+		 * Note that remote user-id is determined according to the pair
+		 * of server-id and local user-id on execution time, not planning
+		 * stage, so we might need to pay attention a scenario that executes
+		 * a plan with different user-id.
+		 * However, all we need to know here is whether both of relations
+		 * shall be run with same credential, or not. Its identical user-id
+		 * is not required here.
+		 * So, InvalidOid shall be set on fdw_user_oid for comparison
+		 * purpose, if it runs based on the credential of GetUserId().
+		 */
+		rte = planner_rt_fetch(rel->relid, root);
+		*fdw_user_oid = rte->checkAsUser;
+
+		fpinfo = (PgFdwRelationInfo *) rel->fdw_private;
+		*fdw_server_oid = fpinfo->server->serverid;
+		*remote_conds = fpinfo->remote_conds;
+		*local_conds = fpinfo->local_conds;
+
+		*relinfo = (Node *) makeInteger(rel->relid);
+
+		return true;
+	}
+	else if (rel->reloptkind == RELOPT_JOINREL)
+	{
+		ListCell   *cell;
+
+		foreach (cell, rel->pathlist)
+		{
+			CustomPath *cpath = lfirst(cell);
+
+			if (IsA(cpath, CustomPath) &&
+				strcmp(cpath->custom_name, "postgres-fdw") == 0)
+			{
+				PgRemoteJoinInfo	jinfo;
+
+				/*
+				 * Note that CustomScan(postgres-fdw) should be constructed
+				 * only when underlying foreign tables use identical server
+				 * and user-id for each.
+				 */
+				unpackPgRemoteJoinInfo(&jinfo, cpath->custom_private);
+				*fdw_server_oid = jinfo.fdw_server_oid;
+				*fdw_user_oid = jinfo.fdw_user_oid;
+				*remote_conds = jinfo.remote_conds;
+				*local_conds = jinfo.local_conds;
+
+				*relinfo = (Node *) cpath->custom_private;
+
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+static void
+postgresAddJoinPaths(PlannerInfo *root,
+					 RelOptInfo *joinrel,
+					 RelOptInfo *outerrel,
+					 RelOptInfo *innerrel,
+					 JoinType jointype,
+					 SpecialJoinInfo *sjinfo,
+					 List *restrictlist,
+					 List *mergeclause_list,
+					 SemiAntiJoinFactors *semifactors,
+					 Relids param_source_rels,
+					 Relids extra_lateral_rels)
+{
+	Oid		o_server_oid;
+	Oid		o_user_oid;
+	Node   *o_relinfo;
+	List   *o_local_conds;
+	List   *o_remote_conds;
+	Oid		i_server_oid;
+	Oid		i_user_oid;
+	Node   *i_relinfo;
+	List   *i_local_conds;
+	List   *i_remote_conds;
+	List   *j_local_conds;
+	List   *j_remote_conds;
+	PgRemoteJoinInfo jinfo;
+	CustomPath *cpath;
+
+	if (add_join_path_next)
+		(*add_join_path_next)(root, joinrel, outerrel, innerrel,
+							  jointype, sjinfo, restrictlist,
+							  mergeclause_list, semifactors,
+							  param_source_rels, extra_lateral_rels);
+
+	/* only regular SQL JOIN syntax is supported */
+	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
+		jointype != JOIN_FULL  && jointype != JOIN_RIGHT)
+		return;
+
+	/* outerrel is managed by this extension? */
+	if (!is_self_managed_relation(root, outerrel,
+								  &o_server_oid, &o_user_oid, &o_relinfo,
+								  &o_remote_conds, &o_local_conds))
+		return;
+
+	/* innerrel is managed by this extension? */
+	if (!is_self_managed_relation(root, innerrel,
+								  &i_server_oid, &i_user_oid, &i_relinfo,
+								  &i_remote_conds, &i_local_conds))
+		return;
+
+	/* Is remote query run with a common credential? */
+	if (o_server_oid != i_server_oid || o_user_oid != i_user_oid)
+		return;
+
+	/* unable to pull up local conditions any more */
+	if ((jointype == JOIN_LEFT && o_local_conds != NIL) ||
+		(jointype == JOIN_RIGHT && i_local_conds != NIL) ||
+		(jointype == JOIN_FULL && (o_local_conds != NIL ||
+								   i_local_conds != NIL)))
+		return;
+
+	classifyConditions(root, joinrel, restrictlist,
+					   &j_remote_conds, &j_local_conds);
+	/* pull-up local conditions, if any */
+	j_local_conds = list_concat(j_local_conds, o_local_conds);
+	j_local_conds = list_concat(j_local_conds, i_local_conds);
+
+	/* OK, make a CustomScan node to run remote join */
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = joinrel;
+#if 0
+	cpath->path.param_info =
+		get_joinrel_parampathinfo(root,
+								  joinrel,
+								  o_path,
+								  i_path,
+								  sjinfo,
+								  required_outer,
+								  &local_conds);
+#endif
+	cpath->custom_name = pstrdup("postgres-fdw");
+	cpath->custom_flags = 0;
+
+	memset(&jinfo, 0, sizeof(PgRemoteJoinInfo));
+	jinfo.fdw_server_oid = o_server_oid;
+	jinfo.fdw_user_oid = o_user_oid;
+	jinfo.relids = joinrel->relids;
+	jinfo.jointype = jointype;
+	jinfo.outer_rel = o_relinfo;
+	jinfo.inner_rel = i_relinfo;
+	jinfo.remote_conds = j_remote_conds;
+	jinfo.local_conds = j_local_conds;
+
+	cpath->custom_private = packPgRemoteJoinInfo(&jinfo);
+
+	//estimate_remote_join_cost();
+	add_path(joinrel, &cpath->path);
+}
+
+/*
+ *
+ *
+ */
+static bool
+fixup_remote_join_recursive(Node *node, List **select_vars)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		ListCell   *lc;
+		int			index = 1;
+
+		foreach (lc, *select_vars)
+		{
+			Var	   *entry = (Var *) lfirst(lc);
+
+			if (var->varno == entry->varno &&
+				var->varattno == entry->varattno)
+			{
+				Assert(var->vartype == entry->vartype);
+				Assert(var->vartypmod == entry->vartypmod);
+				Assert(var->varcollid == entry->varcollid);
+
+				var->varno = CUSTOM_VAR;
+				var->varattno = index;
+
+				return false;
+			}
+		}
+		/* add a new entry to the select list */
+		*select_vars = lappend(*select_vars, copyObject(node));
+
+		var->varno = CUSTOM_VAR;
+		var->varattno = list_length(*select_vars);
+
+		return false;
+	}
+	return expression_tree_walker(node, fixup_remote_join_recursive,
+								  (void *) select_vars);
+}
+
+static List *
+fixup_remote_join_varattno(PlannerInfo *root, CustomScan *cscan_plan)
+{
+	Plan   *plan = &cscan_plan->scan.plan;
+	List   *select_vars = NIL;
+
+	fixup_remote_join_recursive((Node *)plan->targetlist, &select_vars);
+	fixup_remote_join_recursive((Node *)plan->qual, &select_vars);
+
+	return select_vars;
+}
+
+static void
+postgresSetupCustomScan(PlannerInfo *root,
+						CustomPath *cscan_path,
+						CustomScan *cscan_plan)
+{
+	RelOptInfo		   *joinrel = cscan_path->path.parent;
+	RelOptInfo		   *baserel;
+	PgRemoteJoinInfo	jinfo;
+	StringInfoData		sql;
+	Bitmapset		   *temp;
+	int					rtindex;
+	bool				is_first = true;
+	List			   *param_list = NIL;
+
+	Assert(cscan_path->path.parent->reloptkind == RELOPT_JOINREL);
+	unpackPgRemoteJoinInfo(&jinfo, cscan_path->custom_private);
+
+	/*
+	 * adjust targetentry list
+	 *
+	 *
+	 */
+	jinfo.local_conds = extract_actual_clauses(jinfo.local_conds, false);
+	jinfo.remote_conds = extract_actual_clauses(jinfo.remote_conds, false);
+	jinfo.select_vars = fixup_remote_join_varattno(root, cscan_plan);
+
+	//dumpPgRemoteJoinInfo(&jinfo);
+
+	initStringInfo(&sql);
+	deparseRemoteJoinSql(&sql, root,
+						 cscan_path->custom_private,
+						 jinfo.select_vars,
+						 jinfo.remote_conds,
+						 &param_list);
+
+	Assert(!bms_is_empty(joinrel->relids));
+	temp = bms_copy(joinrel->relids);
+	while ((rtindex = bms_first_member(temp)) >= 0)
+	{
+		PgFdwRelationInfo *fpinfo;
+
+		baserel = root->simple_rel_array[rtindex];
+		Assert(baserel->reloptkind == RELOPT_BASEREL);
+
+		fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
+		if (fpinfo->remote_conds)
+		{
+			appendWhereClause(&sql, root, baserel, fpinfo->remote_conds,
+							  is_first, false, &param_list);
+			is_first = false;
+		}
+	}
+	jinfo.select_qry = sql.data;
+	elog(INFO, "query => %s", jinfo.select_qry);
+
+	//remote_join_varattno_fixup(root, joinrel, outerrel, innerrel,
+	//						   j_local_conds, j_remote_conds);
+	cscan_plan->scan.plan.qual = jinfo.local_conds;
+	cscan_plan->custom_exprs = jinfo.remote_conds;
+	cscan_plan->custom_private = packPgRemoteJoinInfo(&jinfo);
+}
+
+static void
+postgresBeginCustomScan(CustomScanState *csstate, int eflags)
+{}
+
+static TupleTableSlot *
+postgresExecCustomScan(CustomScanState *csstate)
+{
+	return NULL;
+}
+
+static void
+postgresEndCustomScan(CustomScanState *csstate)
+{}
+
+static void
+postgresReScanCustomScan(CustomScanState *csstate)
+{}
+
+static void
+postgresExplainCustomScan(CustomScanState *csstate,
+						  ExplainState *es)
+{
+	if (es->verbose)
+	{
+
+
+	}
+}
+
+
+/*
+ *
+ *
+ *
+ *
+ */
+void
+_PG_init(void)
+{
+	CustomProvider	provider;
+
+	/* registration of hook on add_join_paths */
+	add_join_path_next = add_join_path_hook;
+	add_join_path_hook = postgresAddJoinPaths;
+
+	/* registration of custom scan provider */
+	memset(&provider, 0, sizeof(provider));
+	snprintf(provider.name, sizeof(provider.name), "postgres-fdw");
+	provider.SetupCustomScan   = postgresSetupCustomScan;
+	provider.BeginCustomScan   = postgresBeginCustomScan;
+	provider.ExecCustomScan    = postgresExecCustomScan;
+	provider.EndCustomScan     = postgresEndCustomScan;
+	provider.ReScanCustomScan  = postgresReScanCustomScan;
+	provider.ExplainCustomScan = postgresExplainCustomScan;
+
+	register_custom_provider(&provider);
 }

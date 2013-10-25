@@ -568,6 +568,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 			{
 				ForeignScan *splan = (ForeignScan *) plan;
 
+				// XXX - to be considered deeply, later.
+
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
@@ -575,6 +577,28 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
 				splan->fdw_exprs =
 					fix_scan_list(root, splan->fdw_exprs, rtoffset);
+			}
+			break;
+
+		case T_CustomScan:
+			{
+				CustomScan *splan = (CustomScan *) plan;
+
+				if (splan->scan.scanrelid > 0)
+				{
+					splan->scan.scanrelid += rtoffset;
+					splan->scan.plan.targetlist =
+						fix_scan_list(root, splan->scan.plan.targetlist,
+									  rtoffset);
+					splan->scan.plan.qual =
+						fix_scan_list(root, splan->scan.plan.qual, rtoffset);
+					splan->custom_exprs =
+						fix_scan_list(root, splan->custom_exprs, rtoffset);
+				}
+				else
+				{
+
+				}
 			}
 			break;
 

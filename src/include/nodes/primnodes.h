@@ -134,6 +134,7 @@ typedef struct Expr
 #define    INNER_VAR		65000		/* reference to inner subplan */
 #define    OUTER_VAR		65001		/* reference to outer subplan */
 #define    INDEX_VAR		65002		/* reference to index column */
+#define    CUSTOM_VAR		65003		/* reference to custom column */
 
 #define IS_SPECIAL_VARNO(varno)		((varno) >= INNER_VAR)
 

@@ -617,25 +617,13 @@ _copyCustomScan(const CustomScan *from)
 	/*
 	 * copy remainder of node
 	 */
-	COPY_NODE_FIELD(subqry_plan);
-
-    COPY_NODE_FIELD(funcexpr);
-    COPY_NODE_FIELD(funccolnames);
-    COPY_NODE_FIELD(funccoltypes);
-    COPY_NODE_FIELD(funccoltypmods);
-    COPY_NODE_FIELD(funccolcollations);
-	COPY_SCALAR_FIELD(funcordinality);
-
-	COPY_NODE_FIELD(values_lists);
-
-	COPY_SCALAR_FIELD(ctePlanId);
-	COPY_SCALAR_FIELD(cteParam);
-	COPY_SCALAR_FIELD(wtParam);
-
 	COPY_STRING_FIELD(custom_name);
 	COPY_SCALAR_FIELD(custom_flags);
 	COPY_NODE_FIELD(custom_private);
 	COPY_NODE_FIELD(custom_exprs);
+
+	COPY_NODE_FIELD(subqry_plan);
+    COPY_NODE_FIELD(funcexpr);
 
 	return newnode;
 }

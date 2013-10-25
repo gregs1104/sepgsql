@@ -143,6 +143,7 @@ typedef struct
 	List	   *outer_tlist;	/* referent for OUTER_VAR Vars */
 	List	   *inner_tlist;	/* referent for INNER_VAR Vars */
 	List	   *index_tlist;	/* referent for INDEX_VAR Vars */
+	TupleDesc	custom_tupdesc;	/* referent for CUSTOM_VAR Vars */
 } deparse_namespace;
 
 /*
@@ -2362,14 +2363,19 @@ deparse_context_for(const char *aliasname, Oid relid)
  * deparse_context_for_planstate	- Build deparse context for a plan
  *
  * When deparsing an expression in a Plan tree, we might have to resolve
- * OUTER_VAR, INNER_VAR, or INDEX_VAR references.  To do this, the caller must
- * provide the parent PlanState node.  Then OUTER_VAR and INNER_VAR references
- * can be resolved by drilling down into the left and right child plans.
+ * special varno (OUTER_VAR, INNER_VAR, INDEX_VAR or CUSTOM_VAR) references.
+ * To do this, the caller must provide the parent PlanState node.  Then
+ * OUTER_VAR and INNER_VAR references can be resolved by drilling down into
+ * the left and right child plans.
  * Similarly, INDEX_VAR references can be resolved by reference to the
  * indextlist given in the parent IndexOnlyScan node.  (Note that we don't
  * currently support deparsing of indexquals in regular IndexScan or
  * BitmapIndexScan nodes; for those, we can only deparse the indexqualorig
  * fields, which won't contain INDEX_VAR Vars.)
+ * Also, CUSTOM_VAR references can be resolved by reference to the TupleDesc
+ * of ss_ScanTupleSlot in CustomScanState node. (Note that custom scan
+ * provider must be responsible to initialize the ss_ScanTupleSlot with
+ * appropriate TupleDesc; being likely constructed by ExecTypeFromTL).
  *
  * Note: planstate really ought to be declared as "PlanState *", but we use
  * "Node *" to avoid having to include execnodes.h in builtins.h.
@@ -3627,6 +3633,14 @@ set_deparse_planstate(deparse_namespace *dpns, PlanState *ps)
 		dpns->index_tlist = ((IndexOnlyScan *) ps->plan)->indextlist;
 	else
 		dpns->index_tlist = NIL;
+
+	/* custom_tupdesc is set only if it's an CustomScan */
+	if (IsA(ps, CustomScanState) &&
+		((CustomScanState *)ps)->ss.ss_ScanTupleSlot)
+		dpns->custom_tupdesc =
+			((CustomScanState *)ps)->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
+	else
+		dpns->custom_tupdesc = NULL;
 }
 
 /*
@@ -5294,6 +5308,18 @@ get_variable(Var *var, int levelsup, bool istoplevel, deparse_context *context)
 
 		return NULL;
 	}
+	else if (var->varno == CUSTOM_VAR && dpns->custom_tupdesc)
+	{
+		TupleDesc	tupdesc = dpns->custom_tupdesc;
+
+		Assert(netlevelsup == 0);
+		Assert(var->varattno > 0 && var->varattno <= tupdesc->natts);
+
+		attname = NameStr(tupdesc->attrs[var->varattno - 1]->attname);
+		appendStringInfoString(buf, quote_identifier(attname));
+
+		return attname;
+	}
 	else
 	{
 		elog(ERROR, "bogus varno: %d", var->varno);
@@ -5561,6 +5587,18 @@ get_name_for_var_field(Var *var, int fieldno,
 
 		result = get_name_for_var_field((Var *) tle->expr, fieldno,
 										levelsup, context);
+
+		return result;
+	}
+	else if (var->varno == CUSTOM_VAR && dpns->custom_tupdesc)
+	{
+		TupleDesc	tupdesc = dpns->custom_tupdesc;
+		const char *result;
+
+		Assert(netlevelsup == 0);
+		Assert(var->varattno > 0 && var->varattno <= tupdesc->natts);
+
+		result = NameStr(tupdesc->attrs[var->varattno - 1]->attname);
 
 		return result;
 	}

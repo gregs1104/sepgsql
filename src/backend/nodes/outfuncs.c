@@ -574,24 +574,13 @@ _outCustomScan(StringInfo str, const CustomScan *node)
 
 	_outScanInfo(str, (const Scan *) node);
 
-	WRITE_NODE_FIELD(subqry_plan);
-
-	WRITE_NODE_FIELD(funcexpr);
-	WRITE_NODE_FIELD(funccolnames);
-	WRITE_NODE_FIELD(funccoltypes);
-	WRITE_NODE_FIELD(funccoltypmods);
-	WRITE_NODE_FIELD(funccolcollations);
-	WRITE_BOOL_FIELD(funcordinality);
-
-	WRITE_NODE_FIELD(values_lists);
-
-	WRITE_INT_FIELD(ctePlanId);
-	WRITE_INT_FIELD(cteParam);
-
 	WRITE_STRING_FIELD(custom_name);
 	WRITE_INT_FIELD(custom_flags);
 	WRITE_NODE_FIELD(custom_private);
 	WRITE_NODE_FIELD(custom_exprs);
+
+	WRITE_NODE_FIELD(subqry_plan);
+	WRITE_NODE_FIELD(funcexpr);
 }
 
 static void

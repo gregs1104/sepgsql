@@ -2077,26 +2077,24 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 						get_namespace_name(get_rel_namespace(rte->relid));
 				objecttag = "Relation Name";
 			}
+			else if (rte->rtekind == RTE_JOIN)
+			{
+				objectname = rte->eref->aliasname;
+				objecttag = "Join Alias";
+			}
 			else if (rte->rtekind == RTE_FUNCTION)
 			{
-				Node	   *funcexpr;
+				Node	   *funcexpr = ((CustomScan *) plan)->funcexpr;
 
-				/*
-				 * If the expression is still a function call, we can get the
-				 * real name of the function.  Otherwise, punt (this can
-				 * happen if the optimizer simplified away the function call,
-				 * for example).
-				 */
-				funcexpr = ((FunctionScan *) plan)->funcexpr;
 				if (funcexpr && IsA(funcexpr, FuncExpr))
 				{
-					Oid			funcid = ((FuncExpr *) funcexpr)->funcid;
+					Oid		funcid = ((FuncExpr *) funcexpr)->funcid;
 
 					objectname = get_func_name(funcid);
 					if (es->verbose)
 						namespace =
 							get_namespace_name(get_func_namespace(funcid));
-				}
+                }
 				objecttag = "Function Name";
 			}
 			else if (rte->rtekind == RTE_CTE)

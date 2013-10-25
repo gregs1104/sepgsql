@@ -592,7 +592,7 @@ ExecEvalScalarVar(ExprState *exprstate, ExprContext *econtext,
 			slot = econtext->ecxt_outertuple;
 			break;
 
-			/* INDEX_VAR is handled by default case */
+			/* INDEX_VAR and CUSTOM_VAR are handled by default case */
 
 		default:				/* get the tuple from the relation being
 								 * scanned */
@@ -680,7 +680,7 @@ ExecEvalScalarVarFast(ExprState *exprstate, ExprContext *econtext,
 			slot = econtext->ecxt_outertuple;
 			break;
 
-			/* INDEX_VAR is handled by default case */
+			/* INDEX_VAR and CUSTOM_VAR are handled by default case */
 
 		default:				/* get the tuple from the relation being
 								 * scanned */
@@ -732,7 +732,7 @@ ExecEvalWholeRowVar(WholeRowVarExprState *wrvstate, ExprContext *econtext,
 			slot = econtext->ecxt_outertuple;
 			break;
 
-			/* INDEX_VAR is handled by default case */
+			/* INDEX_VAR and CUSTOM_VAR are handled by default case */
 
 		default:				/* get the tuple from the relation being
 								 * scanned */
@@ -915,7 +915,7 @@ ExecEvalWholeRowFast(WholeRowVarExprState *wrvstate, ExprContext *econtext,
 			slot = econtext->ecxt_outertuple;
 			break;
 
-			/* INDEX_VAR is handled by default case */
+			/* INDEX_VAR and CUSTOM_VAR are handled by default case */
 
 		default:				/* get the tuple from the relation being
 								 * scanned */
@@ -991,7 +991,7 @@ ExecEvalWholeRowSlow(WholeRowVarExprState *wrvstate, ExprContext *econtext,
 			slot = econtext->ecxt_outertuple;
 			break;
 
-			/* INDEX_VAR is handled by default case */
+			/* INDEX_VAR and CUSTOM_VAR are handled by default case */
 
 		default:				/* get the tuple from the relation being
 								 * scanned */

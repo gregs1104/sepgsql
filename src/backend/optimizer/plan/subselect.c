@@ -2195,6 +2195,10 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
 			context.paramids = bms_add_members(context.paramids, scan_params);
 			break;
 
+		case T_CustomScan:
+			/* XXX - add here something to finalize */
+			break;
+
 		case T_ModifyTable:
 			{
 				ModifyTable *mtplan = (ModifyTable *) plan;

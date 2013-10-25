@@ -239,6 +239,7 @@ create_plan_recurse(PlannerInfo *root, Path *best_path)
 		case T_CteScan:
 		case T_WorkTableScan:
 		case T_ForeignScan:
+		case T_CustomScan:
 			plan = create_scan_plan(root, best_path);
 			break;
 		case T_HashJoin:
@@ -2040,26 +2041,17 @@ create_customscan_plan(PlannerInfo *root,
 {
 	CustomProvider *provider = get_custom_provider(best_path->custom_name);
 	CustomScan	   *scan_plan = makeNode(CustomScan);
-	Index			scan_relid = best_path->path.parent->relid;
+	RelOptKind		reloptkind = best_path->path.parent->reloptkind;
+	RangeTblEntry  *rte;
+	Index			scan_relid;
 
-	scan_plan->custom_name = pstrdup(best_path->custom_name);
-	scan_plan->custom_flags = best_path->custom_flags;
-	scan_plan->custom_private = NIL;
-	scan_plan->custom_exprs = NULL;
-
-	if (scan_relid > 0)
+	if (reloptkind == RELOPT_BASEREL ||
+		reloptkind == RELOPT_OTHER_MEMBER_REL)
 	{
-		RangeTblEntry  *rte = planner_rt_fetch(scan_relid, root);
+		scan_relid = best_path->path.parent->relid;
 
-		if (rte->rtekind == RTE_RELATION)
-		{
-			Assert(best_path->path.parent->reloptkind == RELOPT_BASEREL);
-		}
-		else if (rte->rtekind == RTE_JOIN)
-		{
-			Assert(best_path->path.parent->reloptkind == RELOPT_JOINREL);
-		}
-		else if (rte->rtekind == RTE_SUBQUERY)
+		rte = planner_rt_fetch(scan_relid, root);
+		if (rte->rtekind == RTE_SUBQUERY)
 		{
 			if (best_path->path.param_info)
 			{
@@ -2071,118 +2063,28 @@ create_customscan_plan(PlannerInfo *root,
 		}
 		else if (rte->rtekind == RTE_FUNCTION)
 		{
-			Node   *func_expr = rte->funcexpr;
+			Node   *funcexpr = rte->funcexpr;
 
 			if (best_path->path.param_info)
-				func_expr = replace_nestloop_params(root, func_expr);
-
-			scan_plan->funcexpr = func_expr;
-			scan_plan->funcordinality = rte->funcordinality;
-			scan_plan->funccolnames = rte->eref->colnames;
-			scan_plan->funccoltypes = rte->funccoltypes;
-			scan_plan->funccoltypmods = rte->funccoltypmods;
-			scan_plan->funccolcollations = rte->funccolcollations;
-		}
-		else if (rte->rtekind == RTE_VALUES)
-		{
-			scan_plan->values_lists = rte->values_lists;
-		}
-		else if (rte->rtekind == RTE_CTE)
-		{
-			if (!rte->self_reference)
-			{
-				/*
-				 * Logic come from create_ctescan_plan because this custom-
-				 * scan shall perform equivalent to CteScan.
-				 */
-				PlannerInfo	   *cteroot = root;
-				Index			levelsup = rte->ctelevelsup;
-				SubPlan		   *ctesplan = NULL;
-				ListCell	   *lc;
-				int				ndx;
-				int				plan_id;
-
-				/*
-				 * Find the referenced CTE, and locate the SubPlan previously
-				 * made for it.
-				 */
-				while (levelsup-- > 0)
-				{
-					cteroot = cteroot->parent_root;
-					if (!cteroot)	/* shouldn't happen */
-						elog(ERROR, "bad levelsup for CTE \"%s\"",
-							 rte->ctename);
-				}
-
-				ndx = 0;
-				foreach(lc, cteroot->parse->cteList)
-				{
-					CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
-
-					if (strcmp(cte->ctename, rte->ctename) == 0)
-						break;
-					ndx++;
-				}
-				if (lc == NULL)		/* shouldn't happen */
-					elog(ERROR, "could not find CTE \"%s\"", rte->ctename);
-				if (ndx >= list_length(cteroot->cte_plan_ids))
-					elog(ERROR, "could not find plan for CTE \"%s\"",
-						 rte->ctename);
-				plan_id = list_nth_int(cteroot->cte_plan_ids, ndx);
-				Assert(plan_id > 0);
-
-				foreach(lc, cteroot->init_plans)
-				{
-					ctesplan = (SubPlan *) lfirst(lc);
-					if (ctesplan->plan_id == plan_id)
-						break;
-				}
-				if (lc == NULL)		/* shouldn't happen */
-					elog(ERROR, "could not find plan for CTE \"%s\"",
-						 rte->ctename);
-
-				scan_plan->ctePlanId = plan_id;
-				scan_plan->cteParam = linitial_int(ctesplan->setParam);
-			}
-			else
-			{
-				/*
-				 * Logic come from create_worktablescan_plan because this
-				 * custom-scan shall perform equivalent to WorkTableScan.
-				 */
-				PlannerInfo	   *cteroot = root;
-				Index			levelsup = rte->ctelevelsup;
-
-				if (levelsup == 0)		/* shouldn't happen */
-					elog(ERROR, "bad levelsup for CTE \"%s\"", rte->ctename);
-				levelsup--;
-				while (levelsup-- > 0)
-				{
-					cteroot = cteroot->parent_root;
-					if (!cteroot)		/* shouldn't happen */
-						elog(ERROR, "bad levelsup for CTE \"%s\"",
-							 rte->ctename);
-				}
-				if (cteroot->wt_param_id < 0)	/* shouldn't happen */
-					elog(ERROR, "could not find param ID for CTE \"%s\"",
-						 rte->ctename);
-				scan_plan->wtParam = cteroot->wt_param_id;
-			}
-		}
-		else
-		{
-			elog(ERROR, "unexpected rtekind on CustomPath(%s): %d",
-				 scan_plan->custom_name, (int)rte->rtekind);
+				funcexpr = replace_nestloop_params(root, funcexpr);
+			scan_plan->funcexpr = funcexpr;
 		}
 	}
-	/* Sort clauses into best execution order */
-	scan_clauses = order_qual_clauses(root, scan_clauses);
+	else if (reloptkind == RELOPT_JOINREL)
+		scan_relid = 0;
+	else
+		elog(ERROR, "unexpected reloptkind: %d", (int)reloptkind);
 
 	scan_plan->scan.plan.targetlist = tlist;
-	scan_plan->scan.plan.qual = scan_clauses;
+	scan_plan->scan.plan.qual = order_qual_clauses(root, scan_clauses);
 	scan_plan->scan.plan.lefttree = NULL;
 	scan_plan->scan.plan.righttree = NULL;
 	scan_plan->scan.scanrelid = scan_relid;
+
+	scan_plan->custom_name = pstrdup(best_path->custom_name);
+	scan_plan->custom_flags = best_path->custom_flags;
+	scan_plan->custom_private = NIL;
+	scan_plan->custom_exprs = NULL;
 
 	/*
 	 * Let custom scan provider perform to set up this custom-scan plan

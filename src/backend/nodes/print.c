@@ -333,6 +333,10 @@ print_expr(const Node *expr, const List *rtable)
 				relname = "INDEX";
 				attname = "?";
 				break;
+			case CUSTOM_VAR:
+				relname = "CUSTOM";
+				attname = "?";
+				break;
 			default:
 				{
 					RangeTblEntry *rte;

@@ -495,30 +495,13 @@ typedef struct CustomScan
 {
 	Scan		scan;
 
-	/* valid only if RTE_SUBQUERY */
-	Plan	   *subqry_plan;
-
-	/* valid only if RTE_FUNCTION */
-	Node	   *funcexpr;			/* Expression tree for function call */
-	List	   *funccolnames;		/* Output column names */
-	List	   *funccoltypes;		/* OID list of column type OIDs */
-	List	   *funccoltypmods;		/* Integer list of column typmods */
-	List	   *funccolcollations;	/* OID list of column collation OIDs */
-	bool		funcordinality;
-
-	/* valid only if RTE_VALUES */
-	List	   *values_lists;		/* list of expression lists */
-
-	/* valid only if RTE_CTE */
-	int			ctePlanId;			/* ID of init SubPlan for CTE */
-	int			cteParam;			/* ID of Param representing CTE output */
-	int			wtParam;			/* ID of Param representing work table */
-
-	/* common parameters of custom scan provider */
 	const char *custom_name;		/* name of custom scan provider */
 	int			custom_flags;		/* a set of CUSTOM__* flags */
 	List	   *custom_private;		/* private data for CSP  */
 	List	   *custom_exprs;		/* expressions that CSP may execute */
+
+	Plan	   *subqry_plan;		/* valid, if RTE_SUBQUERY */
+	Node	   *funcexpr;			/* valid, if RTE_FUNCTION */
 } CustomScan;
 
 /*

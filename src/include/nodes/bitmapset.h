@@ -93,4 +93,8 @@ extern int	bms_first_member(Bitmapset *a);
 /* support for hashtables using Bitmapsets as keys: */
 extern uint32 bms_hash_value(const Bitmapset *a);
 
+/* support for string representation */
+extern char *bms_to_string(Bitmapset *a);
+extern Bitmapset *bms_from_string(const char *a);
+
 #endif   /* BITMAPSET_H */

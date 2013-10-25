@@ -41,6 +41,7 @@ extern int ExtractConnectionOptions(List *defelems,
 /* in deparse.c */
 extern void classifyConditions(PlannerInfo *root,
 				   RelOptInfo *baserel,
+				   List *restrictinfo_list,
 				   List **remote_conds,
 				   List **local_conds);
 extern bool is_foreign_expr(PlannerInfo *root,
@@ -56,6 +57,7 @@ extern void appendWhereClause(StringInfo buf,
 				  RelOptInfo *baserel,
 				  List *exprs,
 				  bool is_first,
+				  bool is_join_on,
 				  List **params);
 extern void deparseInsertSql(StringInfo buf, PlannerInfo *root,
 				 Index rtindex, Relation rel,
@@ -69,8 +71,37 @@ extern void deparseDeleteSql(StringInfo buf, PlannerInfo *root,
 				 Index rtindex, Relation rel,
 				 List *returningList,
 				 List **retrieved_attrs);
+extern void deparseRemoteJoinSql(StringInfo buf, PlannerInfo *root,
+								 List *relinfo,
+								 List *select_vars,
+								 List *remote_expr,
+								 List **param_list);
 extern void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
 extern void deparseAnalyzeSql(StringInfo buf, Relation rel,
 				  List **retrieved_attrs);
+
+/*
+ * Remote Join Support using CustomScan APIs
+ *
+ *
+ *
+ */
+typedef struct
+{
+	Oid			fdw_server_oid;
+	Oid			fdw_user_oid;
+	Relids		relids;
+	JoinType	jointype;
+	Node	   *outer_rel;
+	Node	   *inner_rel;
+	List	   *remote_conds;
+	List	   *local_conds;
+	List	   *select_vars;
+	char	   *select_qry;
+} PgRemoteJoinInfo;
+
+extern List *packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo);
+extern void unpackPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo,
+								   List *custom_private);
 
 #endif   /* POSTGRES_FDW_H */
