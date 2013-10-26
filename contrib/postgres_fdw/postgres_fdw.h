@@ -93,6 +93,7 @@ extern void appendWhereClause(StringInfo buf,
 				  List *exprs,
 				  bool is_first,
 				  bool is_join_on,
+				  bool qualified,
 				  List **params);
 extern void deparseInsertSql(StringInfo buf, PlannerInfo *root,
 				 Index rtindex, Relation rel,

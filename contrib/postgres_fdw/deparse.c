@@ -790,6 +790,7 @@ appendWhereClause(StringInfo buf,
 				  List *exprs,
 				  bool is_first,
 				  bool is_join_on,
+				  bool qualified,
 				  List **params)
 {
 	deparse_expr_cxt context;
@@ -804,7 +805,7 @@ appendWhereClause(StringInfo buf,
 	context.foreignrel = baserel;
 	context.buf = buf;
 	context.params_list = params;
-	context.var_qualified = is_join_on;
+	context.var_qualified = qualified;
 
 	/* Make sure any constants in the exprs are printed portably */
 	nestlevel = set_transmission_modes();
@@ -1030,7 +1031,7 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 
 			appendWhereClause(from_buf, root, joinrel,
 							  jinfo.remote_conds,
-							  true, true, select_params);
+							  true, true, true, select_params);
 		}
 		appendStringInfoChar(from_buf, ')');
 	}
@@ -1073,8 +1074,10 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 
 		fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
 		if (fpinfo->remote_conds)
-			appendWhereClause(where_buf, root, baserel, fpinfo->remote_conds,
-							  where_buf->len == 0, false, select_params);
+			appendWhereClause(where_buf, root, baserel,
+							  fpinfo->remote_conds,
+							  where_buf->len == 0, false, true,
+							  select_params);
 
 		heap_close(rel, NoLock);
 	}

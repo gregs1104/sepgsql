@@ -47,42 +47,6 @@ PG_MODULE_MAGIC;
 /* Default CPU cost to process 1 row (above and beyond cpu_tuple_cost). */
 #define DEFAULT_FDW_TUPLE_COST		0.01
 
-#if 0
-/*
- * FDW-specific planner information kept in RelOptInfo.fdw_private for a
- * foreign table.  This information is collected by postgresGetForeignRelSize.
- */
-typedef struct PgFdwRelationInfo
-{
-	/* baserestrictinfo clauses, broken down into safe and unsafe subsets. */
-	List	   *remote_conds;
-	List	   *local_conds;
-
-	/* Bitmap of attr numbers we need to fetch from the remote server. */
-	Bitmapset  *attrs_used;
-
-	/* Cost and selectivity of local_conds. */
-	QualCost	local_conds_cost;
-	Selectivity local_conds_sel;
-
-	/* Estimated size and cost for a scan with baserestrictinfo quals. */
-	double		rows;
-	int			width;
-	Cost		startup_cost;
-	Cost		total_cost;
-
-	/* Options extracted from catalogs. */
-	bool		use_remote_estimate;
-	Cost		fdw_startup_cost;
-	Cost		fdw_tuple_cost;
-
-	/* Cached catalog information. */
-	ForeignTable *table;
-	ForeignServer *server;
-	UserMapping *user;			/* only set in use_remote_estimate mode */
-} PgFdwRelationInfo;
-#endif
-
 /*
  * Indexes of FDW-private information stored in fdw_private lists.
  *
@@ -132,6 +96,9 @@ enum FdwModifyPrivateIndex
 typedef struct PgFdwScanState
 {
 	Relation	rel;			/* relcache entry for the foreign table */
+	List	   *join_rels;		/* list of underlying relcache entries, if *
+								 * remote join on top of CustomScan */
+	TupleDesc	scan_tupdesc;	/* tuple descriptor of scanned relation */
 	AttInMetadata *attinmeta;	/* attribute datatype conversion metadata */
 
 	/* extracted fdw_private data */
@@ -217,7 +184,8 @@ typedef struct PgFdwAnalyzeState
  */
 typedef struct ConversionLocation
 {
-	Relation	rel;			/* foreign table's relcache entry */
+	const char *relname;		/* name of the foreign table, if any */
+	TupleDesc	tupdesc;		/* tuple descriptor of scanned relation */
 	AttrNumber	cur_attno;		/* attribute number being processed, or 0 */
 } ConversionLocation;
 
@@ -309,8 +277,8 @@ static void get_remote_estimate(const char *sql,
 static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 						  EquivalenceClass *ec, EquivalenceMember *em,
 						  void *arg);
-static void create_cursor(ForeignScanState *node);
-static void fetch_more_data(ForeignScanState *node);
+static void create_cursor(PgFdwScanState *fsstate, ExprContext *econtext);
+static void fetch_more_data(PgFdwScanState *fsstate);
 static void close_cursor(PGconn *conn, unsigned int cursor_number);
 static void prepare_foreign_modify(PgFdwModifyState *fmstate);
 static const char **convert_prep_stmt_params(PgFdwModifyState *fmstate,
@@ -326,7 +294,8 @@ static void analyze_row_processor(PGresult *res, int row,
 					  PgFdwAnalyzeState *astate);
 static HeapTuple make_tuple_from_result_row(PGresult *res,
 						   int row,
-						   Relation rel,
+						   const char *relname,
+						   TupleDesc tupdesc,
 						   AttInMetadata *attinmeta,
 						   List *retrieved_attrs,
 						   MemoryContext temp_context);
@@ -779,7 +748,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 					 &retrieved_attrs);
 	if (remote_conds)
 		appendWhereClause(&sql, root, baserel, remote_conds,
-						  true, false, &params_list);
+						  true, false, false, &params_list);
 
 	/*
 	 * Add FOR UPDATE/SHARE if appropriate.  We apply locking during the
@@ -889,6 +858,7 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 
 	/* Get info about foreign table. */
 	fsstate->rel = node->ss.ss_currentRelation;
+	fsstate->scan_tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
 	table = GetForeignTable(RelationGetRelid(fsstate->rel));
 	server = GetForeignServer(table->serverid);
 	user = GetUserMapping(userid, server->serverid);
@@ -978,7 +948,7 @@ postgresIterateForeignScan(ForeignScanState *node)
 	 * cursor on the remote side.
 	 */
 	if (!fsstate->cursor_exists)
-		create_cursor(node);
+		create_cursor(fsstate, node->ss.ps.ps_ExprContext);
 
 	/*
 	 * Get some more tuples, if we've run out.
@@ -987,7 +957,7 @@ postgresIterateForeignScan(ForeignScanState *node)
 	{
 		/* No point in another fetch if we already detected EOF, though. */
 		if (!fsstate->eof_reached)
-			fetch_more_data(node);
+			fetch_more_data(fsstate);
 		/* If we didn't get any tuples, must be end of data. */
 		if (fsstate->next_tuple >= fsstate->num_tuples)
 			return ExecClearTuple(slot);
@@ -1713,10 +1683,10 @@ estimate_path_cost_size(PlannerInfo *root,
 						 &retrieved_attrs);
 		if (fpinfo->remote_conds)
 			appendWhereClause(&sql, root, baserel, fpinfo->remote_conds,
-							  true, false, NULL);
+							  true, false, false, NULL);
 		if (join_conds)
 			appendWhereClause(&sql, root, baserel, join_conds,
-							  (fpinfo->remote_conds == NIL), false, NULL);
+						  (fpinfo->remote_conds == NIL), false, false, NULL);
 
 		/* Get the remote estimate */
 		conn = GetConnection(fpinfo->server, fpinfo->user, false);
@@ -1872,10 +1842,8 @@ ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
  * Create cursor for node's query with current parameter values.
  */
 static void
-create_cursor(ForeignScanState *node)
+create_cursor(PgFdwScanState *fsstate, ExprContext *econtext)
 {
-	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
-	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			numParams = fsstate->numParams;
 	const char **values = fsstate->param_values;
 	PGconn	   *conn = fsstate->conn;
@@ -1962,9 +1930,8 @@ create_cursor(ForeignScanState *node)
  * Fetch some more rows from the node's cursor.
  */
 static void
-fetch_more_data(ForeignScanState *node)
+fetch_more_data(PgFdwScanState *fsstate)
 {
-	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
 	PGresult   *volatile res = NULL;
 	MemoryContext oldcontext;
 
@@ -1984,6 +1951,7 @@ fetch_more_data(ForeignScanState *node)
 		int			fetch_size;
 		int			numrows;
 		int			i;
+		const char *relname = NULL;
 
 		/* The fetch size is arbitrary, but shouldn't be enormous. */
 		fetch_size = 100;
@@ -2002,11 +1970,15 @@ fetch_more_data(ForeignScanState *node)
 		fsstate->num_tuples = numrows;
 		fsstate->next_tuple = 0;
 
+		if (fsstate->rel)
+			relname = RelationGetRelationName(fsstate->rel);
+
 		for (i = 0; i < numrows; i++)
 		{
 			fsstate->tuples[i] =
 				make_tuple_from_result_row(res, i,
-										   fsstate->rel,
+										   relname,
+										   fsstate->scan_tupdesc,
 										   fsstate->attinmeta,
 										   fsstate->retrieved_attrs,
 										   fsstate->temp_cxt);
@@ -2224,11 +2196,13 @@ store_returning_result(PgFdwModifyState *fmstate,
 	{
 		HeapTuple	newtup;
 
-		newtup = make_tuple_from_result_row(res, 0,
-											fmstate->rel,
-											fmstate->attinmeta,
-											fmstate->retrieved_attrs,
-											fmstate->temp_cxt);
+		newtup =
+			make_tuple_from_result_row(res, 0,
+									   RelationGetRelationName(fmstate->rel),
+									   RelationGetDescr(fmstate->rel),
+									   fmstate->attinmeta,
+									   fmstate->retrieved_attrs,
+									   fmstate->temp_cxt);
 		/* tuple will be deleted when it is cleared from the slot */
 		ExecStoreTuple(newtup, slot, InvalidBuffer, true);
 	}
@@ -2516,11 +2490,13 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 		 */
 		oldcontext = MemoryContextSwitchTo(astate->anl_cxt);
 
-		astate->rows[pos] = make_tuple_from_result_row(res, row,
-													   astate->rel,
-													   astate->attinmeta,
-													 astate->retrieved_attrs,
-													   astate->temp_cxt);
+		astate->rows[pos] =
+			make_tuple_from_result_row(res, row,
+									   RelationGetRelationName(astate->rel),
+									   RelationGetDescr(astate->rel),
+									   astate->attinmeta,
+									   astate->retrieved_attrs,
+									   astate->temp_cxt);
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -2537,13 +2513,13 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 static HeapTuple
 make_tuple_from_result_row(PGresult *res,
 						   int row,
-						   Relation rel,
+						   const char *relname,
+						   TupleDesc tupdesc,
 						   AttInMetadata *attinmeta,
 						   List *retrieved_attrs,
 						   MemoryContext temp_context)
 {
 	HeapTuple	tuple;
-	TupleDesc	tupdesc = RelationGetDescr(rel);
 	Datum	   *values;
 	bool	   *nulls;
 	ItemPointer ctid = NULL;
@@ -2570,7 +2546,8 @@ make_tuple_from_result_row(PGresult *res,
 	/*
 	 * Set up and install callback to report where conversion error occurs.
 	 */
-	errpos.rel = rel;
+	errpos.relname = relname;
+	errpos.tupdesc = tupdesc;
 	errpos.cur_attno = 0;
 	errcallback.callback = conversion_error_callback;
 	errcallback.arg = (void *) &errpos;
@@ -2655,12 +2632,18 @@ static void
 conversion_error_callback(void *arg)
 {
 	ConversionLocation *errpos = (ConversionLocation *) arg;
-	TupleDesc	tupdesc = RelationGetDescr(errpos->rel);
 
-	if (errpos->cur_attno > 0 && errpos->cur_attno <= tupdesc->natts)
-		errcontext("column \"%s\" of foreign table \"%s\"",
-				   NameStr(tupdesc->attrs[errpos->cur_attno - 1]->attname),
-				   RelationGetRelationName(errpos->rel));
+	if (errpos->cur_attno > 0 && errpos->cur_attno <= errpos->tupdesc->natts)
+	{
+		Form_pg_attribute attr = errpos->tupdesc->attrs[errpos->cur_attno - 1];
+
+		if (errpos->relname)
+			errcontext("column \"%s\" of foreign table \"%s\"",
+					   NameStr(attr->attname), errpos->relname);
+		else
+			errcontext("column \"%s\" of remote join relation",
+					   NameStr(attr->attname));
+	}
 }
 
 /*
@@ -3015,12 +2998,19 @@ fixup_remote_join_mutator(Node *node, fixup_remote_join_context *context)
 		ListCell   *lc;
 		AttrNumber	resno;
 
+		/*
+		 * TODO: special case handling if whole-row reference
+		 */
+
+
+
 		resno = 1;
 		foreach (lc, context->select_vars)
 		{
 			Var	   *selvar = (Var *) lfirst(lc);
 
 			Assert(newvar->varlevelsup == 0);
+
 			if (newvar->varno == selvar->varno &&
 				newvar->varattno == selvar->varattno)
 			{
@@ -3091,21 +3081,220 @@ postgresSetPlanRefCustomScan(PlannerInfo *root,
 	csplan->custom_exprs =
 		(List *) fixup_remote_join_expr((Node *)csplan->custom_exprs,
 										root, jinfo.select_vars, rtoffset);
+	if (rtoffset > 0)
+	{
+		ListCell   *lc;
+
+		foreach (lc, jinfo.select_vars)
+		{
+			Var	*var = lfirst(lc);
+
+			var->varno += rtoffset;
+		}
+	}
 }
 
 static void
-postgresBeginCustomScan(CustomScanState *csstate, int eflags)
-{}
+postgresBeginCustomScan(CustomScanState *node, int eflags)
+{
+	CustomScan	   *csplan = (CustomScan *) node->ss.ps.plan;
+	EState		   *estate = node->ss.ps.state;
+	PgRemoteJoinInfo jinfo;
+	PgFdwScanState *fsstate;
+	TupleDesc		tupdesc;
+	List		   *att_names = NIL;
+	List		   *att_types = NIL;
+	List		   *att_typmods = NIL;
+	List		   *att_collations = NIL;
+	List		   *retrieved_attrs = NIL;
+	ListCell	   *lc;
+    ForeignServer  *server;
+    UserMapping	   *user;
+	Oid				userid;
+	int				i, numParams;
+
+	unpackPgRemoteJoinInfo(&jinfo, csplan->custom_private);
+
+	/*
+	 * ss_ScanTupleSlot of ScanState has to be correctly initialized
+	 * even if this invocation is EXPLAIN (without ANALYZE), because
+	 * Var node with CUSTOM_VAR references its TupleDesc to get
+	 * virtual attribute name on the scanned slot.
+	 */
+	ExecInitScanTupleSlot(estate, &node->ss);
+	foreach (lc, jinfo.select_vars)
+	{
+		Oid		reloid;
+		char   *attname;
+		Var	   *var = lfirst(lc);
+
+		Assert(IsA(var, Var));
+		reloid = getrelid(var->varno, estate->es_range_table);
+		attname = get_relid_attribute_name(reloid, var->varattno);
+
+		att_names = lappend(att_names, makeString(attname));
+		att_types = lappend_oid(att_types, var->vartype);
+		att_typmods = lappend_int(att_typmods, var->vartypmod);
+		att_collations = lappend_oid(att_collations, var->varcollid);
+
+		retrieved_attrs = lappend_int(retrieved_attrs,
+									  list_length(retrieved_attrs) + 1);
+	}
+	tupdesc = BuildDescFromLists(att_names, att_types,
+								 att_typmods, att_collations);
+	ExecAssignScanType(&node->ss, tupdesc);
+
+	/*
+	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
+	 */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/*
+	 * CustomScan also uses PgFdwScanState to run remote join
+	 */
+	fsstate = (PgFdwScanState *) palloc0(sizeof(PgFdwScanState));
+	node->custom_state = fsstate;
+
+	/*
+	 * Needs to open underlying relations by itself
+	 */
+	while ((i = bms_first_member(jinfo.relids)) >= 0)
+	{
+		Relation	rel = ExecOpenScanRelation(estate, i, eflags);
+
+		fsstate->join_rels = lappend(fsstate->join_rels, rel);
+	}
+	fsstate->scan_tupdesc = tupdesc;
+
+	/* Get info about foreign server */
+	userid = OidIsValid(jinfo.fdw_user_oid) ? jinfo.fdw_user_oid : GetUserId();
+	user = GetUserMapping(userid, jinfo.fdw_server_oid);
+	server = GetForeignServer(jinfo.fdw_server_oid);
+
+	/*
+	 * Get connection to the foreign server.  Connection manager will
+	 * establish new connection if necessary.
+	 */
+	fsstate->conn = GetConnection(server, user, false);
+
+	/* Assign a unique ID for my cursor */
+	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+	fsstate->cursor_exists = false;
+
+	/* Get private info created by planner functions. */
+	fsstate->query = jinfo.select_qry;
+	fsstate->retrieved_attrs = retrieved_attrs;
+
+	/* Create contexts for batches of tuples and per-tuple temp workspace. */
+	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											   "postgres_fdw tuple data",
+											   ALLOCSET_DEFAULT_MINSIZE,
+											   ALLOCSET_DEFAULT_INITSIZE,
+											   ALLOCSET_DEFAULT_MAXSIZE);
+	fsstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "postgres_fdw temporary data",
+											  ALLOCSET_SMALL_MINSIZE,
+											  ALLOCSET_SMALL_INITSIZE,
+											  ALLOCSET_SMALL_MAXSIZE);
+
+	/* Get info we'll need for input data conversion. */
+	fsstate->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+	/* Prepare for output conversion of parameters used in remote query. */
+	numParams = list_length(jinfo.select_params);
+	fsstate->numParams = numParams;
+	fsstate->param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * numParams);
+
+	i = 0;
+	foreach(lc, jinfo.select_params)
+	{
+		Node   *param_expr = (Node *) lfirst(lc);
+		Oid		typefnoid;
+		bool	isvarlena;
+
+		getTypeOutputInfo(exprType(param_expr), &typefnoid, &isvarlena);
+		fmgr_info(typefnoid, &fsstate->param_flinfo[i]);
+		i++;
+	}
+
+    /*
+     * Prepare remote-parameter expressions for evaluation.
+	 */
+    fsstate->param_exprs = (List *)ExecInitExpr((Expr *) jinfo.select_params,
+												(PlanState *) node);
+
+	/*
+     * Allocate buffer for text form of query parameters, if any.
+     */
+	if (numParams > 0)
+		fsstate->param_values = palloc0(numParams * sizeof(char *));
+	else
+		fsstate->param_values = NULL;
+}
 
 static TupleTableSlot *
-postgresExecCustomScan(CustomScanState *csstate)
+postgresExecCustomAccess(CustomScanState *node)
 {
-	return NULL;
+	PgFdwScanState *fsstate = node->custom_state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	/* create a new cursor, if first call next to Begin or ReScan */
+	if (!fsstate->cursor_exists)
+		create_cursor(fsstate, node->ss.ps.ps_ExprContext);
+
+	/*
+	 * Get some more tuples, if we've run out.
+	 */
+	if (fsstate->next_tuple >= fsstate->num_tuples)
+	{
+		/* No point in another fetch if we already detected EOF, though. */
+		if (!fsstate->eof_reached)
+			fetch_more_data(fsstate);
+		/* If we didn't get any tuples, must be end of data. */
+		if (fsstate->next_tuple >= fsstate->num_tuples)
+			return ExecClearTuple(slot);
+	}
+
+	/*
+	 * Return the next tuple.
+	 */
+	ExecStoreTuple(fsstate->tuples[fsstate->next_tuple++],
+				   slot,
+				   InvalidBuffer,
+				   false);
+
+	return slot;
+}
+
+static bool
+postgresExecCustomRecheck(CustomScanState *node, TupleTableSlot *slot)
+{
+	return true;
+}
+
+static TupleTableSlot *
+postgresExecCustomScan(CustomScanState *node)
+{
+	return ExecScan((ScanState *) node,
+					(ExecScanAccessMtd) postgresExecCustomAccess,
+					(ExecScanRecheckMtd) postgresExecCustomRecheck);
 }
 
 static void
-postgresEndCustomScan(CustomScanState *csstate)
-{}
+postgresEndCustomScan(CustomScanState *node)
+{
+	PgFdwScanState *fsstate = (PgFdwScanState *) node->custom_state;
+	ListCell   *lc;
+
+	if (!fsstate)
+		return;
+
+	
+
+	foreach (lc, fsstate->join_rels)
+		ExecCloseScanRelation(lfirst(lc));
+}
 
 static void
 postgresReScanCustomScan(CustomScanState *csstate)
