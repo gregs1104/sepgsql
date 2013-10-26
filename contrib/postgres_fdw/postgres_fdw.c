@@ -47,6 +47,7 @@ PG_MODULE_MAGIC;
 /* Default CPU cost to process 1 row (above and beyond cpu_tuple_cost). */
 #define DEFAULT_FDW_TUPLE_COST		0.01
 
+#if 0
 /*
  * FDW-specific planner information kept in RelOptInfo.fdw_private for a
  * foreign table.  This information is collected by postgresGetForeignRelSize.
@@ -80,6 +81,7 @@ typedef struct PgFdwRelationInfo
 	ForeignServer *server;
 	UserMapping *user;			/* only set in use_remote_estimate mode */
 } PgFdwRelationInfo;
+#endif
 
 /*
  * Indexes of FDW-private information stored in fdw_private lists.
@@ -2670,20 +2672,46 @@ conversion_error_callback(void *arg)
  *
  *
  */
+enum PgRemoteJoinPrivateIndex
+{
+	/* An OID pair of foreign server and user */
+	PgCust_FdwServUserIds,
+	PgCust_JoinRelids,
+	PgCust_JoinType,
+	PgCust_OuterRel,
+	PgCust_InnerRel,
+	PgCust_RemoteConds,
+	PgCust_LocalConds,
+	PgCust_SelectVars,
+	PgCust_SelectParams,
+	PgCust_SelectSql,
+};
+
 List *
 packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
 {
 	List   *result = NIL;
 
+	/* PgCust_FdwServUserIds */
 	result = lappend(result, list_make2_oid(jinfo->fdw_server_oid,
 											jinfo->fdw_user_oid));
+	/* PgCust_JoinRelids */
 	result = lappend(result, makeString(bms_to_string(jinfo->relids)));
+	/* PgCust_JoinType */
 	result = lappend(result, makeInteger((long) jinfo->jointype));
+	/* PgCust_OuterRel */
 	result = lappend(result, jinfo->outer_rel);
+	/* PgCust_InnerRel */
 	result = lappend(result, jinfo->inner_rel);
+	/* PgCust_RemoteConds */
 	result = lappend(result, jinfo->remote_conds);
+	/* PgCust_LocalConds */
 	result = lappend(result, jinfo->local_conds);
+	/* PgCust_SelectVars */
 	result = lappend(result, jinfo->select_vars);
+	/* PgCust_SelectParams */
+	result = lappend(result, jinfo->select_params);
+	/* PgCust_SelectSql */
 	result = lappend(result, makeString(jinfo->select_qry));
 
 	return result;
@@ -2692,19 +2720,52 @@ packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
 void
 unpackPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo, List *custom_private)
 {
-	ListCell   *lc = list_head(custom_private);
+	ListCell   *lc;
+	int			index = PgCust_FdwServUserIds;
 
 	memset(jinfo, 0, sizeof(PgRemoteJoinInfo));
-	jinfo->fdw_server_oid = linitial_oid(lfirst(lc));
-	jinfo->fdw_user_oid = lsecond_oid(lfirst(lc));
-	jinfo->relids = bms_from_string(strVal(lfirst((lc = lnext(lc)))));
-	jinfo->jointype = (JoinType) intVal(lfirst((lc = lnext(lc))));
-	jinfo->outer_rel = lfirst((lc = lnext(lc)));
-	jinfo->inner_rel = lfirst((lc = lnext(lc)));
-	jinfo->remote_conds = lfirst((lc = lnext(lc)));
-	jinfo->local_conds = lfirst((lc = lnext(lc)));
-	jinfo->select_vars = lfirst((lc = lnext(lc)));
-	jinfo->select_qry = strVal((lc = lnext(lc)));
+	foreach (lc, custom_private)
+	{
+		switch (index)
+		{
+			case PgCust_FdwServUserIds:
+				jinfo->fdw_server_oid = linitial_oid(lfirst(lc));
+				jinfo->fdw_user_oid = lsecond_oid(lfirst(lc));
+				break;
+			case PgCust_JoinRelids:
+				jinfo->relids = bms_from_string(strVal(lfirst(lc)));
+				break;
+			case PgCust_JoinType:
+				jinfo->jointype = (JoinType) intVal(lfirst(lc));
+				break;
+			case PgCust_OuterRel:
+				Assert(IsA(lfirst(lc), List) || IsA(lfirst(lc), Integer));
+				jinfo->outer_rel = lfirst(lc);
+				break;
+			case PgCust_InnerRel:
+				Assert(IsA(lfirst(lc), List) || IsA(lfirst(lc), Integer));
+				jinfo->inner_rel = lfirst(lc);
+				break;
+			case PgCust_RemoteConds:
+				jinfo->remote_conds = lfirst(lc);
+				break;
+			case PgCust_LocalConds:
+				jinfo->local_conds = lfirst(lc);
+				break;
+			case PgCust_SelectVars:
+				jinfo->select_vars = lfirst(lc);
+				break;
+			case PgCust_SelectParams:
+				jinfo->select_params = lfirst(lc);
+				break;
+			case PgCust_SelectSql:
+				jinfo->select_qry = strVal(lfirst(lc));
+				break;
+			default:
+				elog(ERROR, "unexpected member in remote join relinfo");
+		}
+		index++;
+	}
 }
 
 #if 0
@@ -2720,7 +2781,7 @@ dumpPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
 	elog(INFO, "remote_conds = %s", nodeToString(jinfo->remote_conds));
 	elog(INFO, "local_conds = %s", nodeToString(jinfo->local_conds));
 	elog(INFO, "select_vars = %s", nodeToString(jinfo->select_vars));
-	elog(INFO, "select_qry = %s", nodeToString(jinfo->select_qry));
+	elog(INFO, "select_qry = %s", jinfo->select_qry);
 }
 #endif
 
@@ -2900,75 +2961,14 @@ postgresAddJoinPaths(PlannerInfo *root,
 	add_path(joinrel, &cpath->path);
 }
 
-/*
- *
- *
- */
-static bool
-fixup_remote_join_recursive(Node *node, List **select_vars)
-{
-	if (node == NULL)
-		return false;
-	if (IsA(node, Var))
-	{
-		Var		   *var = (Var *) node;
-		ListCell   *lc;
-		int			index = 1;
-
-		foreach (lc, *select_vars)
-		{
-			Var	   *entry = (Var *) lfirst(lc);
-
-			if (var->varno == entry->varno &&
-				var->varattno == entry->varattno)
-			{
-				Assert(var->vartype == entry->vartype);
-				Assert(var->vartypmod == entry->vartypmod);
-				Assert(var->varcollid == entry->varcollid);
-
-				var->varno = CUSTOM_VAR;
-				var->varattno = index;
-
-				return false;
-			}
-		}
-		/* add a new entry to the select list */
-		*select_vars = lappend(*select_vars, copyObject(node));
-
-		var->varno = CUSTOM_VAR;
-		var->varattno = list_length(*select_vars);
-
-		return false;
-	}
-	return expression_tree_walker(node, fixup_remote_join_recursive,
-								  (void *) select_vars);
-}
-
-static List *
-fixup_remote_join_varattno(PlannerInfo *root, CustomScan *cscan_plan)
-{
-	Plan   *plan = &cscan_plan->scan.plan;
-	List   *select_vars = NIL;
-
-	fixup_remote_join_recursive((Node *)plan->targetlist, &select_vars);
-	fixup_remote_join_recursive((Node *)plan->qual, &select_vars);
-
-	return select_vars;
-}
-
 static void
 postgresSetupCustomScan(PlannerInfo *root,
 						CustomPath *cscan_path,
 						CustomScan *cscan_plan)
 {
-	RelOptInfo		   *joinrel = cscan_path->path.parent;
-	RelOptInfo		   *baserel;
+	//RelOptInfo		   *joinrel = cscan_path->path.parent;
 	PgRemoteJoinInfo	jinfo;
 	StringInfoData		sql;
-	Bitmapset		   *temp;
-	int					rtindex;
-	bool				is_first = true;
-	List			   *param_list = NIL;
 
 	Assert(cscan_path->path.parent->reloptkind == RELOPT_JOINREL);
 	unpackPgRemoteJoinInfo(&jinfo, cscan_path->custom_private);
@@ -2980,42 +2980,117 @@ postgresSetupCustomScan(PlannerInfo *root,
 	 */
 	jinfo.local_conds = extract_actual_clauses(jinfo.local_conds, false);
 	jinfo.remote_conds = extract_actual_clauses(jinfo.remote_conds, false);
-	jinfo.select_vars = fixup_remote_join_varattno(root, cscan_plan);
+	cscan_plan->scan.plan.qual = jinfo.local_conds;
+	cscan_plan->custom_exprs = jinfo.remote_conds;
+
+
+	//jinfo.select_vars = fixup_remote_join_varattno(root, cscan_plan);
 
 	//dumpPgRemoteJoinInfo(&jinfo);
 
 	initStringInfo(&sql);
-	deparseRemoteJoinSql(&sql, root,
-						 cscan_path->custom_private,
-						 jinfo.select_vars,
-						 jinfo.remote_conds,
-						 &param_list);
+	deparseRemoteJoinSql(&sql, root, cscan_path->custom_private,
+						 cscan_plan->scan.plan.targetlist,
+						 cscan_plan->scan.plan.qual,
+						 &jinfo.select_vars, &jinfo.select_params);
+	jinfo.select_qry = sql.data;
 
-	Assert(!bms_is_empty(joinrel->relids));
-	temp = bms_copy(joinrel->relids);
-	while ((rtindex = bms_first_member(temp)) >= 0)
+	cscan_plan->custom_private = packPgRemoteJoinInfo(&jinfo);
+}
+
+typedef struct {
+	PlannerInfo *root;
+	List   *select_vars;
+	int		rtoffset;
+} fixup_remote_join_context;
+
+static Node *
+fixup_remote_join_mutator(Node *node, fixup_remote_join_context *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
 	{
-		PgFdwRelationInfo *fpinfo;
+		Var		   *newvar = (Var *) copyObject(node);
+		ListCell   *lc;
+		AttrNumber	resno;
 
-		baserel = root->simple_rel_array[rtindex];
-		Assert(baserel->reloptkind == RELOPT_BASEREL);
-
-		fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
-		if (fpinfo->remote_conds)
+		resno = 1;
+		foreach (lc, context->select_vars)
 		{
-			appendWhereClause(&sql, root, baserel, fpinfo->remote_conds,
-							  is_first, false, &param_list);
-			is_first = false;
+			Var	   *selvar = (Var *) lfirst(lc);
+
+			Assert(newvar->varlevelsup == 0);
+			if (newvar->varno == selvar->varno &&
+				newvar->varattno == selvar->varattno)
+			{
+				Assert(newvar->vartype == selvar->vartype);
+				Assert(newvar->vartypmod == selvar->vartypmod);
+				Assert(newvar->varcollid == selvar->varcollid);
+
+				newvar->varno = CUSTOM_VAR;
+				newvar->varattno = resno;
+
+				return (Node *) newvar;
+			}
+			resno++;
 		}
 	}
-	jinfo.select_qry = sql.data;
-	elog(INFO, "query => %s", jinfo.select_qry);
+	if (IsA(node, CurrentOfExpr))
+	{
+		CurrentOfExpr *cexpr = (CurrentOfExpr *) copyObject(node);
 
-	//remote_join_varattno_fixup(root, joinrel, outerrel, innerrel,
-	//						   j_local_conds, j_remote_conds);
-	cscan_plan->scan.plan.qual = jinfo.local_conds;
-	cscan_plan->custom_exprs = jinfo.remote_conds;
-	cscan_plan->custom_private = packPgRemoteJoinInfo(&jinfo);
+		Assert(cexpr->cvarno != INNER_VAR);
+		Assert(cexpr->cvarno != OUTER_VAR);
+		if (!IS_SPECIAL_VARNO(cexpr->cvarno))
+			cexpr->cvarno += context->rtoffset;
+		return (Node *) cexpr;
+	}
+	if (IsA(node, PlaceHolderVar))
+	{
+		/* At scan level, we should always just evaluate the contained expr */
+		PlaceHolderVar *phv = (PlaceHolderVar *) node;
+
+		return fixup_remote_join_mutator((Node *) phv->phexpr, context);
+	}
+	fix_expr_common(context->root, node);
+	return expression_tree_mutator(node, fixup_remote_join_mutator,
+								   (void *) context);
+}
+
+static Node *
+fixup_remote_join_expr(Node *node, PlannerInfo *root,
+					   List *select_vars, int rtoffset)
+{
+	fixup_remote_join_context context;
+
+	context.root = root;
+	context.select_vars = select_vars;
+	context.rtoffset = rtoffset;
+
+	return fixup_remote_join_mutator(node, &context);
+}
+
+static void
+postgresSetPlanRefCustomScan(PlannerInfo *root,
+							 CustomScan *csplan,
+							 int rtoffset)
+{
+	PgRemoteJoinInfo	jinfo;
+
+	Assert(csplan->scan.scanrelid == 0);
+
+	unpackPgRemoteJoinInfo(&jinfo, csplan->custom_private);
+
+	csplan->scan.plan.targetlist =
+		(List *) fixup_remote_join_expr((Node *)csplan->scan.plan.targetlist,
+										root, jinfo.select_vars, rtoffset);
+	csplan->scan.plan.qual =
+		(List *) fixup_remote_join_expr((Node *)csplan->scan.plan.qual,
+										root, jinfo.select_vars, rtoffset);
+	csplan->custom_exprs =
+		(List *) fixup_remote_join_expr((Node *)csplan->custom_exprs,
+										root, jinfo.select_vars, rtoffset);
 }
 
 static void
@@ -3042,8 +3117,12 @@ postgresExplainCustomScan(CustomScanState *csstate,
 {
 	if (es->verbose)
 	{
+		PgRemoteJoinInfo jinfo;
+		CustomScan *cscan = (CustomScan *)csstate->ss.ps.plan;
 
+		unpackPgRemoteJoinInfo(&jinfo, cscan->custom_private);
 
+		ExplainPropertyText("Remote SQL", jinfo.select_qry, es);
 	}
 }
 
@@ -3066,12 +3145,13 @@ _PG_init(void)
 	/* registration of custom scan provider */
 	memset(&provider, 0, sizeof(provider));
 	snprintf(provider.name, sizeof(provider.name), "postgres-fdw");
-	provider.SetupCustomScan   = postgresSetupCustomScan;
-	provider.BeginCustomScan   = postgresBeginCustomScan;
-	provider.ExecCustomScan    = postgresExecCustomScan;
-	provider.EndCustomScan     = postgresEndCustomScan;
-	provider.ReScanCustomScan  = postgresReScanCustomScan;
-	provider.ExplainCustomScan = postgresExplainCustomScan;
+	provider.SetupCustomScan      = postgresSetupCustomScan;
+	provider.SetPlanRefCustomScan = postgresSetPlanRefCustomScan;
+	provider.BeginCustomScan      = postgresBeginCustomScan;
+	provider.ExecCustomScan       = postgresExecCustomScan;
+	provider.EndCustomScan        = postgresEndCustomScan;
+	provider.ReScanCustomScan     = postgresReScanCustomScan;
+	provider.ExplainCustomScan    = postgresExplainCustomScan;
 
 	register_custom_provider(&provider);
 }

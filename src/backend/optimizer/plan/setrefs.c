@@ -17,6 +17,7 @@
 
 #include "access/transam.h"
 #include "catalog/pg_type.h"
+#include "executor/nodeCustom.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/pathnode.h"
@@ -568,8 +569,6 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 			{
 				ForeignScan *splan = (ForeignScan *) plan;
 
-				// XXX - to be considered deeply, later.
-
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
@@ -582,9 +581,13 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 
 		case T_CustomScan:
 			{
-				CustomScan *splan = (CustomScan *) plan;
+				CustomScan	   *splan = (CustomScan *) plan;
+				CustomProvider *provider
+					= get_custom_provider(splan->custom_name);
 
-				if (splan->scan.scanrelid > 0)
+				if (provider->SetPlanRefCustomScan)
+					provider->SetPlanRefCustomScan(root, splan, rtoffset);
+				else if (splan->scan.scanrelid > 0)
 				{
 					splan->scan.scanrelid += rtoffset;
 					splan->scan.plan.targetlist =
@@ -596,9 +599,7 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 						fix_scan_list(root, splan->custom_exprs, rtoffset);
 				}
 				else
-				{
-
-				}
+					elog(ERROR, "No implementation to set plan reference");
 			}
 			break;
 
@@ -1083,7 +1084,7 @@ copyVar(Var *var)
  * We assume it's okay to update opcode info in-place.  So this could possibly
  * scribble on the planner's input data structures, but it's OK.
  */
-static void
+void
 fix_expr_common(PlannerInfo *root, Node *node)
 {
 	/* We assume callers won't call us on a NULL pointer */

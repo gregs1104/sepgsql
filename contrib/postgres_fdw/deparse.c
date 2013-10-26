@@ -44,6 +44,7 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/pathnode.h"
@@ -108,6 +109,8 @@ static void deparseTargetList(StringInfo buf,
 				  PlannerInfo *root,
 				  Index rtindex,
 				  Relation rel,
+				  bool first,
+				  bool qualified,
 				  Bitmapset *attrs_used,
 				  List **retrieved_attrs);
 static void deparseReturningList(StringInfo buf, PlannerInfo *root,
@@ -681,8 +684,8 @@ deparseSelectSql(StringInfo buf,
 	 * Construct SELECT list
 	 */
 	appendStringInfoString(buf, "SELECT ");
-	deparseTargetList(buf, root, baserel->relid, rel, attrs_used,
-					  retrieved_attrs);
+	deparseTargetList(buf, root, baserel->relid, rel, true, false,
+					  attrs_used, retrieved_attrs);
 
 	/*
 	 * Construct FROM clause
@@ -705,12 +708,13 @@ deparseTargetList(StringInfo buf,
 				  PlannerInfo *root,
 				  Index rtindex,
 				  Relation rel,
+				  bool first,
+				  bool qualified,
 				  Bitmapset *attrs_used,
 				  List **retrieved_attrs)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	bool		have_wholerow;
-	bool		first;
 	int			i;
 
 	*retrieved_attrs = NIL;
@@ -719,7 +723,6 @@ deparseTargetList(StringInfo buf,
 	have_wholerow = bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
 								  attrs_used);
 
-	first = true;
 	for (i = 1; i <= tupdesc->natts; i++)
 	{
 		Form_pg_attribute attr = tupdesc->attrs[i - 1];
@@ -736,6 +739,8 @@ deparseTargetList(StringInfo buf,
 				appendStringInfoString(buf, ", ");
 			first = false;
 
+			if (qualified)
+				appendStringInfo(buf, "r%d.", rtindex);
 			deparseColumnRef(buf, rtindex, i, false, root);
 
 			*retrieved_attrs = lappend_int(*retrieved_attrs, i);
@@ -973,37 +978,18 @@ deparseReturningList(StringInfo buf, PlannerInfo *root,
 				   &attrs_used);
 
 	appendStringInfoString(buf, " RETURNING ");
-	deparseTargetList(buf, root, rtindex, rel, attrs_used,
-					  retrieved_attrs);
+	deparseTargetList(buf, root, rtindex, rel, true, false,
+					  attrs_used, retrieved_attrs);
 }
 
 /****/
 static void
-deparseRemoteJoinTargetList(StringInfo buf, PlannerInfo *root,
-							List *select_vars)
-{
-	ListCell   *lc;
-	bool		is_first = true;
-
-	foreach (lc, select_vars)
-	{
-		Var		   *var = lfirst(lc);
-
-		Assert(IsA(var, Var));
-		if (!is_first)
-			appendStringInfoString(buf, ", ");
-		deparseColumnRef(buf, var->varno, var->varattno, true, root);
-		is_first = false;
-	}
-
-	/* Don't generate bad syntax if no columns were referenced */
-	if (is_first)
-		appendStringInfoString(buf, "NULL");
-}
-
-static void
-deparseRemoteJoinRelation(StringInfo buf, PlannerInfo *root,
-						  Node *relinfo, List **param_list)
+deparseRemoteJoinRelation(StringInfo tlist_buf,
+						  StringInfo from_buf,
+						  StringInfo where_buf,
+						  PlannerInfo *root, Node *relinfo,
+						  List *target_list, List *local_conds,
+						  List **select_vars, List **select_params)
 {
 	if (IsA(relinfo, List))
 	{
@@ -1011,46 +997,85 @@ deparseRemoteJoinRelation(StringInfo buf, PlannerInfo *root,
 
 		unpackPgRemoteJoinInfo(&jinfo, (List *)relinfo);
 
-		appendStringInfoChar(buf, '(');
-		deparseRemoteJoinRelation(buf, root, jinfo.inner_rel, param_list);
+		appendStringInfoChar(from_buf, '(');
+		deparseRemoteJoinRelation(tlist_buf, from_buf, where_buf,
+								  root, jinfo.outer_rel,
+								  target_list, local_conds,
+								  select_vars, select_params);
 		switch (jinfo.jointype)
 		{
 			case JOIN_INNER:
-				appendStringInfoString(buf, " JOIN ");
+				appendStringInfoString(from_buf, " JOIN ");
 				break;
 			case JOIN_LEFT:
-				appendStringInfoString(buf, " LEFT JOIN ");
+				appendStringInfoString(from_buf, " LEFT JOIN ");
 				break;
 			case JOIN_FULL:
-				appendStringInfoString(buf, " FULL JOIN ");
+				appendStringInfoString(from_buf, " FULL JOIN ");
 				break;
 			case JOIN_RIGHT:
-				appendStringInfoString(buf, " RIGHT JOIN ");
+				appendStringInfoString(from_buf, " RIGHT JOIN ");
 				break;
 			default:
 				elog(ERROR, "unexpected join type: %d", (int)jinfo.jointype);
 				break;
 		}
-		deparseRemoteJoinRelation(buf, root, jinfo.outer_rel, param_list);
-
+		deparseRemoteJoinRelation(tlist_buf, from_buf, where_buf,
+								  root, jinfo.inner_rel,
+								  target_list, local_conds,
+								  select_vars, select_params);
 		if (jinfo.remote_conds)
 		{
 			RelOptInfo *joinrel = find_join_rel(root, jinfo.relids);
 
-			appendWhereClause(buf, root, joinrel, jinfo.remote_conds,
-							  true, true, param_list);
+			appendWhereClause(from_buf, root, joinrel,
+							  jinfo.remote_conds,
+							  true, true, select_params);
 		}
-		appendStringInfoChar(buf, ')');
+		appendStringInfoChar(from_buf, ')');
 	}
 	else if (IsA(relinfo, Integer))
 	{
 		Index			rtindex = intVal(relinfo);
 		RangeTblEntry  *rte = planner_rt_fetch(rtindex, root);
+		RelOptInfo	   *baserel = root->simple_rel_array[rtindex];
 		Relation		rel;
+		TupleDesc		tupdesc;
+		Bitmapset	   *attrs_used = NULL;
+		List		   *retrieved_attrs = NIL;
+		ListCell	   *lc;
+		PgFdwRelationInfo *fpinfo;
 
 		rel = heap_open(rte->relid, NoLock);
-		deparseRelation(buf, rel);
-		appendStringInfo(buf, " r%d", rtindex);
+		deparseRelation(from_buf, rel);
+		appendStringInfo(from_buf, " r%d", rtindex);
+
+		pull_varattnos((Node *) target_list, rtindex, &attrs_used);
+		pull_varattnos((Node *) local_conds, rtindex, &attrs_used);
+		deparseTargetList(tlist_buf, root, rtindex, rel,
+						  (bool)(tlist_buf->len == 0), true,
+						  attrs_used, &retrieved_attrs);
+
+		tupdesc = RelationGetDescr(rel);
+		foreach (lc, retrieved_attrs)
+		{
+			AttrNumber	anum = lfirst_int(lc);
+			Form_pg_attribute attr = tupdesc->attrs[anum - 1];
+
+			*select_vars = lappend(*select_vars,
+								   makeVar(rtindex,
+										   anum,
+										   attr->atttypid,
+										   attr->atttypmod,
+										   attr->attcollation,
+										   0));
+		}
+
+		fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
+		if (fpinfo->remote_conds)
+			appendWhereClause(where_buf, root, baserel, fpinfo->remote_conds,
+							  where_buf->len == 0, false, select_params);
+
 		heap_close(rel, NoLock);
 	}
 	else
@@ -1060,16 +1085,30 @@ deparseRemoteJoinRelation(StringInfo buf, PlannerInfo *root,
 void
 deparseRemoteJoinSql(StringInfo buf, PlannerInfo *root,
 					 List *relinfo,
-					 List *select_vars,
-					 List *remote_expr,
-					 List **param_list)
+					 List *target_list,
+					 List *local_conds,
+					 List **select_vars,
+					 List **select_params)
 {
-	Assert(IsA(relinfo, List));
+	StringInfoData	tlist_buf;
+	StringInfoData	from_buf;
+	StringInfoData	where_buf;
 
-	appendStringInfoString(buf, "SELECT ");
-	deparseRemoteJoinTargetList(buf, root, select_vars);
-	appendStringInfoString(buf, " FROM ");
-	deparseRemoteJoinRelation(buf, root, (Node *)relinfo, param_list);
+	Assert(IsA(relinfo, List));
+	initStringInfo(&tlist_buf);
+	initStringInfo(&from_buf);
+	initStringInfo(&where_buf);
+
+	deparseRemoteJoinRelation(&tlist_buf, &from_buf, &where_buf,
+							  root, (Node *)relinfo,
+							  target_list, local_conds,
+							  select_vars, select_params);
+	appendStringInfo(buf, "SELECT %s FROM %s%s",
+					 tlist_buf.len > 0 ? tlist_buf.data : "NULL",
+					 from_buf.data,
+					 where_buf.len > 0 ? where_buf.data : "");
+	pfree(tlist_buf.data);
+	pfree(from_buf.data);
 }
 
 /*

@@ -21,6 +21,9 @@
 typedef void (*SetupCustomScan_function)(PlannerInfo *root,
 										 CustomPath *cscan_path,
 										 CustomScan *cscan_plan);
+typedef void (*SetPlanRefCustomScan_function)(PlannerInfo *root,
+											  CustomScan *cscan_plan,
+											  int rtoffset);
 typedef void (*BeginCustomScan_function)(CustomScanState *csstate, int eflags);
 typedef TupleTableSlot *(*ExecCustomScan_function)(CustomScanState *csstate);
 typedef Node *(*MultiExecCustomScan_function)(CustomScanState *csstate);
@@ -38,6 +41,7 @@ typedef struct CustomProvider
 	char							name[NAMEDATALEN];
 
 	SetupCustomScan_function		SetupCustomScan;
+	SetPlanRefCustomScan_function	SetPlanRefCustomScan;
 
 	BeginCustomScan_function		BeginCustomScan;
 	ExecCustomScan_function			ExecCustomScan;
