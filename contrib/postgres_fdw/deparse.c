@@ -1028,10 +1028,14 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 		if (jinfo.remote_conds)
 		{
 			RelOptInfo *joinrel = find_join_rel(root, jinfo.relids);
-
 			appendWhereClause(from_buf, root, joinrel,
 							  jinfo.remote_conds,
-							  true, true, true, select_params);
+                              true, true, true, select_params);
+		}
+		else
+		{
+			/* prevent syntax error */
+			appendStringInfoString(from_buf, " ON true");
 		}
 		appendStringInfoChar(from_buf, ')');
 	}

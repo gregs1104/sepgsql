@@ -18,9 +18,9 @@
 /*
  * Definition of the custom execution provider callbacks
  */
-typedef void (*SetupCustomScan_function)(PlannerInfo *root,
-										 CustomPath *cscan_path,
-										 CustomScan *cscan_plan);
+typedef void (*InitCustomScanPlan_function)(PlannerInfo *root,
+											CustomPath *cscan_path,
+											CustomScan *cscan_plan);
 typedef void (*SetPlanRefCustomScan_function)(PlannerInfo *root,
 											  CustomScan *cscan_plan,
 											  int rtoffset);
@@ -40,7 +40,7 @@ typedef struct CustomProvider
 {
 	char							name[NAMEDATALEN];
 
-	SetupCustomScan_function		SetupCustomScan;
+	InitCustomScanPlan_function		InitCustomScanPlan;
 	SetPlanRefCustomScan_function	SetPlanRefCustomScan;
 
 	BeginCustomScan_function		BeginCustomScan;
@@ -55,10 +55,13 @@ typedef struct CustomProvider
 	ExplainCustomScan_function		ExplainCustomScan;
 } CustomProvider;
 
-/* custom_flags */
-#define CUSTOM__RETURNS_SYSTEM_COLUMNS			0x0001
-#define CUSTOM__EXPLAIN_UNDERLYING_PLANS		0x0002
-#define CUSTOM__SUPPORT_BACKWARD_SCAN			0x0004
+/* Flags of CustomScan */
+
+/*
+ * CUSTOM__SUPPORT_MARK_RESTORE informs optimizer this custom scan provider
+ * support ExecCustomMarkPos and ExecCustomRestrPos callbacks.
+ */
+#define CUSTOM__SUPPORT_MARK_RESTORE			0x0001
 
 /*
  * Registration and lookup custom execution provider
@@ -77,5 +80,7 @@ extern Node *MultiExecCustomScan(CustomScanState *csstate);
 extern void ExecEndCustomScan(CustomScanState *csstate);
 
 extern void ExecReScanCustomScan(CustomScanState *csstate);
+extern void ExecCustomMarkPos(CustomScanState *csstate);
+extern void ExecCustomRestrPos(CustomScanState *csstate);
 
 #endif	/* NODECUSTOM_H */

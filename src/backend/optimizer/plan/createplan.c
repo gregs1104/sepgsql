@@ -2090,7 +2090,7 @@ create_customscan_plan(PlannerInfo *root,
 	 * Let custom scan provider perform to set up this custom-scan plan
 	 * according to the given path information. 
 	 */
-	provider->SetupCustomScan(root, best_path, scan_plan);
+	provider->InitCustomScanPlan(root, best_path, scan_plan);
 
 	/* Copy cost data from Path to Plan; no need to make callback do this */
 	copy_path_costsize(&scan_plan->scan.plan, &best_path->path);
