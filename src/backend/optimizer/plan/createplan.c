@@ -87,7 +87,6 @@ static MergeJoin *create_mergejoin_plan(PlannerInfo *root, MergePath *best_path,
 					  Plan *outer_plan, Plan *inner_plan);
 static HashJoin *create_hashjoin_plan(PlannerInfo *root, HashPath *best_path,
 					 Plan *outer_plan, Plan *inner_plan);
-static Node *replace_nestloop_params(PlannerInfo *root, Node *expr);
 static Node *replace_nestloop_params_mutator(Node *node, PlannerInfo *root);
 static void process_subquery_nestloop_params(PlannerInfo *root,
 								 List *subplan_params);
@@ -2075,8 +2074,9 @@ create_customscan_plan(PlannerInfo *root,
 	else
 		elog(ERROR, "unexpected reloptkind: %d", (int)reloptkind);
 
-	scan_plan->scan.plan.targetlist = tlist;
-	scan_plan->scan.plan.qual = order_qual_clauses(root, scan_clauses);
+	scan_clauses = order_qual_clauses(root, scan_clauses);
+	scan_plan->scan.plan.targetlist = NULL;	/* to be set by callback */
+	scan_plan->scan.plan.qual = NULL;		/* to be set by callback */
 	scan_plan->scan.plan.lefttree = NULL;
 	scan_plan->scan.plan.righttree = NULL;
 	scan_plan->scan.scanrelid = scan_relid;
@@ -2090,7 +2090,8 @@ create_customscan_plan(PlannerInfo *root,
 	 * Let custom scan provider perform to set up this custom-scan plan
 	 * according to the given path information. 
 	 */
-	provider->InitCustomScanPlan(root, best_path, scan_plan);
+	provider->InitCustomScanPlan(root, scan_plan,
+								 best_path, tlist, scan_clauses);
 
 	/* Copy cost data from Path to Plan; no need to make callback do this */
 	copy_path_costsize(&scan_plan->scan.plan, &best_path->path);
@@ -2646,7 +2647,7 @@ create_hashjoin_plan(PlannerInfo *root,
  * root->curOuterRels are replaced by Params, and entries are added to
  * root->curOuterParams if not already present.
  */
-static Node *
+Node *
 replace_nestloop_params(PlannerInfo *root, Node *expr)
 {
 	/* No setup needed for tree walk, so away we go */

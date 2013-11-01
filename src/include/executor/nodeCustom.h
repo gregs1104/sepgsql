@@ -19,8 +19,10 @@
  * Definition of the custom execution provider callbacks
  */
 typedef void (*InitCustomScanPlan_function)(PlannerInfo *root,
+											CustomScan *cscan_plan,
 											CustomPath *cscan_path,
-											CustomScan *cscan_plan);
+											List *tlist,
+											List *scan_clauses);
 typedef void (*SetPlanRefCustomScan_function)(PlannerInfo *root,
 											  CustomScan *cscan_plan,
 											  int rtoffset);

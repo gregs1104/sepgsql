@@ -159,15 +159,19 @@ DESCR("equal");
 #define TIDEqualOperator   387
 DATA(insert OID = 402 (  "<>"	   PGNSP PGUID b f f	27	27	16 402 387 tidne neqsel neqjoinsel ));
 DESCR("not equal");
+#define TIDNotEqualOperator	402
 DATA(insert OID = 2799 (  "<"	   PGNSP PGUID b f f	27	27	16 2800 2802 tidlt scalarltsel scalarltjoinsel ));
 DESCR("less than");
 #define TIDLessOperator    2799
 DATA(insert OID = 2800 (  ">"	   PGNSP PGUID b f f	27	27	16 2799 2801 tidgt scalargtsel scalargtjoinsel ));
 DESCR("greater than");
+#define TIDGreaterOperator		2800
 DATA(insert OID = 2801 (  "<="	   PGNSP PGUID b f f	27	27	16 2802 2800 tidle scalarltsel scalarltjoinsel ));
 DESCR("less than or equal");
+#define TIDLessEqualOperator	2801
 DATA(insert OID = 2802 (  ">="	   PGNSP PGUID b f f	27	27	16 2801 2799 tidge scalargtsel scalargtjoinsel ));
 DESCR("greater than or equal");
+#define TIDGreaterEqualOperator	2802
 
 DATA(insert OID = 410 ( "="		   PGNSP PGUID b t t	20	20	16 410 411 int8eq eqsel eqjoinsel ));
 DESCR("equal");
