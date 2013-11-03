@@ -96,9 +96,11 @@ CTidEstimateCosts(PlannerInfo *root,
 	List	   *ctidquals = cpath->custom_private;
 	ListCell   *lc;
 	double		ntuples;
-	BlockNumber	bnum_min = 0;
-	BlockNumber	bnum_max = baserel->pages;
-	bool		has_const = false;
+	ItemPointerData ip_min;
+	ItemPointerData ip_max;
+	bool		has_min_val = false;
+	bool		has_max_val = false;
+	BlockNumber	num_pages;
 	Cost		startup_cost = 0;
 	Cost		run_cost = 0;
 	Cost		cpu_per_tuple;
@@ -117,6 +119,8 @@ CTidEstimateCosts(PlannerInfo *root,
 		ntuples = cpath->path.rows = baserel->rows;
 
 	/* Estimate how many tuples we may retrieve */
+	ItemPointerSet(&ip_min, 0, 0);
+	ItemPointerSet(&ip_max, MaxBlockNumber, MaxOffsetNumber);
 	foreach (lc, ctidquals)
 	{
 		OpExpr	   *op = lfirst(lc);
@@ -140,33 +144,59 @@ CTidEstimateCosts(PlannerInfo *root,
 		if (IsA(other, Const))
 		{
 			ItemPointer	ip = (ItemPointer)(((Const *) other)->constvalue);
-			BlockNumber	bnum = ItemPointerGetBlockNumber(ip);
 
 			switch (opno)
 			{
 				case TIDLessOperator:
 				case TIDLessEqualOperator:
-					if (bnum < bnum_max)
-						bnum_max = bnum;
+					if (ItemPointerCompare(ip, &ip_max) < 0)
+						ItemPointerCopy(ip, &ip_max);
+					has_max_val = true;
 					break;
 				case TIDGreaterOperator:
 				case TIDGreaterEqualOperator:
-					if (bnum > bnum_min)
-						bnum_min = (bnum < baserel->pages ?
-									bnum : baserel->pages);
+					if (ItemPointerCompare(ip, &ip_min) > 0)
+						ItemPointerCopy(ip, &ip_min);
+					has_min_val = true;
 					break;
 				default:
 					elog(ERROR, "unexpected operator code: %u", op->opno);
 					break;
 			}
-			has_const = true;
 		}
 	}
 
-	if (has_const)
-		ntuples *= ((double)(bnum_max - bnum_min)) / ((double) baserel->pages);
+	if (has_min_val && has_max_val)
+	{
+		BlockNumber	bnum_max = BlockIdGetBlockNumber(&ip_max.ip_blkid);
+		BlockNumber	bnum_min = BlockIdGetBlockNumber(&ip_min.ip_blkid);
+
+		bnum_max = Min(bnum_max, baserel->pages);
+		bnum_min = Max(bnum_min, 0);
+		num_pages = Min(bnum_max - bnum_min + 1, 1);
+	}
+	else if (has_min_val)
+	{
+		BlockNumber	bnum_max = baserel->pages;
+		BlockNumber	bnum_min = BlockIdGetBlockNumber(&ip_min.ip_blkid);
+
+		bnum_min = Max(bnum_min, 0);
+		num_pages = Min(bnum_max - bnum_min + 1, 1);
+	}
+	else if (has_max_val)
+	{
+		BlockNumber	bnum_max = BlockIdGetBlockNumber(&ip_max.ip_blkid);
+		BlockNumber	bnum_min = 0;
+
+		bnum_max = Min(bnum_max, baserel->pages);
+		num_pages = Min(bnum_max - bnum_min + 1, 1);
+	}
 	else
-		ntuples *= 0.5;
+	{
+		/* just a rough estimation */
+		num_pages = Max((baserel->pages + 1) / 2, 1);
+	}
+	ntuples *= ((double) num_pages) / ((double) baserel->pages);
 
 	/*
 	 * The TID qual expressions will be computed once, any other baserestrict
@@ -305,8 +335,14 @@ CTidEvalScanZone(CustomScanState *node)
 	ExprContext	   *econtext = node->ss.ps.ps_ExprContext;
 	ListCell	   *lc;
 
-	ItemPointerSetInvalid(&ctss->ip_min);
-	ItemPointerSetInvalid(&ctss->ip_max);
+	/*
+	 * See ItemPointerCompare(), ip_min_comp shall be usually 0 or -1,
+	 * if ip_min is valid. "1" means the compared itemptr is either less,
+	 * equal or greater, thus, it matches any values; that is equivalent
+	 * to open-end. It is similar on "-1" for ip_max_comp.
+	 */
+	ctss->ip_min_comp = -1;
+	ctss->ip_max_comp = 1;
 
 	foreach (lc, ctss->ctid_quals)
 	{
@@ -339,34 +375,38 @@ CTidEvalScanZone(CustomScanState *node)
 													  NULL));
 		if (!isnull && ItemPointerIsValid(itemptr))
 		{
-			switch (op->opno)
+			switch (opno)
 			{
 				case TIDLessOperator:
-					if (ItemPointerCompare(itemptr, &ctss->ip_max) <= 0)
+					if (ctss->ip_max_comp > 0 ||
+						ItemPointerCompare(itemptr, &ctss->ip_max) <= 0)
 					{
 						ItemPointerCopy(itemptr, &ctss->ip_max);
 						ctss->ip_max_comp = -1;
 					}
 					break;
 				case TIDLessEqualOperator:
-					if (ItemPointerCompare(itemptr, &ctss->ip_max) <= 0)
+					if (ctss->ip_max_comp > 0 ||
+						ItemPointerCompare(itemptr, &ctss->ip_max) < 0)
 					{
 						ItemPointerCopy(itemptr, &ctss->ip_max);
 						ctss->ip_max_comp = 0;
 					}
 					break;
 				case TIDGreaterOperator:
-					if (ItemPointerCompare(itemptr, &ctss->ip_min) >= 0)
-					{
-						ItemPointerCopy(itemptr, &ctss->ip_min);
-						ctss->ip_min_comp = 1;
-					}
-					break;
-				case TIDGreaterEqualOperator:
-					if (ItemPointerCompare(itemptr, &ctss->ip_min) >= 0)
+					if (ctss->ip_min_comp < 0 ||
+						ItemPointerCompare(itemptr, &ctss->ip_min) >= 0)
 					{
 						ItemPointerCopy(itemptr, &ctss->ip_min);
 						ctss->ip_min_comp = 0;
+					}
+					break;
+				case TIDGreaterEqualOperator:
+					if (ctss->ip_min_comp < 0 ||
+						ItemPointerCompare(itemptr, &ctss->ip_min) > 0)
+					{
+						ItemPointerCopy(itemptr, &ctss->ip_min);
+						ctss->ip_min_comp = 1;
 					}
 					break;
 				default:
@@ -388,10 +428,10 @@ static void
 CTidBeginCustomScan(CustomScanState *node, int eflags)
 {
 	CustomScan	   *cscan = (CustomScan *)node->ss.ps.plan;
-	Index			scanrelid = ((Scan *)&node->ss.ps.plan)->scanrelid;
+	Index			scanrelid = ((Scan *)node->ss.ps.plan)->scanrelid;
 	EState		   *estate = node->ss.ps.state;
-	CTidScanState  *ctss = palloc0(CTidScanState);
-	Relation		rel;
+	CTidScanState  *ctss = palloc0(sizeof(CTidScanState));
+	TupleDesc		tupdesc;
 
 	ctss->scanrelid = scanrelid;
 	ctss->ctid_quals = (List *)
@@ -399,19 +439,77 @@ CTidBeginCustomScan(CustomScanState *node, int eflags)
 	ctss->ip_needs_eval = true;
 
 	ExecInitScanTupleSlot(estate, &node->ss);
-	ExecInitScanTupleSlot(estate, scanstate);
+	ExecInitScanTupleSlot(estate, &node->ss);
 
 	node->ss.ss_currentRelation
 		= ExecOpenScanRelation(estate, scanrelid, eflags);
-	node->ss.ss_currentRelation
+	node->ss.ss_currentScanDesc
 		= heap_beginscan(node->ss.ss_currentRelation,
 						 estate->es_snapshot, 0, NULL);
 
-	ExecAssignScanType(node, RelationGetDescr(node->ss.ss_currentRelation));
+	tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
+	ExecAssignScanType(&node->ss, tupdesc);
 
 	node->ss.ps.ps_TupFromTlist = false;
 
-	node->custom_state = ctstate;
+	node->custom_state = ctss;
+}
+
+static bool
+CTidSeekPosition(HeapScanDesc scan, ItemPointer pos, ScanDirection direction)
+{
+	BlockNumber		bnum = BlockIdGetBlockNumber(&pos->ip_blkid);
+	OffsetNumber	offs;
+	ItemPointerData	ip;
+
+	Assert(direction == BackwardScanDirection ||
+		   direction == ForwardScanDirection);
+
+	/*
+	 * In case when block-number is out of the range, it is obvious that
+	 * no tuples shall be fetched if forward scan direction. On the other
+	 * hand, we have nothing special is backward scan direction.
+	 */
+	if (bnum >= scan->rs_nblocks)
+	{
+		if (direction == ForwardScanDirection)
+			return false;
+		else
+		{
+			heap_rescan(scan, NULL);
+			return true;
+		}
+	}
+
+	scan->rs_inited = true;
+	if (scan->rs_pageatatime)
+		offs = FirstOffsetNumber;
+	else
+		offs = ItemPointerGetOffsetNumber(pos);
+
+	ItemPointerSet(&ip, bnum, offs);
+	ItemPointerCopy(&ip, &scan->rs_mctid);
+	if (scan->rs_pageatatime)
+		scan->rs_mindex = 0;
+
+	heap_restrpos(scan);
+
+	if (scan->rs_pageatatime)
+	{
+		if (ItemPointerGetOffsetNumber(pos) < FirstOffsetNumber)
+			scan->rs_cindex = 0;
+		else if (ItemPointerGetOffsetNumber(pos) <= scan->rs_ntuples)
+			scan->rs_cindex = ItemPointerGetOffsetNumber(pos) - 1;
+		else
+			scan->rs_cindex = scan->rs_ntuples - 1;
+	}
+
+	if (direction == ForwardScanDirection)
+		heap_getnext(scan, BackwardScanDirection);
+	else
+		heap_getnext(scan, ForwardScanDirection);
+
+	return true;
 }
 
 static TupleTableSlot *
@@ -428,58 +526,51 @@ CTidAccessCustomScan(CustomScanState *node)
 		if (!CTidEvalScanZone(node))
 			return NULL;
 
-		switch (estate->es_direction)
+		if (estate->es_direction == ForwardScanDirection)
 		{
-			case ForwardScanDirection:
-				if (ItemPointerIsValid(&ctss->ip_min))
-				{
-					ItemPointerCopy(&ctss->ip_min, &scan->rs_mctid);
-					heap_restrpos(scan);
-				}
-				break;
-			case BackwardScanDirection:
-				if (ItemPointerIsValid(&ctss->ip_max))
-				{
-					ItemPointerCopy(&ctss->ip_max, &scan->rs_mctid);
-					heap_restrpos(scan);
-				}
-				break;
-			default:
-				/* do nothing, if */
-				break;
+			if (ctss->ip_min_comp != -1)
+			{
+				if (!CTidSeekPosition(scan, &ctss->ip_min,
+									  estate->es_direction))
+					return NULL;
+			}
+			else
+				heap_rescan(scan, NULL);
+		}
+		else if (estate->es_direction == BackwardScanDirection)
+		{
+			if (ctss->ip_max_comp != 1)
+			{
+				if (!CTidSeekPosition(scan, &ctss->ip_max,
+									  estate->es_direction))
+					return NULL;
+			}
+			else
+				heap_rescan(scan, NULL);
 		}
 		ctss->ip_needs_eval = false;
-	}
-
-	switch (estate->es_direction)
-	{
-		case ForwardScanDirection:
-			if (ItemPointerIsValid(&ctss->ip_max) &&
-				ItemPointerIsValid(&scan->rs_ctup.t_self) &&
-				ItemPointerCompare(&ctss->ip_max,
-								   &scan->rs_ctup.t_self) <= ctss->ip_max_comp)
-				return NULL;
-			break;
-		case BackwardScanDirection:
-			if (ItemPointerIsValid(&ctss->ip_min) &&
-				ItemPointerIsValid(&scan->rs_ctup.t_self) &&
-				ItemPointerCompare(&ctss->ip_min,
-								   &scan->rs_ctup.t_self) >= ctss->ip_min_comp)
-				return NULL;
-			break;
-		default:
-			break;
 	}
 
 	/*
 	 * get the next tuple from the table
 	 */
 	tuple = heap_getnext(scan, estate->es_direction);
+	if (!HeapTupleIsValid(tuple))
+		return NULL;
 
-	if (HeapTupleIsValid(tuple))
-		ExecStoreTuple(tuple, slot, scan->rs_cbuf, false);
-	else
-		ExecClearTuple(slot);
+	if (estate->es_direction == ForwardScanDirection)
+	{
+		if (ItemPointerCompare(&tuple->t_self,
+							   &ctss->ip_max) > ctss->ip_max_comp)
+			return NULL;
+	}
+	else if (estate->es_direction == BackwardScanDirection)
+	{
+		if (ItemPointerCompare(&scan->rs_ctup.t_self,
+							   &ctss->ip_min) < ctss->ip_min_comp)
+			return NULL;
+	}
+	ExecStoreTuple(tuple, slot, scan->rs_cbuf, false);
 
 	return slot;
 }
