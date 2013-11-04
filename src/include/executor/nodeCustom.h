@@ -64,6 +64,11 @@ typedef struct CustomProvider
  * support ExecCustomMarkPos and ExecCustomRestrPos callbacks.
  */
 #define CUSTOM__SUPPORT_MARK_RESTORE			0x0001
+
+/*
+ * CUSTOM__SUPPORT_BACKWARD_SCAN informs optimizer this custom scan provider
+ * is designed to support backward scan.
+ */
 #define CUSTOM__SUPPORT_BACKWARD_SCAN			0x0002
 
 /*

@@ -85,7 +85,6 @@ extern ModifyTable *make_modifytable(PlannerInfo *root,
 				 List *resultRelations, List *subplans,
 				 List *withCheckOptionLists, List *returningLists,
 				 List *rowMarks, int epqParam);
-extern Node *replace_nestloop_params(PlannerInfo *root, Node *expr);
 extern bool is_projection_capable_plan(Plan *plan);
 
 /*

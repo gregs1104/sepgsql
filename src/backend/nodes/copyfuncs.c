@@ -623,7 +623,7 @@ _copyCustomScan(const CustomScan *from)
 	COPY_NODE_FIELD(custom_exprs);
 
 	COPY_NODE_FIELD(subqry_plan);
-    COPY_NODE_FIELD(funcexpr);
+	COPY_NODE_FIELD(funcexpr);
 
 	return newnode;
 }

@@ -2196,7 +2196,13 @@ finalize_plan(PlannerInfo *root, Plan *plan, Bitmapset *valid_params,
 			break;
 
 		case T_CustomScan:
-			/* XXX - add here something to finalize */
+			finalize_primnode((Node *) ((CustomScan *) plan)->custom_exprs,
+							  &context);
+			context.paramids = bms_add_members(context.paramids, scan_params);
+			/*
+			 * XXX - Is it sufficient to do? Don't we need something special
+			 * if CustomScan override FunctionScan or SubqueryScan.
+			 */
 			break;
 
 		case T_ModifyTable:

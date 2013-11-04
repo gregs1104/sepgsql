@@ -485,11 +485,7 @@ typedef struct ForeignScan
 
 /* ----------------
  *		CustomScan node
- *
- *
- *
- *
- *
+ * ----------------
  */
 typedef struct CustomScan
 {

@@ -89,11 +89,10 @@ get_custom_provider(const char *custom_name)
 /*
  * ExecInitCustomScan
  *
- *
- *
- *
- *
- *
+ * Allocation of CustomScanState and various initialization stuff.
+ * Note that some of initialization jobs are skipped if scanrelid is zero
+ * (that means this custom scan plan is not associated with a particular
+ * relation in range-table list.)
  */
 CustomScanState *
 ExecInitCustomScan(CustomScan *node, EState *estate, int eflags)
@@ -101,6 +100,7 @@ ExecInitCustomScan(CustomScan *node, EState *estate, int eflags)
 	CustomProvider	   *provider = get_custom_provider(node->custom_name);
 	CustomScanState	   *csstate;
 	Plan			   *plan = &node->scan.plan;
+	Index				scanrelid = node->scan.scanrelid;
 
 	/*
 	 * Create state structure
@@ -127,36 +127,69 @@ ExecInitCustomScan(CustomScan *node, EState *estate, int eflags)
 
 	/*
 	 * tuple table initialization
+	 *
+	 * Note that ss_ScanTupleSlot is set only when scanrelid is associated
+	 * with a particular relation. Elsewhere, it needs to be initialized by
+	 * custom-scan provider itself if it internally uses ss_ScanTupleSlot.
+	 * If it replaces varno of Var node by CUSTOM_VAR, it has to be set to
+	 * reference underlying attribute name to generate EXPLAIN output.
 	 */
 	ExecInitResultTupleSlot(estate, &csstate->ss.ps);
+	if (scanrelid > 0)
+		ExecInitScanTupleSlot(estate, &csstate->ss);
 
 	/*
-	 * Final initialization with custom execution provider
-	 *
-	 * XXX - call ExecInitScanTupleSlot and ExecAssignScanType
-	 * if needed.
+	 * open the base relation and acquire appropriate lock on it,
+	 * if this custom scan is connected with a particular relaion.
+	 * Also, assign its scan type according to the table definition.
 	 */
-	csstate->custom_provider->BeginCustomScan(csstate, eflags);
+	if (scanrelid > 0)
+	{
+		Relation	rel = ExecOpenScanRelation(estate, scanrelid, eflags);
+
+		csstate->ss.ss_currentRelation = rel;
+		ExecAssignScanType(&csstate->ss, RelationGetDescr(rel));
+	}
 
 	/*
 	 * Initialize result tuple type and projection info.
 	 */
 	ExecAssignResultTypeFromTL(&csstate->ss.ps);
-	if (node->scan.scanrelid > 0)
+
+	if (scanrelid > 0)
 		ExecAssignScanProjectionInfo(&csstate->ss);
 	else
 		ExecAssignProjectionInfo(&csstate->ss.ps, NULL);
 
+	/*
+	 * Final initialization based on callback of BeginCustomScan method.
+	 * Extension may be able to override initialization stuff above, if
+	 * needed.
+	 */
+	csstate->custom_provider->BeginCustomScan(csstate, eflags);
+
 	return csstate;
 }
 
+/*
+ * ExecCustomScan
+ *
+ * Just an entrypoint of ExecCustomScan method. All the stuff to fetch
+ * a tuple is a job of custom-scan provider.
+ */
 TupleTableSlot *
 ExecCustomScan(CustomScanState *csstate)
 {
 	return csstate->custom_provider->ExecCustomScan(csstate);
 }
 
-
+/*
+ * MultiExecCustomScan
+ *
+ * Aldo, just an entrypoint of MultiExecCustomScan method. All the stuff
+ * to fetch multiple tuples (according to expectation of upper node) is
+ * a job of custom-scan provider.
+ */
 Node *
 MultiExecCustomScan(CustomScanState *csstate)
 {
@@ -166,28 +199,29 @@ MultiExecCustomScan(CustomScanState *csstate)
 /*
  * ExecEndCustomScan
  *
- *
- *
- *
+ * It releases all the resources allocated on this scan.
  */
 void
 ExecEndCustomScan(CustomScanState *csstate)
 {
 	/* Let the custom-exec shut down */
 	csstate->custom_provider->EndCustomScan(csstate);
+
 	/* Free the exprcontext */
 	ExecFreeExprContext(&csstate->ss.ps);
-	/* Clean out the tuple table */
+
+	/* Clean out the tuple table, if exists */
 	ExecClearTuple(csstate->ss.ps.ps_ResultTupleSlot);
+	if (csstate->ss.ss_ScanTupleSlot)
+		ExecClearTuple(csstate->ss.ss_ScanTupleSlot);
+
+	/* close the relation, if opened */
+	if (csstate->ss.ss_currentRelation)
+		ExecCloseScanRelation(csstate->ss.ss_currentRelation);
 }
 
 /*
  * ExecReScanCustomScan
- *
- *
- *
- *
- *
  */
 void
 ExecReScanCustomScan(CustomScanState *csstate)
@@ -195,6 +229,9 @@ ExecReScanCustomScan(CustomScanState *csstate)
 	csstate->custom_provider->ReScanCustomScan(csstate);
 }
 
+/*
+ * ExecCustomMarkPos
+ */
 void
 ExecCustomMarkPos(CustomScanState *csstate)
 {
@@ -202,6 +239,9 @@ ExecCustomMarkPos(CustomScanState *csstate)
 	csstate->custom_provider->ExecMarkPosCustomScan(csstate);
 }
 
+/*
+ * ExecCustomRestrPos
+ */
 void
 ExecCustomRestrPos(CustomScanState *csstate)
 {

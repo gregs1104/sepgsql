@@ -2050,6 +2050,11 @@ create_customscan_plan(PlannerInfo *root,
 		scan_relid = best_path->path.parent->relid;
 
 		rte = planner_rt_fetch(scan_relid, root);
+		/*
+		 * For EXPLAIN output, we save various information in CustomScan plan
+		 * structure. Custom-scan provider can utilize them, but it is not
+		 * recommendablt to adjust.
+		 */
 		if (rte->rtekind == RTE_SUBQUERY)
 		{
 			if (best_path->path.param_info)
@@ -2096,13 +2101,13 @@ create_customscan_plan(PlannerInfo *root,
 	/* Copy cost data from Path to Plan; no need to make callback do this */
 	copy_path_costsize(&scan_plan->scan.plan, &best_path->path);
 
-    /*
-     * Replace any outer-relation variables with nestloop params in the qual
-     * and fdw_exprs expressions.  We do this last so that the FDW doesn't
-     * have to be involved.  (Note that parts of fdw_exprs could have come
-     * from join clauses, so doing this beforehand on the scan_clauses
-     * wouldn't work.)
-     */
+	/*
+	 * Replace any outer-relation variables with nestloop params in the qual
+	 * and custom_exprs expressions.  We do this last so that the FDW doesn't
+	 * have to be involved.  (Note that parts of custom_exprs could have come
+	 * from join clauses, so doing this beforehand on the scan_clauses
+	 * wouldn't work.)
+	 */
 	if (best_path->path.param_info)
 	{
 		scan_plan->scan.plan.qual = (List *)
@@ -2647,7 +2652,7 @@ create_hashjoin_plan(PlannerInfo *root,
  * root->curOuterRels are replaced by Params, and entries are added to
  * root->curOuterParams if not already present.
  */
-Node *
+static Node *
 replace_nestloop_params(PlannerInfo *root, Node *expr)
 {
 	/* No setup needed for tree walk, so away we go */

@@ -369,6 +369,7 @@ CTidInitCustomScanPlan(PlannerInfo *root,
 	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
+#if 0
 	/* Replace any outer-relation variables with nestloop params */
 	if (cscan_path->path.param_info)
 	{
@@ -377,6 +378,7 @@ CTidInitCustomScanPlan(PlannerInfo *root,
 		ctidquals = (List *)
 			replace_nestloop_params(root, (Node *) ctidquals);
 	}
+#endif
 
 	/*
 	 * Most of initialization stuff was done at nodeCustomScan.c. So, all
