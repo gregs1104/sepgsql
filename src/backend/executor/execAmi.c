@@ -486,6 +486,15 @@ ExecSupportsBackwardScan(Plan *node)
 			return ExecSupportsBackwardScan(((SubqueryScan *) node)->subplan) &&
 				TargetListSupportsBackwardScan(node->targetlist);
 
+		case T_CustomScan:
+			{
+				int		flags = ((CustomScan *) node)->custom_flags;
+
+				if (flags & CUSTOM__SUPPORT_BACKWARD_SCAN)
+					return TargetListSupportsBackwardScan(node->targetlist);
+			}
+			return false;
+
 		case T_Material:
 		case T_Sort:
 			/* these don't evaluate tlist */

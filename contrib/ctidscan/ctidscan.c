@@ -1,7 +1,17 @@
 /*
  * ctidscan.c
  *
- * Definition of Custom TidScan implementation
+ * Definition of Custom TidScan implementation.
+ *
+ * It is designed to demonstrate Custom Scan APIs; that allows to override
+ * a part of executor node. This extension focus on a workload that tries
+ * to fetch records with tid larger or less than a particular value.
+ * In case when inequality operators were given, this module construct
+ * a custom scan path that enables to skip records not to be read. Then,
+ * if it was the chepest one, it shall be used to run the query.
+ * Custom Scan APIs callbacks this extension when executor tries to fetch
+ * underlying records, then it utilizes existing heap_getnext() but seek
+ * the records to be read prior to fetching the first record.
  *
  * Portions Copyright (c) 2013, PostgreSQL Global Development Group
  */
@@ -18,6 +28,7 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "storage/bufmgr.h"
 #include "storage/itemptr.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -36,6 +47,16 @@ static add_scan_path_hook_type	add_scan_path_next;
 	 ((Var *) (node))->varattno == SelfItemPointerAttributeNumber &&	\
 	 ((Var *) (node))->varlevelsup == 0)
 
+/*
+ * CTidQualFromExpr
+ *
+ * It checks whether the given restriction clauses enables to determine
+ * the zone to be scanned, or not. If one or more restriction clauses are
+ * available, it returns a list of them, or NIL elsewhere.
+ * The caller can consider all the conditions are chainned with AND-
+ * boolean operator, so all the operator works for narrowing down the
+ * scope of custom tid scan.
+ */
 static List *
 CTidQualFromExpr(Node *expr, int varno)
 {
@@ -46,6 +67,7 @@ CTidQualFromExpr(Node *expr, int varno)
 		Node   *arg2;
 		Node   *other = NULL;
 
+		/* only inequality operators are candidate */
 		if (op->opno != TIDLessOperator &&
 			op->opno != TIDLessEqualOperator &&
 			op->opno != TIDGreaterOperator &&
@@ -88,6 +110,14 @@ CTidQualFromExpr(Node *expr, int varno)
 	return NIL;
 }
 
+/*
+ * CTidEstimateCosts
+ *
+ * It estimates cost to scan the target relation according to the given
+ * restriction clauses. Its logic to scan relations are almost same as
+ * SeqScan doing, because it uses regular heap_getnext(), except for
+ * the number of tuples to be scanned if restriction clauses work well.
+*/
 static void
 CTidEstimateCosts(PlannerInfo *root,
 				  RelOptInfo *baserel,
@@ -114,9 +144,9 @@ CTidEstimateCosts(PlannerInfo *root,
 
 	/* Mark the path with the correct row estimate */
 	if (cpath->path.param_info)
-		ntuples = cpath->path.rows = cpath->path.param_info->ppi_rows;
+		cpath->path.rows = cpath->path.param_info->ppi_rows;
 	else
-		ntuples = cpath->path.rows = baserel->rows;
+		cpath->path.rows = baserel->rows;
 
 	/* Estimate how many tuples we may retrieve */
 	ItemPointerSet(&ip_min, 0, 0);
@@ -135,6 +165,7 @@ CTidEstimateCosts(PlannerInfo *root,
 		}
 		else if (IsCTIDVar(lsecond(op->args), baserel->relid))
 		{
+			/* To simplifies, we assume as if Var node is 1st argument */
 			opno = get_commutator(op->opno);
 			other = linitial(op->args);
 		}
@@ -145,6 +176,10 @@ CTidEstimateCosts(PlannerInfo *root,
 		{
 			ItemPointer	ip = (ItemPointer)(((Const *) other)->constvalue);
 
+			/*
+			 * Just an rough estimation, we don't distinct inequality and
+			 * inequality-or-equal operator.
+			 */
 			switch (opno)
 			{
 				case TIDLessOperator:
@@ -166,8 +201,12 @@ CTidEstimateCosts(PlannerInfo *root,
 		}
 	}
 
+	/* estimated number of tuples in this relation */
+	ntuples = baserel->pages * baserel->tuples;
+
 	if (has_min_val && has_max_val)
 	{
+		/* case of both side being bounded */
 		BlockNumber	bnum_max = BlockIdGetBlockNumber(&ip_max.ip_blkid);
 		BlockNumber	bnum_min = BlockIdGetBlockNumber(&ip_min.ip_blkid);
 
@@ -177,6 +216,7 @@ CTidEstimateCosts(PlannerInfo *root,
 	}
 	else if (has_min_val)
 	{
+		/* case of only lower side being bounded */
 		BlockNumber	bnum_max = baserel->pages;
 		BlockNumber	bnum_min = BlockIdGetBlockNumber(&ip_min.ip_blkid);
 
@@ -185,6 +225,7 @@ CTidEstimateCosts(PlannerInfo *root,
 	}
 	else if (has_max_val)
 	{
+		/* case of only upper side being bounded */
 		BlockNumber	bnum_max = BlockIdGetBlockNumber(&ip_max.ip_blkid);
 		BlockNumber	bnum_min = 0;
 
@@ -193,7 +234,11 @@ CTidEstimateCosts(PlannerInfo *root,
 	}
 	else
 	{
-		/* just a rough estimation */
+		/*
+		 * Just a rough estimation. We assume half of records shall be
+		 * read using this restriction clause, but undeterministic untill
+		 * executor run it actually.
+		 */
 		num_pages = Max((baserel->pages + 1) / 2, 1);
 	}
 	ntuples *= ((double) num_pages) / ((double) baserel->pages);
@@ -217,7 +262,10 @@ CTidEstimateCosts(PlannerInfo *root,
 							  cpath->path.param_info,
 							  &qpqual_cost);
 
-	/* XXX currently we assume TID quals are a subset of qpquals */
+	/*
+	 * We don't decrease cost for the inequality operators, because 
+	 * it is subset of qpquals and still in.
+	 */
 	startup_cost += qpqual_cost.startup + ctid_qual_cost.per_tuple;
 	cpu_per_tuple = cpu_tuple_cost + qpqual_cost.per_tuple -
 		ctid_qual_cost.per_tuple;
@@ -227,6 +275,12 @@ CTidEstimateCosts(PlannerInfo *root,
 	cpath->path.total_cost = startup_cost + run_cost;
 }
 
+/*
+ * CTidAddScanPath
+ *
+ * It adds a custom scan path if inequality operators are given on the
+ * relation to be scanned and makes sense to reduce number of tuples.
+ */
 static void
 CTidAddScanPath(PlannerInfo *root,
 				RelOptInfo *baserel,
@@ -249,6 +303,7 @@ CTidAddScanPath(PlannerInfo *root,
 		relkind != RELKIND_TOASTVALUE)
 		return;
 
+	/* walk on the restrict info */
 	foreach (lc, baserel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
@@ -259,6 +314,12 @@ CTidAddScanPath(PlannerInfo *root,
 		temp = CTidQualFromExpr((Node *) rinfo->clause, baserel->relid);
 		rlst = list_concat(rlst, temp);
 	}
+
+	/*
+	 * OK, it is case when a part of restriction clause makes sense to
+	 * reduce number of tuples, so we will add a custom scan path being
+	 * provided by this module.
+	 */
 	if (rlst != NIL)
 	{
 		CustomPath *cpath = makeNode(CustomPath);
@@ -276,7 +337,7 @@ CTidAddScanPath(PlannerInfo *root,
 		cpath->path.param_info = get_baserel_parampathinfo(root, baserel,
 														   required_outer);
 		cpath->custom_name = pstrdup("ctidscan");
-		cpath->custom_flags = CUSTOM__SUPPORT_MARK_RESTORE;
+		cpath->custom_flags = CUSTOM__SUPPORT_BACKWARD_SCAN;
 		cpath->custom_private = rlst;
 
 		CTidEstimateCosts(root, baserel, cpath);
@@ -285,7 +346,12 @@ CTidAddScanPath(PlannerInfo *root,
 	}
 }
 
-
+/*
+ * CTidInitCustomScanPlan
+ *
+ * It initializes the given CustomScan plan object according to the CustomPath
+ * being choosen by the optimizer.
+ */
 static void
 CTidInitCustomScanPlan(PlannerInfo *root,
 					   CustomScan *cscan_plan,
@@ -304,7 +370,6 @@ CTidInitCustomScanPlan(PlannerInfo *root,
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
 
 	/* Replace any outer-relation variables with nestloop params */
-	/* TODO: remove items in ctidquals from scan_clauses */
 	if (cscan_path->path.param_info)
 	{
 		scan_clauses = (List *)
@@ -313,19 +378,29 @@ CTidInitCustomScanPlan(PlannerInfo *root,
 			replace_nestloop_params(root, (Node *) ctidquals);
 	}
 
+	/*
+	 * Most of initialization stuff was done at nodeCustomScan.c. So, all
+	 * we need to do is to put clauses that were little bit adjusted and
+	 * private stuff; list of restriction clauses in this case.
+	 */
 	cscan_plan->scan.plan.targetlist = tlist;
 	cscan_plan->scan.plan.qual = scan_clauses;
 	cscan_plan->custom_private = ctidquals;
 }
 
+/*
+ * CTidScanState
+ *
+ * State of custom-tid scan during its execution.
+ */
 typedef struct {
-	Index			scanrelid;
-	ItemPointerData	ip_min;
-	ItemPointerData	ip_max;
-	int32			ip_min_comp;
-	int32			ip_max_comp;
-	bool			ip_needs_eval;
-	List		   *ctid_quals;
+	Index			scanrelid;		/* range table index of the relation */
+	ItemPointerData	ip_min;			/* minimum ItemPointer */
+	ItemPointerData	ip_max;			/* maximum ItemPointer */
+	int32			ip_min_comp;	/* comparison policy to ip_min */
+	int32			ip_max_comp;	/* comparison policy to ip_max */
+	bool			ip_needs_eval;	/* true, if needs to seek again */
+	List		   *ctid_quals;		/* list of ExprState for inequality ops */
 } CTidScanState;
 
 static bool
@@ -336,14 +411,18 @@ CTidEvalScanZone(CustomScanState *node)
 	ListCell	   *lc;
 
 	/*
-	 * See ItemPointerCompare(), ip_min_comp shall be usually 0 or -1,
-	 * if ip_min is valid. "1" means the compared itemptr is either less,
-	 * equal or greater, thus, it matches any values; that is equivalent
-	 * to open-end. It is similar on "-1" for ip_max_comp.
+	 * See ItemPointerCompare(), ip_max_comp shall be usually either 1 or
+	 * 0 if tid of fetched records are larger than or equal with ip_min.
+	 * To detect end of scan, we shall check whether the result of
+	 * ItemPointerCompare() is less than ip_max_comp, so it never touch
+	 * the point if ip_max_comp is -1, because all the result is either
+	 * 1, 0 or -1. So, it is same as "open ended" as if no termination
+	 * condition was set.
 	 */
 	ctss->ip_min_comp = -1;
 	ctss->ip_max_comp = 1;
 
+	/* Walks on the inequality operators */
 	foreach (lc, ctss->ctid_quals)
 	{
 		FuncExprState  *fexstate = (FuncExprState *) lfirst(lc);
@@ -373,8 +452,13 @@ CTidEvalScanZone(CustomScanState *node)
 													  econtext,
 													  &isnull,
 													  NULL));
-		if (!isnull && ItemPointerIsValid(itemptr))
+		if (!isnull)
 		{
+			/*
+			 * OK, we could calculate a particular TID that should be
+			 * larger than, less than or equal with fetched record, thus,
+			 * it allows to determine upper or lower bounds of this scan.
+			 */
 			switch (opno)
 			{
 				case TIDLessOperator:
@@ -416,51 +500,79 @@ CTidEvalScanZone(CustomScanState *node)
 		}
 		else
 		{
-
+			/*
+			 * Whole of the restriction clauses chainned with AND- boolean
+			 * operators because false, if one of the clauses has NULL result.
+			 * So, we can immediately break the evaluation to inform caller
+			 * it does not make sense to scan any more.
+			 */
 			return false;
 		}
 	}
 	return true;
 }
 
-
+/*
+ * CTidBeginCustomScan
+ *
+ * It initializes the given CustomScanState according to the CustomScan plan.
+ */
 static void
 CTidBeginCustomScan(CustomScanState *node, int eflags)
 {
 	CustomScan	   *cscan = (CustomScan *)node->ss.ps.plan;
 	Index			scanrelid = ((Scan *)node->ss.ps.plan)->scanrelid;
 	EState		   *estate = node->ss.ps.state;
-	CTidScanState  *ctss = palloc0(sizeof(CTidScanState));
+	CTidScanState  *ctss;
 	TupleDesc		tupdesc;
 
-	ctss->scanrelid = scanrelid;
-	ctss->ctid_quals = (List *)
-		ExecInitExpr((Expr *)cscan->custom_private, &node->ss.ps);
-	ctss->ip_needs_eval = true;
-
-	ExecInitScanTupleSlot(estate, &node->ss);
-	ExecInitScanTupleSlot(estate, &node->ss);
-
+	/* open the relation with appropriate lock level */
 	node->ss.ss_currentRelation
 		= ExecOpenScanRelation(estate, scanrelid, eflags);
-	node->ss.ss_currentScanDesc
-		= heap_beginscan(node->ss.ss_currentRelation,
-						 estate->es_snapshot, 0, NULL);
 
+	/*
+	 * also, assign a scan tuple slot that has identical tuple descriptor
+	 * as underlying relation has.
+	 */
+	ExecInitScanTupleSlot(estate, &node->ss);
 	tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
 	ExecAssignScanType(&node->ss, tupdesc);
 
 	node->ss.ps.ps_TupFromTlist = false;
 
+	/* Do nothing anymore in EXPLAIN (no ANALYZE) case. */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/* Begin sequential scan, but pointer shall be seeked later */
+	node->ss.ss_currentScanDesc
+		= heap_beginscan(node->ss.ss_currentRelation,
+						 estate->es_snapshot, 0, NULL);
+
+	/* init CTidScanState */
+	ctss = palloc0(sizeof(CTidScanState));
+	ctss->scanrelid = scanrelid;
+	ctss->ctid_quals = (List *)
+		ExecInitExpr((Expr *)cscan->custom_private, &node->ss.ps);
+	ctss->ip_needs_eval = true;
+
 	node->custom_state = ctss;
 }
 
+/*
+ * CTidSeekPosition
+ *
+ * It seeks current scan position into a particular point we specified.
+ * Next heap_getnext() will fetch a record from the point we seeked.
+ * It returns false, if specified position was out of range thus does not
+ * make sense to scan any mode. Elsewhere, true shall be return.
+ */
 static bool
 CTidSeekPosition(HeapScanDesc scan, ItemPointer pos, ScanDirection direction)
 {
 	BlockNumber		bnum = BlockIdGetBlockNumber(&pos->ip_blkid);
-	OffsetNumber	offs;
-	ItemPointerData	ip;
+	ItemPointerData	save_mctid;
+	int				save_mindex;
 
 	Assert(direction == BackwardScanDirection ||
 		   direction == ForwardScanDirection);
@@ -468,50 +580,57 @@ CTidSeekPosition(HeapScanDesc scan, ItemPointer pos, ScanDirection direction)
 	/*
 	 * In case when block-number is out of the range, it is obvious that
 	 * no tuples shall be fetched if forward scan direction. On the other
-	 * hand, we have nothing special is backward scan direction.
+	 * hand, we have nothing special for backward scan direction.
+	 * Note that heap_getnext() shall return NULL tuple just after
+	 * heap_rescan() if NoMovementScanDirection is given. Caller of this
+	 * function override scan direction if 'true' was returned, so it makes
+	 * this scan terminated immediately.
 	 */
 	if (bnum >= scan->rs_nblocks)
 	{
+		heap_rescan(scan, NULL);
+		/* Termination of this scan immediately */
 		if (direction == ForwardScanDirection)
-			return false;
-		else
-		{
-			heap_rescan(scan, NULL);
 			return true;
-		}
+		/* Elsewhere, backward scan from the beginning */
+		return false;
 	}
 
-	scan->rs_inited = true;
-	if (scan->rs_pageatatime)
-		offs = FirstOffsetNumber;
-	else
-		offs = ItemPointerGetOffsetNumber(pos);
+	/* save the marked position */
+	ItemPointerCopy(&scan->rs_mctid, &save_mctid);
+	save_mindex = scan->rs_mindex;
 
-	ItemPointerSet(&ip, bnum, offs);
-	ItemPointerCopy(&ip, &scan->rs_mctid);
-	if (scan->rs_pageatatime)
-		scan->rs_mindex = 0;
+	/*
+	 * Ensure the block that includes the position shall be loaded on
+	 * heap_restrpos(). Because heap_restrpos() internally calls
+	 * heapgettup() or heapgettup_pagemode() that kicks heapgetpage()
+	 * when rs_cblock is different from the block number being pointed
+	 * by rs_mctid, it makes sense to put invalid block number not to
+	 * match previous value.
+	 */
+	scan->rs_cblock = InvalidBlockNumber;
 
+	/* Put a pseudo value as if heap_markpos() save a position. */
+	ItemPointerCopy(pos, &scan->rs_mctid);
+	if (scan->rs_pageatatime)
+		scan->rs_mindex = ItemPointerGetOffsetNumber(pos) - 1;
+
+	/* Seek to the point */
 	heap_restrpos(scan);
 
-	if (scan->rs_pageatatime)
-	{
-		if (ItemPointerGetOffsetNumber(pos) < FirstOffsetNumber)
-			scan->rs_cindex = 0;
-		else if (ItemPointerGetOffsetNumber(pos) <= scan->rs_ntuples)
-			scan->rs_cindex = ItemPointerGetOffsetNumber(pos) - 1;
-		else
-			scan->rs_cindex = scan->rs_ntuples - 1;
-	}
-
-	if (direction == ForwardScanDirection)
-		heap_getnext(scan, BackwardScanDirection);
-	else
-		heap_getnext(scan, ForwardScanDirection);
+	/* restore the marked position */
+	ItemPointerCopy(&save_mctid, &scan->rs_mctid);
+	scan->rs_mindex = save_mindex;
 
 	return true;
 }
 
+/*
+ * CTidAccessCustomScan
+ *
+ * Access method of ExecScan(). It fetches a tuple from the underlying heap
+ * scan that was started from the point according to the tid clauses.
+ */
 static TupleTableSlot *
 CTidAccessCustomScan(CustomScanState *node)
 {
@@ -519,52 +638,61 @@ CTidAccessCustomScan(CustomScanState *node)
 	HeapScanDesc	scan = node->ss.ss_currentScanDesc;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	EState		   *estate = node->ss.ps.state;
+	ScanDirection	direction = estate->es_direction;
 	HeapTuple		tuple;
 
 	if (ctss->ip_needs_eval)
 	{
+		/* It terminates this scan, if result set shall be obvious empty. */
 		if (!CTidEvalScanZone(node))
 			return NULL;
 
-		if (estate->es_direction == ForwardScanDirection)
+		if (direction == ForwardScanDirection)
 		{
+			/* seek to the point if min-tid was obvious */
 			if (ctss->ip_min_comp != -1)
 			{
-				if (!CTidSeekPosition(scan, &ctss->ip_min,
-									  estate->es_direction))
-					return NULL;
+				if (CTidSeekPosition(scan, &ctss->ip_min, direction))
+					direction = NoMovementScanDirection;
 			}
-			else
+			else if (scan->rs_inited)
 				heap_rescan(scan, NULL);
 		}
-		else if (estate->es_direction == BackwardScanDirection)
+		else if (direction == BackwardScanDirection)
 		{
+			/* seel to the point if max-tid was obvious */
 			if (ctss->ip_max_comp != 1)
 			{
-				if (!CTidSeekPosition(scan, &ctss->ip_max,
-									  estate->es_direction))
-					return NULL;
+				if (CTidSeekPosition(scan, &ctss->ip_max, direction))
+					direction = NoMovementScanDirection;
 			}
-			else
+			else if (scan->rs_inited)
 				heap_rescan(scan, NULL);
 		}
+		else
+			elog(ERROR, "unexpected scan direction");
+
 		ctss->ip_needs_eval = false;
 	}
 
 	/*
 	 * get the next tuple from the table
 	 */
-	tuple = heap_getnext(scan, estate->es_direction);
+	tuple = heap_getnext(scan, direction);
 	if (!HeapTupleIsValid(tuple))
 		return NULL;
 
-	if (estate->es_direction == ForwardScanDirection)
+	/*
+	 * check whether the fetched tuple reached to the upper bound
+	 * if forward scan, or the lower bound if backward scan.
+	 */
+	if (direction == ForwardScanDirection)
 	{
 		if (ItemPointerCompare(&tuple->t_self,
 							   &ctss->ip_max) > ctss->ip_max_comp)
 			return NULL;
 	}
-	else if (estate->es_direction == BackwardScanDirection)
+	else if (direction == BackwardScanDirection)
 	{
 		if (ItemPointerCompare(&scan->rs_ctup.t_self,
 							   &ctss->ip_min) < ctss->ip_min_comp)
@@ -575,12 +703,23 @@ CTidAccessCustomScan(CustomScanState *node)
 	return slot;
 }
 
+/*
+ * CTidRecheckCustomScan
+ *
+ * Recheck method of ExecScan(). We don't need recheck logic.
+ */
 static bool
 CTidRecheckCustomScan(CustomScanState *node, TupleTableSlot *slot)
 {
 	return true;
 }
 
+/*
+ * CTidExecCustomScan
+ *
+ * It fetches a tuple from the underlying heap scan, according to
+ * the Execscan() manner.
+ */
 static TupleTableSlot *
 CTidExecCustomScan(CustomScanState *node)
 {
@@ -589,13 +728,29 @@ CTidExecCustomScan(CustomScanState *node)
 					(ExecScanRecheckMtd) CTidRecheckCustomScan);
 }
 
+/*
+ * CTidEndCustomScan
+ *
+ * It terminates custom tid scan.
+ */
 static void
 CTidEndCustomScan(CustomScanState *node)
 {
-	heap_endscan(node->ss.ss_currentScanDesc);
+	CTidScanState  *ctss = node->custom_state;
+
+	/* if ctss != NULL, we started underlying heap-scan */
+	if (ctss)
+		heap_endscan(node->ss.ss_currentScanDesc);
 	ExecCloseScanRelation(node->ss.ss_currentRelation);
 }
 
+/*
+ * CTidReScanCustomScan
+ *
+ * It rewinds current position of the scan. Setting ip_needs_eval indicates
+ * to calculate the starting point again and rewinds underlying heap scan
+ * on the next ExecScan timing.
+ */
 static void
 CTidReScanCustomScan(CustomScanState *node)
 {
@@ -604,11 +759,12 @@ CTidReScanCustomScan(CustomScanState *node)
 
 	ctss->ip_needs_eval = true;
 
-	heap_rescan(scan, NULL);
-
 	ExecScanReScan(&node->ss);
 }
 
+/*
+ * Entrypoint of this extension
+ */
 void
 _PG_init(void)
 {
@@ -622,12 +778,10 @@ _PG_init(void)
 	memset(&provider, 0, sizeof(provider));
 	snprintf(provider.name, sizeof(provider.name), "ctidscan");
 	provider.InitCustomScanPlan   = CTidInitCustomScanPlan;
-	//provider.SetPlanRefCustomScan = CTidSetPlanRefCustomScan;
 	provider.BeginCustomScan      = CTidBeginCustomScan;
 	provider.ExecCustomScan       = CTidExecCustomScan;
 	provider.EndCustomScan        = CTidEndCustomScan;
 	provider.ReScanCustomScan     = CTidReScanCustomScan;
-	//provider.ExplainCustomScan    = CTidExplainCustomScan;
 
 	register_custom_provider(&provider);
 }

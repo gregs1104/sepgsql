@@ -1,0 +1,107 @@
+<!-- doc/src/sgml/ctidscan.sgml -->
+
+<sect1 id="ctidscan" xreflabel="ctidscan">
+ <title>lo</title>
+
+ <indexterm zone="ctidscan">
+  <primary>ctidscan</primary>
+ </indexterm>
+
+ <para>
+  The <filename>ctidscan</> module provides an additional logic to scan
+  regular relations if <literal>WHERE</> clause contains inequality
+  operators that compares something with <literal>ctid</> system column.
+  It also performs as a proof-of-concept implementation that works on
+  the custom-scan APIs that enables to extend the core executor system.
+ </para>
+
+ <sect2>
+  <title>Overview</title>
+  <para>
+   Once this module is loaded, it registers itself as a custom-scan provider.
+   It allows to provide an additional scan path on regular relations using
+   qualifiers that reference <literal>ctid</> system column.
+  </para>
+  <para>
+   For example, the query below usually falls to sequential scan if this
+   module was not loaded.
+<programlisting>
+SELECT ctid,* FROM my_table WHERE ctid > '(100,0)'::tid;
+</programlisting>
+   On the other hand, <filename>ctidscan</> module can construct an alternative
+   scan plan utilizing inequality operators that involve <literal>ctid</> 
+   system column, to reduce number of rows to be processed.
+   It does not make sense obviously to read tuples within pages being located
+   on 99th page or prior. So, it seeks the internal pointer to scan into
+   <literal>(100,0)</> at beginning of the scan, even though it internally
+   uses same logic with sequential scan.
+  </para>
+  <para>
+   Usually, <productname>PostgreSQL</> runs queries with inequality operators
+   that involves <literal>ctid</> system column using sequential scan, as
+   follows.
+<programlisting>
+postgres=# EXPLAIN SELECT * FROM t1 WHERE ctid > '(100,0)'::tid;
+                       QUERY PLAN
+--------------------------------------------------------
+ Seq Scan on t1  (cost=0.00..209.00 rows=3333 width=37)
+   Filter: (ctid > '(100,0)'::tid)
+(2 rows)
+</programlisting>
+   It works well except for the waste of i/o loads on the pages that contains
+   the records to be skipped.
+  </para>
+  <para>
+   On the other hands, an alternative scan path implemented with
+   <filename>ctidscan</> provides more efficient way; that skips the first
+   100 pages prior to sequencial scan, as follows.
+<programlisting>
+postgres=# load 'ctidscan';
+LOAD
+postgres=# EXPLAIN SELECT * FROM t1 WHERE ctid > '(100,0)'::tid;
+                              QUERY PLAN
+----------------------------------------------------------------------
+ Custom Scan (ctidscan) on t1  (cost=0.00..100.00 rows=3333 width=37)
+   Filter: (ctid > '(100,0)'::tid)
+(2 rows)
+</programlisting>
+   The optimizer internally compares all the candidates of scan paths, then
+   chooses a path with cheapest cost. The custom-scan path provided by
+   <filename>ctidscan</> is usually cheaper than sequential scan because of
+   smaller number of tuples to be processed.
+  </para>
+  <para>
+   Of course, it shall not be choosen if we have more cheaper path than the
+   above custom-scan path. Index-scan based on equality operation is usually
+   cheaper than this custom-scan, so optimizer adopts it instead of sequential
+   scan or custom scan provided by <filename>ctidscan</> for instance.
+<programlisting>
+postgres=# EXPLAIN SELECT * FROM t1 WHERE ctid > '(100,0)'::tid AND a = 100;
+                            QUERY PLAN
+-------------------------------------------------------------------
+ Index Scan using t1_pkey on t1  (cost=0.29..8.30 rows=1 width=37)
+   Index Cond: (a = 100)
+   Filter: (ctid > '(100,0)'::tid)
+(3 rows)
+</programlisting>
+  </para>
+  <para>
+   Its usage is quite simple. All you need to do is, loading
+   the <filename>ctidscan</> into <productname>PostgreSQL</> using
+   <xref linkend="sql-load"> command,
+   <xref linkend="guc-shared-preload-libraries"> or
+   <xref linkend="guc-local-preload-libraries"> parameter, according to
+   your convenience.
+  </para>
+  <para>
+   We have no configurable parameter in this module, right now.
+  </para>
+ </sect2>
+ <sect2>
+  <title>Author</title>
+  <para>
+   KaiGai Kohei <email>kaigai@kaigai.gr.jp</email>
+  </para>
+ </sect2>
+
+</sect1>

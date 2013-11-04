@@ -64,6 +64,7 @@ typedef struct CustomProvider
  * support ExecCustomMarkPos and ExecCustomRestrPos callbacks.
  */
 #define CUSTOM__SUPPORT_MARK_RESTORE			0x0001
+#define CUSTOM__SUPPORT_BACKWARD_SCAN			0x0002
 
 /*
  * Registration and lookup custom execution provider
