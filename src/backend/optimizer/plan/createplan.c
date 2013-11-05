@@ -87,6 +87,7 @@ static MergeJoin *create_mergejoin_plan(PlannerInfo *root, MergePath *best_path,
 					  Plan *outer_plan, Plan *inner_plan);
 static HashJoin *create_hashjoin_plan(PlannerInfo *root, HashPath *best_path,
 					 Plan *outer_plan, Plan *inner_plan);
+static Node *replace_nestloop_params(PlannerInfo *root, Node *expr);
 static Node *replace_nestloop_params_mutator(Node *node, PlannerInfo *root);
 static void process_subquery_nestloop_params(PlannerInfo *root,
 								 List *subplan_params);

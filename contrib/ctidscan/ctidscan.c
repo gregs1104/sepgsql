@@ -526,21 +526,6 @@ CTidBeginCustomScan(CustomScanState *node, int eflags)
 	Index			scanrelid = ((Scan *)node->ss.ps.plan)->scanrelid;
 	EState		   *estate = node->ss.ps.state;
 	CTidScanState  *ctss;
-	TupleDesc		tupdesc;
-
-	/* open the relation with appropriate lock level */
-	node->ss.ss_currentRelation
-		= ExecOpenScanRelation(estate, scanrelid, eflags);
-
-	/*
-	 * also, assign a scan tuple slot that has identical tuple descriptor
-	 * as underlying relation has.
-	 */
-	ExecInitScanTupleSlot(estate, &node->ss);
-	tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
-	ExecAssignScanType(&node->ss, tupdesc);
-
-	node->ss.ps.ps_TupFromTlist = false;
 
 	/* Do nothing anymore in EXPLAIN (no ANALYZE) case. */
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -743,7 +728,6 @@ CTidEndCustomScan(CustomScanState *node)
 	/* if ctss != NULL, we started underlying heap-scan */
 	if (ctss)
 		heap_endscan(node->ss.ss_currentScanDesc);
-	ExecCloseScanRelation(node->ss.ss_currentRelation);
 }
 
 /*
@@ -757,7 +741,6 @@ static void
 CTidReScanCustomScan(CustomScanState *node)
 {
 	CTidScanState  *ctss = node->custom_state;
-	HeapScanDesc	scan = node->ss.ss_currentScanDesc;
 
 	ctss->ip_needs_eval = true;
 

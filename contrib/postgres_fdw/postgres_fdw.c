@@ -3021,38 +3021,57 @@ postgresAddJoinPaths(PlannerInfo *root,
 
 static void
 postgresInitCustomScanPlan(PlannerInfo *root,
+						   CustomScan *cscan_plan,
 						   CustomPath *cscan_path,
-						   CustomScan *cscan_plan)
+						   List *tlist,
+						   List *scan_clauses)
 {
-	//RelOptInfo		   *joinrel = cscan_path->path.parent;
-	PgRemoteJoinInfo	jinfo;
-	StringInfoData		sql;
+	PgRemoteJoinInfo jinfo;
+	StringInfoData sql;
+	List	   *relinfo = cscan_path->custom_private;
+	List	   *local_conds = NIL;
+	List	   *remote_conds = NIL;
+	ListCell   *lc;
 
 	Assert(cscan_path->path.parent->reloptkind == RELOPT_JOINREL);
-	unpackPgRemoteJoinInfo(&jinfo, cscan_path->custom_private);
+	unpackPgRemoteJoinInfo(&jinfo, relinfo);
 
 	/*
 	 * adjust targetentry list
 	 *
 	 *
 	 */
-	jinfo.local_conds = extract_actual_clauses(jinfo.local_conds, false);
-	jinfo.remote_conds = extract_actual_clauses(jinfo.remote_conds, false);
-	cscan_plan->scan.plan.qual = jinfo.local_conds;
-	cscan_plan->custom_exprs = jinfo.remote_conds;
+	local_conds = extract_actual_clauses(jinfo.local_conds, false);
+	remote_conds = extract_actual_clauses(jinfo.remote_conds, false);
 
+	foreach (lc, scan_clauses)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-	//jinfo.select_vars = fixup_remote_join_varattno(root, cscan_plan);
+		Assert(IsA(rinfo, RestrictInfo));
 
-	//dumpPgRemoteJoinInfo(&jinfo);
+		/* Ignore any pseudoconstants, they're dealt with elsewhere */
+		if (rinfo->pseudoconstant)
+			continue;
+
+		if (!list_member(remote_conds, rinfo->clause) &&
+			!list_member(local_conds, rinfo->clause))
+			local_conds = lappend(local_conds, rinfo->clause);
+	}
 
 	initStringInfo(&sql);
 	deparseRemoteJoinSql(&sql, root, cscan_path->custom_private,
-						 cscan_plan->scan.plan.targetlist,
-						 cscan_plan->scan.plan.qual,
-						 &jinfo.select_vars, &jinfo.select_params);
+						 tlist,
+						 local_conds,
+						 &jinfo.select_vars,
+						 &jinfo.select_params);
+	jinfo.local_conds = NIL;	/* never used any more */
+	jinfo.remote_conds = NIL;	/* never used any more */
 	jinfo.select_qry = sql.data;
 
+	cscan_plan->scan.plan.targetlist = tlist;
+	cscan_plan->scan.plan.qual = local_conds;
+	cscan_plan->custom_exprs = remote_conds;
 	cscan_plan->custom_private = packPgRemoteJoinInfo(&jinfo);
 }
 
@@ -3444,10 +3463,10 @@ postgresExplainCustomScan(CustomScanState *csstate,
 }
 
 /*
+ * _PG_init
  *
- *
- *
- *
+ * Entrypoint of this module; registration of custom-scan provider, but
+ * no special registration is not needed for FDW portion.
  */
 void
 _PG_init(void)

@@ -149,6 +149,8 @@ ExecInitCustomScan(CustomScan *node, EState *estate, int eflags)
 
 		csstate->ss.ss_currentRelation = rel;
 		ExecAssignScanType(&csstate->ss, RelationGetDescr(rel));
+
+		csstate->ss.ps.ps_TupFromTlist = false;
 	}
 
 	/*
