@@ -289,11 +289,6 @@ exec_command(const char *cmd,
 			success = false;
 		}
 
-		if (pset.dirname)
-			free(pset.dirname);
-		pset.dirname = pg_strdup(dir);
-		canonicalize_path(pset.dirname);
-
 		if (opt)
 			free(opt);
 	}
@@ -1102,8 +1097,7 @@ exec_command(const char *cmd,
 		/* This scrolls off the screen when using /dev/tty */
 		success = saveHistory(fname ? fname : DEVTTY, -1, false, false);
 		if (success && !pset.quiet && fname)
-			printf(gettext("Wrote history to file \"%s/%s\".\n"),
-				   pset.dirname ? pset.dirname : ".", fname);
+			printf(_("Wrote history to file \"%s\".\n"), fname);
 		if (!fname)
 			putchar('\n');
 		free(fname);
@@ -1186,10 +1180,9 @@ exec_command(const char *cmd,
 		else
 		{
 			/* Set variable to the value of the next argument */
-			int			len = strlen(envvar) + strlen(envval) + 1;
-			char	   *newval = pg_malloc(len + 1);
+			char	   *newval;
 
-			snprintf(newval, len + 1, "%s=%s", envvar, envval);
+			newval = psprintf("%s=%s", envvar, envval);
 			putenv(newval);
 			success = true;
 
@@ -1550,9 +1543,7 @@ prompt_for_password(const char *username)
 	{
 		char	   *prompt_text;
 
-		prompt_text = pg_malloc(strlen(username) + 100);
-		snprintf(prompt_text, strlen(username) + 100,
-				 _("Password for user %s: "), username);
+		prompt_text = psprintf(_("Password for user %s: "), username);
 		result = simple_prompt(prompt_text, 100, false);
 		free(prompt_text);
 	}
@@ -1923,14 +1914,6 @@ editFile(const char *fname, int lineno)
 		}
 	}
 
-	/* Allocate sufficient memory for command line. */
-	if (lineno > 0)
-		sys = pg_malloc(strlen(editorName)
-						+ strlen(editor_lineno_arg) + 10		/* for integer */
-						+ 1 + strlen(fname) + 10 + 1);
-	else
-		sys = pg_malloc(strlen(editorName) + strlen(fname) + 10 + 1);
-
 	/*
 	 * On Unix the EDITOR value should *not* be quoted, since it might include
 	 * switches, eg, EDITOR="pico -t"; it's up to the user to put quotes in it
@@ -1940,18 +1923,18 @@ editFile(const char *fname, int lineno)
 	 */
 #ifndef WIN32
 	if (lineno > 0)
-		sprintf(sys, "exec %s %s%d '%s'",
-				editorName, editor_lineno_arg, lineno, fname);
+		sys = psprintf("exec %s %s%d '%s'",
+					editorName, editor_lineno_arg, lineno, fname);
 	else
-		sprintf(sys, "exec %s '%s'",
-				editorName, fname);
+		sys = psprintf("exec %s '%s'",
+					editorName, fname);
 #else
 	if (lineno > 0)
-		sprintf(sys, SYSTEMQUOTE "\"%s\" %s%d \"%s\"" SYSTEMQUOTE,
+		sys = psprintf(SYSTEMQUOTE "\"%s\" %s%d \"%s\"" SYSTEMQUOTE,
 				editorName, editor_lineno_arg, lineno, fname);
 	else
-		sprintf(sys, SYSTEMQUOTE "\"%s\" \"%s\"" SYSTEMQUOTE,
-				editorName, fname);
+		sys = psprintf(SYSTEMQUOTE "\"%s\" \"%s\"" SYSTEMQUOTE,
+					editorName, fname);
 #endif
 	result = system(sys);
 	if (result == -1)
@@ -2644,14 +2627,11 @@ do_shell(const char *command)
 		if (shellName == NULL)
 			shellName = DEFAULT_SHELL;
 
-		sys = pg_malloc(strlen(shellName) + 16);
+		/* See EDITOR handling comment for an explanation */
 #ifndef WIN32
-		sprintf(sys,
-		/* See EDITOR handling comment for an explanation */
-				"exec %s", shellName);
+		sys = psprintf("exec %s", shellName);
 #else
-		/* See EDITOR handling comment for an explanation */
-		sprintf(sys, SYSTEMQUOTE "\"%s\"" SYSTEMQUOTE, shellName);
+		sys = psprintf(SYSTEMQUOTE "\"%s\"" SYSTEMQUOTE, shellName);
 #endif
 		result = system(sys);
 		free(sys);

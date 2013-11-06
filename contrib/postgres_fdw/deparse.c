@@ -852,7 +852,7 @@ deparseInsertSql(StringInfo buf, PlannerInfo *root,
 
 	if (targetAttrs)
 	{
-		appendStringInfoString(buf, "(");
+		appendStringInfoChar(buf, '(');
 
 		first = true;
 		foreach(lc, targetAttrs)
@@ -880,7 +880,7 @@ deparseInsertSql(StringInfo buf, PlannerInfo *root,
 			pindex++;
 		}
 
-		appendStringInfoString(buf, ")");
+		appendStringInfoChar(buf, ')');
 	}
 	else
 		appendStringInfoString(buf, " DEFAULT VALUES");
@@ -1157,7 +1157,7 @@ deparseAnalyzeSizeSql(StringInfo buf, Relation rel)
 	initStringInfo(&relname);
 	deparseRelation(&relname, rel);
 
-	appendStringInfo(buf, "SELECT pg_catalog.pg_relation_size(");
+	appendStringInfoString(buf, "SELECT pg_catalog.pg_relation_size(");
 	deparseStringLiteral(buf, relname.data);
 	appendStringInfo(buf, "::pg_catalog.regclass) / %d", BLCKSZ);
 }
@@ -1479,7 +1479,7 @@ deparseConst(Const *node, deparse_expr_cxt *context)
 
 	if (node->constisnull)
 	{
-		appendStringInfo(buf, "NULL");
+		appendStringInfoString(buf, "NULL");
 		appendStringInfo(buf, "::%s",
 						 format_type_with_typemod(node->consttype,
 												  node->consttypmod));
@@ -1827,7 +1827,7 @@ deparseOperatorName(StringInfo buf, Form_pg_operator opform)
 	else
 	{
 		/* Just print operator name. */
-		appendStringInfo(buf, "%s", opname);
+		appendStringInfoString(buf, opname);
 	}
 }
 

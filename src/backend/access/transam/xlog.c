@@ -1248,7 +1248,7 @@ begin:;
 		xlog_outrec(&buf, rechdr);
 		if (rdata->data != NULL)
 		{
-			appendStringInfo(&buf, " - ");
+			appendStringInfoString(&buf, " - ");
 			RmgrTable[rechdr->xl_rmid].rm_desc(&buf, rechdr->xl_info, rdata->data);
 		}
 		elog(LOG, "%s", buf.data);
@@ -1482,7 +1482,7 @@ CopyXLogRecordToWAL(int write_len, bool isLogSwitch, XLogRecData *rdata,
 	Assert(written == write_len);
 
 	/* Align the end position, so that the next record starts aligned */
-	CurrPos = MAXALIGN(CurrPos);
+	CurrPos = MAXALIGN64(CurrPos);
 
 	/*
 	 * If this was an xlog-switch, it's not enough to write the switch record,
@@ -6677,7 +6677,7 @@ StartupXLOG(void)
 							(uint32) (ReadRecPtr >> 32), (uint32) ReadRecPtr,
 							 (uint32) (EndRecPtr >> 32), (uint32) EndRecPtr);
 					xlog_outrec(&buf, record);
-					appendStringInfo(&buf, " - ");
+					appendStringInfoString(&buf, " - ");
 					RmgrTable[record->xl_rmid].rm_desc(&buf,
 													   record->xl_info,
 													 XLogRecGetData(record));

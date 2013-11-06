@@ -1106,7 +1106,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 					if (((Join *) plan)->jointype != JOIN_INNER)
 						appendStringInfo(es->str, " %s Join", jointype);
 					else if (!IsA(plan, NestLoop))
-						appendStringInfo(es->str, " Join");
+						appendStringInfoString(es->str, " Join");
 				}
 				else
 					ExplainPropertyText("Join Type", jointype, es);
@@ -1201,7 +1201,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 	{
 
 		if (es->format == EXPLAIN_FORMAT_TEXT)
-			appendStringInfo(es->str, " (never executed)");
+			appendStringInfoString(es->str, " (never executed)");
 		else if (planstate->instrument->need_timer)
 		{
 			ExplainPropertyFloat("Actual Startup Time", 0.0, 3, es);
