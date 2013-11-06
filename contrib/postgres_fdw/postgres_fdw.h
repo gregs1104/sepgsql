@@ -117,25 +117,20 @@ extern void deparseAnalyzeSizeSql(StringInfo buf, Relation rel);
 extern void deparseAnalyzeSql(StringInfo buf, Relation rel,
 				  List **retrieved_attrs);
 
-/*
- * Remote Join Support using CustomScan APIs
- *
- *
- *
- */
+/* remote join support on top of custom-scan APIs */
 typedef struct
 {
-	Oid			fdw_server_oid;
-	Oid			fdw_user_oid;
-	Relids		relids;
-	JoinType	jointype;
-	Node	   *outer_rel;
-	Node	   *inner_rel;
-	List	   *remote_conds;
-	List	   *local_conds;
-	List	   *select_vars;
-	List	   *select_params;
-	char	   *select_qry;
+	Oid			fdw_server_oid;	/* server oid commonly used */
+	Oid			fdw_user_oid;	/* user oid commonly used */
+	Relids		relids;			/* bitmapset of range table indexes */
+	JoinType	jointype;		/* one of JOIN_* */
+	Node	   *outer_rel;		/* packed information of outer relation */
+	Node	   *inner_rel;		/* packed information of inner relation */
+	List	   *remote_conds;	/* condition to be run on remote server */
+	List	   *local_conds;	/* condition to be run on local server */
+	List	   *select_vars;	/* List of Var nodes to be fetched */
+	List	   *select_params;	/* List of Var nodes being parameralized */
+	char	   *select_qry;		/* remote query being deparsed */
 } PgRemoteJoinInfo;
 
 extern List *packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo);

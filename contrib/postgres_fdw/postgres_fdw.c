@@ -2646,30 +2646,31 @@ conversion_error_callback(void *arg)
 	}
 }
 
-/*
+/* ------------------------------------------------------------
+ *
  * Remote JOIN support
  *
- *
- *
- *
- *
- *
+ * ------------------------------------------------------------
  */
 enum PgRemoteJoinPrivateIndex
 {
-	/* An OID pair of foreign server and user */
-	PgCust_FdwServUserIds,
-	PgCust_JoinRelids,
-	PgCust_JoinType,
-	PgCust_OuterRel,
-	PgCust_InnerRel,
-	PgCust_RemoteConds,
-	PgCust_LocalConds,
-	PgCust_SelectVars,
-	PgCust_SelectParams,
-	PgCust_SelectSql,
+	PgCust_FdwServUserIds,	/* oid pair of foreign server and user */
+	PgCust_JoinRelids,		/* bitmapset of rtindexes to be joinned */
+	PgCust_JoinType,		/* one of JOIN_* */
+	PgCust_OuterRel,		/* packed joinrel of outer relation */
+	PgCust_InnerRel,		/* packed joinrel of inner relation */
+	PgCust_RemoteConds,		/* remote conditions */
+	PgCust_LocalConds,		/* local conditions */
+	PgCust_SelectVars,		/* list of Var nodes to be fetched */
+	PgCust_SelectParams,	/* list of Var nodes being parameterized */
+	PgCust_SelectSql,		/* remote query being deparsed */
 };
 
+/*
+ * packPgRemoteJoinInfo
+ *
+ * pack PgRemoteJoinInfo into a List object to save as private datum
+ */
 List *
 packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
 {
@@ -2700,6 +2701,11 @@ packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
 	return result;
 }
 
+/*
+ * unpackPgRemoteJoinInfo
+ *
+ * unpack a private datum to PgRemoteJoinInfo
+ */
 void
 unpackPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo, List *custom_private)
 {
@@ -2751,7 +2757,14 @@ unpackPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo, List *custom_private)
 	}
 }
 
-/******/
+/*
+ * is_self_managed_relation
+ *
+ * It checks whether the supplied relation is either a foreign table or remote
+ * join managed by postgres_fdw. If not, false shall be returned.
+ * If it is a managed relation, some related properties shall be returned to
+ * the caller.
+ */
 static bool
 is_self_managed_relation(PlannerInfo *root, RelOptInfo *rel,
 						 Oid *fdw_server_oid, Oid *fdw_user_oid,
@@ -2826,6 +2839,11 @@ is_self_managed_relation(PlannerInfo *root, RelOptInfo *rel,
 	return false;
 }
 
+/*
+ * has_wholerow_reference
+ *
+ * It returns true, if supplied expression contains whole-row reference.
+ */
 static bool
 has_wholerow_reference(Node *node, void *context)
 {
@@ -2848,6 +2866,11 @@ has_wholerow_reference(Node *node, void *context)
 	return expression_tree_walker(node, has_wholerow_reference, context);
 }
 
+/*
+ * estimate_remote_join_cost
+ *
+ * It calculates cost for remote join, then put them on the Path structure.
+ */
 static void
 estimate_remote_join_cost(PlannerInfo *root,
 						  CustomPath *cpath,
@@ -2900,6 +2923,13 @@ estimate_remote_join_cost(PlannerInfo *root,
 	cpath->path.total_cost = total_cost;
 }
 
+/*
+ * postgresAddJoinPaths
+ *
+ * A callback routine of add_join_path_hook. It checks whether this join can
+ * be run on the remote server, and add a custom-scan path that launches
+ * a remote join instead of a pair of remote scan and local join.
+ */
 static void
 postgresAddJoinPaths(PlannerInfo *root,
 					 RelOptInfo *joinrel,
@@ -3019,6 +3049,11 @@ postgresAddJoinPaths(PlannerInfo *root,
 	add_path(joinrel, &cpath->path);
 }
 
+/*
+ * postgresInitCustomScanPlan
+ *
+ * construction of CustomScan according to remote join path above.
+ */
 static void
 postgresInitCustomScanPlan(PlannerInfo *root,
 						   CustomScan *cscan_plan,
@@ -3036,11 +3071,7 @@ postgresInitCustomScanPlan(PlannerInfo *root,
 	Assert(cscan_path->path.parent->reloptkind == RELOPT_JOINREL);
 	unpackPgRemoteJoinInfo(&jinfo, relinfo);
 
-	/*
-	 * adjust targetentry list
-	 *
-	 *
-	 */
+	/* pulls expressions from RestrictInfo */
 	local_conds = extract_actual_clauses(jinfo.local_conds, false);
 	remote_conds = extract_actual_clauses(jinfo.remote_conds, false);
 
@@ -3059,6 +3090,7 @@ postgresInitCustomScanPlan(PlannerInfo *root,
 			local_conds = lappend(local_conds, rinfo->clause);
 	}
 
+	/* construct a remote join query */
 	initStringInfo(&sql);
 	deparseRemoteJoinSql(&sql, root, cscan_path->custom_private,
 						 tlist,
@@ -3075,6 +3107,17 @@ postgresInitCustomScanPlan(PlannerInfo *root,
 	cscan_plan->custom_private = packPgRemoteJoinInfo(&jinfo);
 }
 
+/*
+ * fixup_remote_join_expr
+ *
+ * Var nodes that reference a relation of remote join have varno of underlying
+ * foreign tables. It makes a problem because it shall be eventually replaced
+ * by references to outer or inner relation, however, result of remote join is
+ * stored on the scan-tuple-slot neither outer nor inner.
+ * So, we need to replace varno of Var nodes that reference a relation of
+ * remote join by CUSTOM_VAR; that is a pseudo varno to reference a tuple in
+ * the scan-tuple-slot.
+ */
 typedef struct {
 	PlannerInfo *root;
 	List   *select_vars;
@@ -3092,6 +3135,7 @@ fixup_remote_join_mutator(Node *node, fixup_remote_join_context *context)
 		ListCell   *lc;
 		AttrNumber	resno = 1;
 
+		/* remote columns are ordered according to the select_vars */
 		foreach (lc, context->select_vars)
 		{
 			Var	   *selvar = (Var *) lfirst(lc);
@@ -3149,6 +3193,13 @@ fixup_remote_join_expr(Node *node, PlannerInfo *root,
 	return fixup_remote_join_mutator(node, &context);
 }
 
+/*
+ * postgresSetPlanRefCustomScan
+ *
+ * We need a special treatment of Var nodes to reference columns in remote
+ * join relation, because we replaces a join relation by a remote query that
+ * returns a result of join being executed remotely.
+ */
 static void
 postgresSetPlanRefCustomScan(PlannerInfo *root,
 							 CustomScan *csplan,
@@ -3180,6 +3231,12 @@ postgresSetPlanRefCustomScan(PlannerInfo *root,
 	}
 }
 
+/*
+ * postgresBeginCustomScan
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
 static void
 postgresBeginCustomScan(CustomScanState *node, int eflags)
 {
@@ -3319,6 +3376,12 @@ postgresBeginCustomScan(CustomScanState *node, int eflags)
 		fsstate->param_values = NULL;
 }
 
+/*
+ * postgresExecCustomAccess
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
 static TupleTableSlot *
 postgresExecCustomAccess(CustomScanState *node)
 {
@@ -3353,12 +3416,22 @@ postgresExecCustomAccess(CustomScanState *node)
 	return slot;
 }
 
+/*
+ * postgresExecCustomRecheck
+ *
+ * No need to recheck it again.
+ */
 static bool
 postgresExecCustomRecheck(CustomScanState *node, TupleTableSlot *slot)
 {
 	return true;
 }
 
+/*
+ * postgresExecCustomScan
+ *
+ * Just a wrapper of postgresExecCustomScan
+ */
 static TupleTableSlot *
 postgresExecCustomScan(CustomScanState *node)
 {
@@ -3367,6 +3440,12 @@ postgresExecCustomScan(CustomScanState *node)
 					(ExecScanRecheckMtd) postgresExecCustomRecheck);
 }
 
+/*
+ * postgresEndCustomScan
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
 static void
 postgresEndCustomScan(CustomScanState *node)
 {
@@ -3392,6 +3471,12 @@ postgresEndCustomScan(CustomScanState *node)
 		ExecCloseScanRelation(lfirst(lc));
 }
 
+/*
+ * postgresReScanCustomScan
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
 static void
 postgresReScanCustomScan(CustomScanState *node)
 {
@@ -3447,6 +3532,11 @@ postgresReScanCustomScan(CustomScanState *node)
 	fsstate->eof_reached = false;
 }
 
+/*
+ * postgresExplainCustomScan
+ *
+ * Callback routine on EXPLAIN. It just adds remote query, if verbose mode.
+ */
 static void
 postgresExplainCustomScan(CustomScanState *csstate,
 						  ExplainState *es)

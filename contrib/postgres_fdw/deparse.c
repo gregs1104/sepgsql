@@ -983,7 +983,12 @@ deparseReturningList(StringInfo buf, PlannerInfo *root,
 					  attrs_used, retrieved_attrs);
 }
 
-/****/
+/*
+ * deparseRemoteJoinRelation
+ *
+ * The main job portion of deparseRemoteJoinSql. It deparses a relation,
+ * might be join not only regular table, to SQL expression.
+ */
 static void
 deparseRemoteJoinRelation(StringInfo tlist_buf,
 						  StringInfo from_buf,
@@ -992,6 +997,12 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 						  List *target_list, List *local_conds,
 						  List **select_vars, List **select_params)
 {
+	/*
+	 * 'relinfo' is either List or Integer.
+	 * In case of List, it is a packed PgRemoteJoinInfo that contains
+	 * outer and inner join references, so needs to deparse recursively.
+	 * In case of Integer, it is rtindex of a particular foreign table.
+	 */
 	if (IsA(relinfo, List))
 	{
 		PgRemoteJoinInfo jinfo;
@@ -1061,6 +1072,10 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 						  (bool)(tlist_buf->len == 0), true,
 						  attrs_used, &retrieved_attrs);
 
+		/*
+		 * Columns being referenced in target-list and local conditions has
+		 * to be fetched from the remote server, but not all the columns.
+		 */
 		tupdesc = RelationGetDescr(rel);
 		foreach (lc, retrieved_attrs)
 		{
@@ -1075,7 +1090,7 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 										   attr->attcollation,
 										   0));
 		}
-
+		/* deparse WHERE clause, to be appended later */
 		fpinfo = (PgFdwRelationInfo *) baserel->fdw_private;
 		if (fpinfo->remote_conds)
 			appendWhereClause(where_buf, root, baserel,
@@ -1089,6 +1104,13 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 		elog(ERROR, "unexpected path type: %d", (int)nodeTag(relinfo));
 }
 
+/*
+ * deparseRemoteJoinSql
+ *
+ * It deparses a join tree to be executed on the remote server.
+ * It assumes the top-level 'relinfo' is one for remote join relation, thus
+ * it has to be a List object that packs PgRemoteJoinInfo.
+ */
 void
 deparseRemoteJoinSql(StringInfo buf, PlannerInfo *root,
 					 List *relinfo,
