@@ -548,7 +548,12 @@ dataSplitPage(GinBtree btree, Buffer lbuf, Buffer rbuf, OffsetNumber off, XLogRe
 
 	/* set up right bound for left page */
 	bound = GinDataPageGetRightBound(lpage);
-	*bound = btree->pitem.key;
+	if (GinPageIsLeaf(lpage))
+		*bound = *GinDataPageGetItemPointer(lpage,
+											GinPageGetOpaque(lpage)->maxoff);
+	else
+		*bound = GinDataPageGetPostingItem(lpage,
+									  GinPageGetOpaque(lpage)->maxoff)->key;
 
 	/* set up right bound for right page */
 	bound = GinDataPageGetRightBound(rpage);
@@ -577,12 +582,7 @@ dataSplitPage(GinBtree btree, Buffer lbuf, Buffer rbuf, OffsetNumber off, XLogRe
 
 	/* Prepare a downlink tuple for insertion to the parent */
 	PostingItemSetBlockNumber(&(btree->pitem), BufferGetBlockNumber(lbuf));
-	if (GinPageIsLeaf(lpage))
-		btree->pitem.key = *GinDataPageGetItemPointer(lpage,
-											GinPageGetOpaque(lpage)->maxoff);
-	else
-		btree->pitem.key = GinDataPageGetPostingItem(lpage,
-									  GinPageGetOpaque(lpage)->maxoff)->key;
+	btree->pitem.key = *GinDataPageGetRightBound(lpage);
 	btree->rightblkno = BufferGetBlockNumber(rbuf);
 
 	return lpage;
@@ -623,10 +623,10 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 	BlockNumber blkno;
 	Buffer		buffer;
 	Page		page;
-	int			itemsCount;
+	int			nrootitems;
 
 	/* Calculate how many TIDs will fit on first page. */
-	itemsCount = Min(nitems, GinMaxLeafDataItems);
+	nrootitems = Min(nitems, GinMaxLeafDataItems);
 
 	/*
 	 * Create the root page.
@@ -638,8 +638,8 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 	START_CRIT_SECTION();
 
 	GinInitBuffer(buffer, GIN_DATA | GIN_LEAF);
-	memcpy(GinDataPageGetData(page), items, sizeof(ItemPointerData) * nitems);
-	GinPageGetOpaque(page)->maxoff = nitems;
+	memcpy(GinDataPageGetData(page), items, sizeof(ItemPointerData) * nrootitems);
+	GinPageGetOpaque(page)->maxoff = nrootitems;
 
 	MarkBufferDirty(buffer);
 
@@ -651,7 +651,7 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 
 		data.node = index->rd_node;
 		data.blkno = blkno;
-		data.nitem = nitems;
+		data.nitem = nrootitems;
 
 		rdata[0].buffer = InvalidBuffer;
 		rdata[0].data = (char *) &data;
@@ -660,7 +660,7 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 
 		rdata[1].buffer = InvalidBuffer;
 		rdata[1].data = (char *) items;
-		rdata[1].len = sizeof(ItemPointerData) * itemsCount;
+		rdata[1].len = sizeof(ItemPointerData) * nrootitems;
 		rdata[1].next = NULL;
 
 		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_CREATE_PTREE, rdata);
@@ -678,7 +678,7 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 	/*
 	 * Add any remaining TIDs to the newly-created posting tree.
 	 */
-	if (itemsCount < nitems)
+	if (nitems > nrootitems)
 	{
 		GinPostingTreeScan *gdi;
 
@@ -686,8 +686,8 @@ createPostingTree(Relation index, ItemPointerData *items, uint32 nitems,
 		gdi->btree.isBuild = (buildStats != NULL);
 
 		ginInsertItemPointers(gdi,
-							  items + itemsCount,
-							  nitems - itemsCount,
+							  items + nrootitems,
+							  nitems - nrootitems,
 							  buildStats);
 
 		pfree(gdi);
