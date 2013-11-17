@@ -241,6 +241,7 @@
   &nls;
   &plhandler;
   &fdwhandler;
+  &custom-scan;
   &geqo;
   &indexam;
   &gist;

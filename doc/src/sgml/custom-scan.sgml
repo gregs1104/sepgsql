@@ -1,0 +1,298 @@
+<!-- doc/src/sgml/custom-scan.sgml -->
+
+<chapter id="custom-scan">
+ <title>Writing A Custom Scan Provider</title>
+
+ <indexterm zone="custom-scan">
+  <primary>custom scan</primary>
+  <secondary>handler for</secondary>
+ </indexterm>
+ <para>
+  Custom-scan API enables extension to provide alternative ways to scan or
+  join relations, being fully integrated with cost based optimizer,
+  in addition to the built-in implementation.
+  It consists of a set of callbacks, with a unique name, to be invoked during
+  query planning and execution. Custom-scan provider should implement these
+  callback functions according to the expectation of API.
+ </para>
+ <para>
+  Overall, here is four major jobs that custom-scan provider should implement.
+  The first one is registration of custom-scan provider itself. Usually, it
+  shall be done once at <literal>_PG_init()</literal> entrypoint on module
+  loading.
+  The other three jobs shall be done for each query planning and execution.
+  The second one is submission of candidate paths to scan or join relations,
+  with an adequate cost, for the core planner.
+  Then, planner shall chooses a cheapest path from all the candidates.
+  If custom path survived, the planner kicks the third job; construction of
+  <literal>CustomScan</literal> plan node, being located within query plan
+  tree instead of the built-in plan node.
+  The last one is execution of its implementation in answer to invocations
+  by the core executor.
+ </para>
+ <para>
+  Some of contrib module utilize the custom-scan API. It may be able to
+  provide a good example for new development.
+  <variablelist>
+   <varlistentry>
+    <term><xref linkend="ctidscan"></term>
+    <listitem>
+     <para>
+      Its logic enables to skip earlier pages or terminate scan prior to
+      end of the relation, if inequality operator on <literal>ctid</literal>
+      system column can narrow down the scope to be scanned, instead of
+      the sequential scan that reads a relation from the head to the end.
+     </para>
+    </listitem>
+   </varlistentry>
+   <varlistentry>
+    <term><xref linkend="postgres-fdw"></term>
+    <listitem>
+     <para>
+      Its logic replaces a local join of foreign tables managed by
+      <literal>postgres_fdw</literal> with a custom scan that fetches
+      remotely joined relations.
+      It shows the way to implement a custom scan node that performs
+      instead join nodes.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </para>
+ <para>
+  Right now, only scan and join are supported to have fully integrated cost
+  based query optimization performing on custom scan API.
+  You might be able to implement other stuff, like sort or aggregation, with
+  manipulation of the planned tree, however, extension has to be responsible
+  to handle this replacement correctly. Here is no support by the core.
+ </para>
+
+ <sect1 id="custom-scan-spec">
+  <title>Custom Scan API Functions and Callbacks</title>
+  <sect2 id="custom-scan-register">
+   <title>Registration of custom scan provider</title>
+   <para>
+    The first job for custom scan provider is registration of a set of
+    callbacks with a unique name. Usually, it shall be done once on
+    <literal>_PG_init()</literal> entrypoint of module loading.
+<programlisting>
+void
+register_custom_provider(const CustomProvider *provider);
+</programlisting>
+    Its argument, <literal>CustomProvider</literal> structure, contains
+    a name and a set of callback function pointers but some of them are
+    optional.
+    Once registered, it is copied on the internal table, so the caller
+    does not need to keep this structure any more.
+   </para>
+  </sect2>
+
+  <sect2 id="custom-scan-path">
+   <title>Submission of custom paths</title>
+   <para>
+    The query planner finds out the best way to scan or join relations from
+    the various potential paths; combination of a scan algorithm and target
+    relations.
+    Prior to this selection, we list up all the potential paths towards
+    a target relation (if base relation) or a pair of relations (if join).
+    The <literal>add_scan_path_hook</> and <literal>add_join_path_hook</>
+    allows extensions to add alternative scan paths in addition to built-in
+    ones.
+    If custom-scan provider can submit a potential scan path towards the
+    supplied relation, it shall construct <literal>CustomPath</> object
+    with appropriate parameters.
+<programlisting>
+typedef struct CustomPath
+{
+    Path        path;
+    const char *custom_name;        /* name of custom scan provider */
+    int         custom_flags;       /* CUSTOM__* flags in nodeCustom.h */
+    List       *custom_private;     /* can be used for private data */
+} CustomPath;
+</programlisting>
+    Its <literal>path</> is common field for all the path nodes to store
+    cost estimation. In addition, <literal>custom_name</> is the name of
+    registered custom scan provider, <literal>custom_flags</> is a set of
+    flags below, and <literal>custom_private</> can be used to store private
+    data of the custom scan provider.
+   </para>
+   <para>
+    <variablelist>
+     <varlistentry>
+      <term><literal>CUSTOM__SUPPORT_MARK_RESTORE</></term>
+      <listitem>
+       <para>
+        It informs the query planner this custom scan node supports
+        <literal>ExecMarkPosCustomScan</> and
+        <literal>ExecRestorePosCustomScan</> methods.
+        Also, custom scan provider has to be responsible to mark and restore
+        a particular position.
+       </para>
+      </listitem>
+     </varlistentry>
+     <varlistentry>
+      <term><literal>CUSTOM__SUPPORT_BACKWARD_SCAN</></term>
+      <listitem>
+       <para>
+        It informs the query planner this custom scan node supports
+        backward scan.
+        Also, custom scan provider has to be responsible to scan with
+        backward direction.
+       </para>
+      </listitem>
+     </varlistentry>
+    </variablelist>
+   </para>
+  </sect2>
+
+  <sect2 id="custom-scan-plan">
+   <title>Construction of custom plan node</title>
+   <para>
+    Once <literal>CustomPath</literal> got choosen by query planner,
+    it calls back its associated custom scan provider to complete setting
+    up <literal>CustomScan</literal> plan node according to the path
+    information.
+<programlisting>
+void
+InitCustomScanPlan(PlannerInfo *root,
+                   CustomScan *cscan_plan,
+                   CustomPath *cscan_path,
+                   List *tlist,
+                   List *scan_clauses);
+</programlisting>
+    Query planner does basic initialization on the <literal>cscan_plan</>
+    being allocated, then custom scan provider can apply final initialization.
+    <literal>cscan_path</> is the path node that was constructed on the
+    previous stage then got choosen.
+    <literal>tlist</> is a list of <literal>TargetEntry</> to be assigned
+    on the <literal>Plan</> portion in the <literal>cscan_plan</>.
+    Also, <literal>scan_clauses</> is a list of <literal>RestrictInfo</> to
+    be checked during relation scan. Its expression portion shall be also
+    assigned on the <literal>Plan</> portion, but can be eliminated from
+    this list if custom scan provider can handle these checks by itself.
+   </para>
+   <para>
+    It often needs to adjust <literal>varno</> of <literal>Var</> node that
+    references a particular scan node, after conscruction of plan node.
+    For example, Var node in the target list of join node originally
+    references a particular relation underlying a join, however, it has to
+    be adjusted to either inner or outer reference.
+<programlisting>
+void
+SetPlanRefCustomScan(PlannerInfo *root,
+                     CustomScan *cscan_plan,
+                     int rtoffset);
+</programlisting>
+    This callback is optional if custom scan node is a vanilla relation
+    scan because here is nothing special to do. Elsewhere, it needs to
+    be handled by custom scan provider in case when a custom scan replaced
+    a join with two or more relations for example.
+   </para>
+  </sect2>
+
+  <sect2 id="custom-scan-exec">
+   <title>Execution of custom scan node</title>
+   <para>
+    Query execuror also launches associated callbacks to begin, execute and
+    end custom scan according to the executor's manner.
+   </para>
+   <para>
+<programlisting>
+void
+BeginCustomScan(CustomScanState *csstate, int eflags);
+</programlisting>
+    It begins execution of the custom scan on starting up executor.
+    It allows custom scan provider to do any initialization job around this
+    plan, however, it is not a good idea to launch actual scanning jobs.
+    (It shall be done on the first invocation of <literal>ExecCustomScan</>
+    instead.)
+    The <literal>custom_state</> field of <literal>CustomScanState</> is
+    intended to save the private state being managed by custom scan provider.
+    Also, <literal>eflags</> has flag bits of the executor's operating mode
+    for this plan node.
+    Note that custom scan provider should not perform anything visible
+    externally if <literal>EXEC_FLAG_EXPLAIN_ONLY</> would be given,
+   </para>
+
+   <para>
+<programlisting>
+TupleTableSlot *
+ExecCustomScan(CustomScanState *csstate);
+</programlisting>
+    It fetches one tuple from the underlying relation or relations if join
+    according to the custom logic. Unlike <literal>IterateForeignScan</>
+    method in foreign table, it is also responsible to check whether next
+    tuple matches the qualifier of this scan, or not.
+    A usual way to implement this method is the callback performs just an
+    entrypoint of <literal>ExecQual</> with its own access method.
+   </para>
+
+   <para>
+<programlisting>
+Node *
+MultiExecCustomScan(CustomScanState *csstate);
+</programlisting>
+    It fetches multiple tuples from the underlying relation or relations if
+    join according to the custom logic. Pay attention the data format (and
+    the way to return also) depends on the type of upper node.
+   </para>
+
+   <para>
+<programlisting>
+void
+EndCustomScan(CustomScanState *csstate);
+</programlisting>
+    It ends the scan and release resources privately allocated.
+    It is usually not important to release memory in per-execution memory
+    context. So, all this callback should be responsible is its own
+    resources regardless from the framework.
+   </para>
+  </sect2>
+
+  <sect2 id="custom-scan-misc">
+   <title>Miscellaneous jobs</title>
+   <para>
+<programlisting>
+void
+ReScanCustomScan(CustomScanState *csstate);
+</programlisting>
+    It restarts the current scan from the beginning.
+    Note that parameters of the scan depends on might change values,
+    so rewinded scan does not need to return exactly identical tuples.
+   </para>
+   <para>
+<programlisting>
+void
+MarkPosCustomScan(CustomScanState *csstate);
+</programlisting>
+    It saves the current position of the custom scan on somewhere private
+    state.
+    Note that it is optional to implement, only when
+    <literal>CUSTOM__SUPPORT_MARK_RESTORE</> is set.
+   </para>
+   <para>
+<programlisting>
+void
+RestorePosCustom(CustomScanState *csstate);
+</programlisting>
+    It rewinds the current position of the custom scan to the position
+    where <literal>MarkPosCustomScan</> saved before.
+    Note that it is optional to implement, only when
+    <literal>CUSTOM__SUPPORT_MARK_RESTORE</> is set.
+   </para>
+   <para>
+<programlisting>
+void
+ExplainCustomScan(CustomScanState *csstate,
+                  ExplainState *es);
+</programlisting>
+    It prints additional <command>EXPLAIN</> output for a custom scan plan.
+    This callback is expected to call <literal>ExplainPropertyText</> to
+    make additional field of <command>EXPLAIN</> output.
+    The flag fields in <literal>ExplainState</> indicates what shall be
+    printed, and the state of the <literal>CustomScanState</> will provide
+    run-time statistics in the <command>EXPLAIN ANALYZE</> case.
+   </para>
+  </sect2>
+ </sect1>
+</chapter>

@@ -32,8 +32,8 @@ typedef Node *(*MultiExecCustomScan_function)(CustomScanState *csstate);
 typedef void (*EndCustomScan_function)(CustomScanState *csstate);
 
 typedef void (*ReScanCustomScan_function)(CustomScanState *csstate);
-typedef void (*ExecMarkPosCustomScan_function)(CustomScanState *csstate);
-typedef void (*ExecRestorePosCustom_function)(CustomScanState *csstate);
+typedef void (*MarkPosCustomScan_function)(CustomScanState *csstate);
+typedef void (*RestorePosCustom_function)(CustomScanState *csstate);
 
 typedef void (*ExplainCustomScan_function)(CustomScanState *csstate,
 										   ExplainState *es);
@@ -51,8 +51,8 @@ typedef struct CustomProvider
 	EndCustomScan_function			EndCustomScan;
 
 	ReScanCustomScan_function		ReScanCustomScan;
-	ExecMarkPosCustomScan_function	ExecMarkPosCustomScan;
-	ExecRestorePosCustom_function	ExecRestorePosCustom;
+	MarkPosCustomScan_function		MarkPosCustomScan;
+	RestorePosCustom_function		RestorePosCustom;
 
 	ExplainCustomScan_function		ExplainCustomScan;
 } CustomProvider;

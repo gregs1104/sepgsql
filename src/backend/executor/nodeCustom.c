@@ -238,7 +238,7 @@ void
 ExecCustomMarkPos(CustomScanState *csstate)
 {
 	Assert((csstate->custom_flags & CUSTOM__SUPPORT_MARK_RESTORE) != 0);
-	csstate->custom_provider->ExecMarkPosCustomScan(csstate);
+	csstate->custom_provider->MarkPosCustomScan(csstate);
 }
 
 /*
@@ -248,5 +248,5 @@ void
 ExecCustomRestrPos(CustomScanState *csstate)
 {
 	Assert((csstate->custom_flags & CUSTOM__SUPPORT_MARK_RESTORE) != 0);
-	csstate->custom_provider->ExecRestorePosCustom(csstate);
+	csstate->custom_provider->RestorePosCustom(csstate);
 }
