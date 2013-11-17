@@ -19,6 +19,7 @@
 #include "commands/defrem.h"
 #include "commands/explain.h"
 #include "commands/vacuum.h"
+#include "executor/nodeCustom.h"
 #include "foreign/fdwapi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -45,40 +46,6 @@ PG_MODULE_MAGIC;
 
 /* Default CPU cost to process 1 row (above and beyond cpu_tuple_cost). */
 #define DEFAULT_FDW_TUPLE_COST		0.01
-
-/*
- * FDW-specific planner information kept in RelOptInfo.fdw_private for a
- * foreign table.  This information is collected by postgresGetForeignRelSize.
- */
-typedef struct PgFdwRelationInfo
-{
-	/* baserestrictinfo clauses, broken down into safe and unsafe subsets. */
-	List	   *remote_conds;
-	List	   *local_conds;
-
-	/* Bitmap of attr numbers we need to fetch from the remote server. */
-	Bitmapset  *attrs_used;
-
-	/* Cost and selectivity of local_conds. */
-	QualCost	local_conds_cost;
-	Selectivity local_conds_sel;
-
-	/* Estimated size and cost for a scan with baserestrictinfo quals. */
-	double		rows;
-	int			width;
-	Cost		startup_cost;
-	Cost		total_cost;
-
-	/* Options extracted from catalogs. */
-	bool		use_remote_estimate;
-	Cost		fdw_startup_cost;
-	Cost		fdw_tuple_cost;
-
-	/* Cached catalog information. */
-	ForeignTable *table;
-	ForeignServer *server;
-	UserMapping *user;			/* only set in use_remote_estimate mode */
-} PgFdwRelationInfo;
 
 /*
  * Indexes of FDW-private information stored in fdw_private lists.
@@ -129,6 +96,9 @@ enum FdwModifyPrivateIndex
 typedef struct PgFdwScanState
 {
 	Relation	rel;			/* relcache entry for the foreign table */
+	List	   *join_rels;		/* list of underlying relcache entries, if *
+								 * remote join on top of CustomScan */
+	TupleDesc	scan_tupdesc;	/* tuple descriptor of scanned relation */
 	AttInMetadata *attinmeta;	/* attribute datatype conversion metadata */
 
 	/* extracted fdw_private data */
@@ -214,7 +184,8 @@ typedef struct PgFdwAnalyzeState
  */
 typedef struct ConversionLocation
 {
-	Relation	rel;			/* foreign table's relcache entry */
+	const char *relname;		/* name of the foreign table, if any */
+	TupleDesc	tupdesc;		/* tuple descriptor of scanned relation */
 	AttrNumber	cur_attno;		/* attribute number being processed, or 0 */
 } ConversionLocation;
 
@@ -306,8 +277,8 @@ static void get_remote_estimate(const char *sql,
 static bool ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
 						  EquivalenceClass *ec, EquivalenceMember *em,
 						  void *arg);
-static void create_cursor(ForeignScanState *node);
-static void fetch_more_data(ForeignScanState *node);
+static void create_cursor(PgFdwScanState *fsstate, ExprContext *econtext);
+static void fetch_more_data(PgFdwScanState *fsstate);
 static void close_cursor(PGconn *conn, unsigned int cursor_number);
 static void prepare_foreign_modify(PgFdwModifyState *fmstate);
 static const char **convert_prep_stmt_params(PgFdwModifyState *fmstate,
@@ -323,12 +294,19 @@ static void analyze_row_processor(PGresult *res, int row,
 					  PgFdwAnalyzeState *astate);
 static HeapTuple make_tuple_from_result_row(PGresult *res,
 						   int row,
-						   Relation rel,
+						   const char *relname,
+						   TupleDesc tupdesc,
 						   AttInMetadata *attinmeta,
 						   List *retrieved_attrs,
 						   MemoryContext temp_context);
 static void conversion_error_callback(void *arg);
 
+void		_PG_init(void);
+
+/*
+ * Static variables
+ */
+static add_join_path_hook_type	add_join_path_next = NULL;
 
 /*
  * Foreign-data wrapper handler function: return a struct with pointers
@@ -444,7 +422,7 @@ postgresGetForeignRelSize(PlannerInfo *root,
 	 * Identify which baserestrictinfo clauses can be sent to the remote
 	 * server and which can't.
 	 */
-	classifyConditions(root, baserel,
+	classifyConditions(root, baserel, baserel->baserestrictinfo,
 					   &fpinfo->remote_conds, &fpinfo->local_conds);
 
 	/*
@@ -770,7 +748,7 @@ postgresGetForeignPlan(PlannerInfo *root,
 					 &retrieved_attrs);
 	if (remote_conds)
 		appendWhereClause(&sql, root, baserel, remote_conds,
-						  true, &params_list);
+						  true, false, false, &params_list);
 
 	/*
 	 * Add FOR UPDATE/SHARE if appropriate.  We apply locking during the
@@ -880,6 +858,7 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 
 	/* Get info about foreign table. */
 	fsstate->rel = node->ss.ss_currentRelation;
+	fsstate->scan_tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
 	table = GetForeignTable(RelationGetRelid(fsstate->rel));
 	server = GetForeignServer(table->serverid);
 	user = GetUserMapping(userid, server->serverid);
@@ -969,7 +948,7 @@ postgresIterateForeignScan(ForeignScanState *node)
 	 * cursor on the remote side.
 	 */
 	if (!fsstate->cursor_exists)
-		create_cursor(node);
+		create_cursor(fsstate, node->ss.ps.ps_ExprContext);
 
 	/*
 	 * Get some more tuples, if we've run out.
@@ -978,7 +957,7 @@ postgresIterateForeignScan(ForeignScanState *node)
 	{
 		/* No point in another fetch if we already detected EOF, though. */
 		if (!fsstate->eof_reached)
-			fetch_more_data(node);
+			fetch_more_data(fsstate);
 		/* If we didn't get any tuples, must be end of data. */
 		if (fsstate->next_tuple >= fsstate->num_tuples)
 			return ExecClearTuple(slot);
@@ -1704,10 +1683,10 @@ estimate_path_cost_size(PlannerInfo *root,
 						 &retrieved_attrs);
 		if (fpinfo->remote_conds)
 			appendWhereClause(&sql, root, baserel, fpinfo->remote_conds,
-							  true, NULL);
+							  true, false, false, NULL);
 		if (join_conds)
 			appendWhereClause(&sql, root, baserel, join_conds,
-							  (fpinfo->remote_conds == NIL), NULL);
+						  (fpinfo->remote_conds == NIL), false, false, NULL);
 
 		/* Get the remote estimate */
 		conn = GetConnection(fpinfo->server, fpinfo->user, false);
@@ -1863,10 +1842,8 @@ ec_member_matches_foreign(PlannerInfo *root, RelOptInfo *rel,
  * Create cursor for node's query with current parameter values.
  */
 static void
-create_cursor(ForeignScanState *node)
+create_cursor(PgFdwScanState *fsstate, ExprContext *econtext)
 {
-	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
-	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			numParams = fsstate->numParams;
 	const char **values = fsstate->param_values;
 	PGconn	   *conn = fsstate->conn;
@@ -1953,9 +1930,8 @@ create_cursor(ForeignScanState *node)
  * Fetch some more rows from the node's cursor.
  */
 static void
-fetch_more_data(ForeignScanState *node)
+fetch_more_data(PgFdwScanState *fsstate)
 {
-	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
 	PGresult   *volatile res = NULL;
 	MemoryContext oldcontext;
 
@@ -1975,6 +1951,7 @@ fetch_more_data(ForeignScanState *node)
 		int			fetch_size;
 		int			numrows;
 		int			i;
+		const char *relname = NULL;
 
 		/* The fetch size is arbitrary, but shouldn't be enormous. */
 		fetch_size = 100;
@@ -1993,11 +1970,15 @@ fetch_more_data(ForeignScanState *node)
 		fsstate->num_tuples = numrows;
 		fsstate->next_tuple = 0;
 
+		if (fsstate->rel)
+			relname = RelationGetRelationName(fsstate->rel);
+
 		for (i = 0; i < numrows; i++)
 		{
 			fsstate->tuples[i] =
 				make_tuple_from_result_row(res, i,
-										   fsstate->rel,
+										   relname,
+										   fsstate->scan_tupdesc,
 										   fsstate->attinmeta,
 										   fsstate->retrieved_attrs,
 										   fsstate->temp_cxt);
@@ -2215,11 +2196,13 @@ store_returning_result(PgFdwModifyState *fmstate,
 	{
 		HeapTuple	newtup;
 
-		newtup = make_tuple_from_result_row(res, 0,
-											fmstate->rel,
-											fmstate->attinmeta,
-											fmstate->retrieved_attrs,
-											fmstate->temp_cxt);
+		newtup =
+			make_tuple_from_result_row(res, 0,
+									   RelationGetRelationName(fmstate->rel),
+									   RelationGetDescr(fmstate->rel),
+									   fmstate->attinmeta,
+									   fmstate->retrieved_attrs,
+									   fmstate->temp_cxt);
 		/* tuple will be deleted when it is cleared from the slot */
 		ExecStoreTuple(newtup, slot, InvalidBuffer, true);
 	}
@@ -2507,11 +2490,13 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 		 */
 		oldcontext = MemoryContextSwitchTo(astate->anl_cxt);
 
-		astate->rows[pos] = make_tuple_from_result_row(res, row,
-													   astate->rel,
-													   astate->attinmeta,
-													 astate->retrieved_attrs,
-													   astate->temp_cxt);
+		astate->rows[pos] =
+			make_tuple_from_result_row(res, row,
+									   RelationGetRelationName(astate->rel),
+									   RelationGetDescr(astate->rel),
+									   astate->attinmeta,
+									   astate->retrieved_attrs,
+									   astate->temp_cxt);
 
 		MemoryContextSwitchTo(oldcontext);
 	}
@@ -2528,13 +2513,13 @@ analyze_row_processor(PGresult *res, int row, PgFdwAnalyzeState *astate)
 static HeapTuple
 make_tuple_from_result_row(PGresult *res,
 						   int row,
-						   Relation rel,
+						   const char *relname,
+						   TupleDesc tupdesc,
 						   AttInMetadata *attinmeta,
 						   List *retrieved_attrs,
 						   MemoryContext temp_context)
 {
 	HeapTuple	tuple;
-	TupleDesc	tupdesc = RelationGetDescr(rel);
 	Datum	   *values;
 	bool	   *nulls;
 	ItemPointer ctid = NULL;
@@ -2561,7 +2546,8 @@ make_tuple_from_result_row(PGresult *res,
 	/*
 	 * Set up and install callback to report where conversion error occurs.
 	 */
-	errpos.rel = rel;
+	errpos.relname = relname;
+	errpos.tupdesc = tupdesc;
 	errpos.cur_attno = 0;
 	errcallback.callback = conversion_error_callback;
 	errcallback.arg = (void *) &errpos;
@@ -2646,10 +2632,951 @@ static void
 conversion_error_callback(void *arg)
 {
 	ConversionLocation *errpos = (ConversionLocation *) arg;
-	TupleDesc	tupdesc = RelationGetDescr(errpos->rel);
 
-	if (errpos->cur_attno > 0 && errpos->cur_attno <= tupdesc->natts)
-		errcontext("column \"%s\" of foreign table \"%s\"",
-				   NameStr(tupdesc->attrs[errpos->cur_attno - 1]->attname),
-				   RelationGetRelationName(errpos->rel));
+	if (errpos->cur_attno > 0 && errpos->cur_attno <= errpos->tupdesc->natts)
+	{
+		Form_pg_attribute attr = errpos->tupdesc->attrs[errpos->cur_attno - 1];
+
+		if (errpos->relname)
+			errcontext("column \"%s\" of foreign table \"%s\"",
+					   NameStr(attr->attname), errpos->relname);
+		else
+			errcontext("column \"%s\" of remote join relation",
+					   NameStr(attr->attname));
+	}
+}
+
+/* ------------------------------------------------------------
+ *
+ * Remote JOIN support
+ *
+ * ------------------------------------------------------------
+ */
+enum PgRemoteJoinPrivateIndex
+{
+	PgCust_FdwServUserIds,	/* oid pair of foreign server and user */
+	PgCust_JoinRelids,		/* bitmapset of rtindexes to be joinned */
+	PgCust_JoinType,		/* one of JOIN_* */
+	PgCust_OuterRel,		/* packed joinrel of outer relation */
+	PgCust_InnerRel,		/* packed joinrel of inner relation */
+	PgCust_RemoteConds,		/* remote conditions */
+	PgCust_LocalConds,		/* local conditions */
+	PgCust_SelectVars,		/* list of Var nodes to be fetched */
+	PgCust_SelectParams,	/* list of Var nodes being parameterized */
+	PgCust_SelectSql,		/* remote query being deparsed */
+};
+
+/*
+ * packPgRemoteJoinInfo
+ *
+ * pack PgRemoteJoinInfo into a List object to save as private datum
+ */
+List *
+packPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo)
+{
+	List   *result = NIL;
+
+	/* PgCust_FdwServUserIds */
+	result = lappend(result, list_make2_oid(jinfo->fdw_server_oid,
+											jinfo->fdw_user_oid));
+	/* PgCust_JoinRelids */
+	result = lappend(result, makeString(bms_to_string(jinfo->relids)));
+	/* PgCust_JoinType */
+	result = lappend(result, makeInteger((long) jinfo->jointype));
+	/* PgCust_OuterRel */
+	result = lappend(result, jinfo->outer_rel);
+	/* PgCust_InnerRel */
+	result = lappend(result, jinfo->inner_rel);
+	/* PgCust_RemoteConds */
+	result = lappend(result, jinfo->remote_conds);
+	/* PgCust_LocalConds */
+	result = lappend(result, jinfo->local_conds);
+	/* PgCust_SelectVars */
+	result = lappend(result, jinfo->select_vars);
+	/* PgCust_SelectParams */
+	result = lappend(result, jinfo->select_params);
+	/* PgCust_SelectSql */
+	result = lappend(result, makeString(jinfo->select_qry));
+
+	return result;
+}
+
+/*
+ * unpackPgRemoteJoinInfo
+ *
+ * unpack a private datum to PgRemoteJoinInfo
+ */
+void
+unpackPgRemoteJoinInfo(PgRemoteJoinInfo *jinfo, List *custom_private)
+{
+	ListCell   *lc;
+	int			index = PgCust_FdwServUserIds;
+
+	memset(jinfo, 0, sizeof(PgRemoteJoinInfo));
+	foreach (lc, custom_private)
+	{
+		switch (index)
+		{
+			case PgCust_FdwServUserIds:
+				jinfo->fdw_server_oid = linitial_oid(lfirst(lc));
+				jinfo->fdw_user_oid = lsecond_oid(lfirst(lc));
+				break;
+			case PgCust_JoinRelids:
+				jinfo->relids = bms_from_string(strVal(lfirst(lc)));
+				break;
+			case PgCust_JoinType:
+				jinfo->jointype = (JoinType) intVal(lfirst(lc));
+				break;
+			case PgCust_OuterRel:
+				Assert(IsA(lfirst(lc), List) || IsA(lfirst(lc), Integer));
+				jinfo->outer_rel = lfirst(lc);
+				break;
+			case PgCust_InnerRel:
+				Assert(IsA(lfirst(lc), List) || IsA(lfirst(lc), Integer));
+				jinfo->inner_rel = lfirst(lc);
+				break;
+			case PgCust_RemoteConds:
+				jinfo->remote_conds = lfirst(lc);
+				break;
+			case PgCust_LocalConds:
+				jinfo->local_conds = lfirst(lc);
+				break;
+			case PgCust_SelectVars:
+				jinfo->select_vars = lfirst(lc);
+				break;
+			case PgCust_SelectParams:
+				jinfo->select_params = lfirst(lc);
+				break;
+			case PgCust_SelectSql:
+				jinfo->select_qry = strVal(lfirst(lc));
+				break;
+			default:
+				elog(ERROR, "unexpected member in remote join relinfo");
+		}
+		index++;
+	}
+}
+
+/*
+ * is_self_managed_relation
+ *
+ * It checks whether the supplied relation is either a foreign table or remote
+ * join managed by postgres_fdw. If not, false shall be returned.
+ * If it is a managed relation, some related properties shall be returned to
+ * the caller.
+ */
+static bool
+is_self_managed_relation(PlannerInfo *root, RelOptInfo *rel,
+						 Oid *fdw_server_oid, Oid *fdw_user_oid,
+						 Node **relinfo,
+						 List **remote_conds, List **local_conds)
+{
+	if (rel->reloptkind == RELOPT_BASEREL)
+	{
+		PgFdwRelationInfo  *fpinfo;
+		RangeTblEntry	   *rte;
+
+		/* Is it a foreign table managed by postgres_fdw? */
+		if (rel->rtekind != RTE_RELATION ||
+			rel->fdwroutine == NULL ||
+			rel->fdwroutine->GetForeignRelSize != postgresGetForeignRelSize)
+			return false;
+
+		/*
+		 * Inform the caller its server-id and local user-id also.
+		 * Note that remote user-id is determined according to the pair
+		 * of server-id and local user-id on execution time, not planning
+		 * stage, so we might need to pay attention a scenario that executes
+		 * a plan with different user-id.
+		 * However, all we need to know here is whether both of relations
+		 * shall be run with same credential, or not. Its identical user-id
+		 * is not required here.
+		 * So, InvalidOid shall be set on fdw_user_oid for comparison
+		 * purpose, if it runs based on the credential of GetUserId().
+		 */
+		rte = planner_rt_fetch(rel->relid, root);
+		*fdw_user_oid = rte->checkAsUser;
+
+		fpinfo = (PgFdwRelationInfo *) rel->fdw_private;
+		*fdw_server_oid = fpinfo->server->serverid;
+		*remote_conds = fpinfo->remote_conds;
+		*local_conds = fpinfo->local_conds;
+
+		*relinfo = (Node *) makeInteger(rel->relid);
+
+		return true;
+	}
+	else if (rel->reloptkind == RELOPT_JOINREL)
+	{
+		ListCell   *cell;
+
+		foreach (cell, rel->pathlist)
+		{
+			CustomPath *cpath = lfirst(cell);
+
+			if (IsA(cpath, CustomPath) &&
+				strcmp(cpath->custom_name, "postgres-fdw") == 0)
+			{
+				PgRemoteJoinInfo	jinfo;
+
+				/*
+				 * Note that CustomScan(postgres-fdw) should be constructed
+				 * only when underlying foreign tables use identical server
+				 * and user-id for each.
+				 */
+				unpackPgRemoteJoinInfo(&jinfo, cpath->custom_private);
+				*fdw_server_oid = jinfo.fdw_server_oid;
+				*fdw_user_oid = jinfo.fdw_user_oid;
+				*remote_conds = jinfo.remote_conds;
+				*local_conds = jinfo.local_conds;
+
+				*relinfo = (Node *) cpath->custom_private;
+
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/*
+ * has_wholerow_reference
+ *
+ * It returns true, if supplied expression contains whole-row reference.
+ */
+static bool
+has_wholerow_reference(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RestrictInfo))
+	{
+		RestrictInfo   *rinfo = (RestrictInfo *) node;
+
+		return has_wholerow_reference((Node *)rinfo->clause, context);
+	}
+	if (IsA(node, Var))
+	{
+		Var	   *var = (Var *) node;
+
+		if (var->varlevelsup == 0 && var->varattno == 0)
+			return true;
+		return false;
+	}
+	return expression_tree_walker(node, has_wholerow_reference, context);
+}
+
+/*
+ * estimate_remote_join_cost
+ *
+ * It calculates cost for remote join, then put them on the Path structure.
+ */
+static void
+estimate_remote_join_cost(PlannerInfo *root,
+						  CustomPath *cpath,
+						  PgRemoteJoinInfo *jinfo,
+						  SpecialJoinInfo *sjinfo)
+{
+	RelOptInfo	   *joinrel = cpath->path.parent;
+	ForeignServer  *server;
+	ListCell	   *lc;
+	Cost			startup_cost = DEFAULT_FDW_STARTUP_COST;
+	Cost			tuple_cost = DEFAULT_FDW_TUPLE_COST;
+	Cost			total_cost;
+	QualCost		qual_cost;
+	Selectivity		local_sel;
+	Selectivity		remote_sel;
+	double			rows = joinrel->rows;
+	double			retrieved_rows;
+
+	server = GetForeignServer(jinfo->fdw_server_oid);
+	foreach(lc, server->options)
+	{
+		DefElem	   *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "fdw_startup_cost") == 0)
+			startup_cost = strtod(defGetString(def), NULL);
+		else if (strcmp(def->defname, "fdw_tuple_cost") == 0)
+			tuple_cost = strtod(defGetString(def), NULL);
+	}
+	cost_qual_eval(&qual_cost, jinfo->local_conds, root);
+	local_sel = clauselist_selectivity(root,
+									   jinfo->local_conds,
+									   0,
+									   JOIN_INNER,
+									   NULL);
+	remote_sel = clauselist_selectivity(root,
+										jinfo->remote_conds,
+										0,
+										jinfo->jointype,
+										sjinfo);
+	retrieved_rows = remote_sel * rows;
+
+	startup_cost += qual_cost.startup * retrieved_rows;
+	total_cost = startup_cost;
+	total_cost += tuple_cost * retrieved_rows;
+	total_cost += qual_cost.per_tuple * retrieved_rows;
+	total_cost += cpu_tuple_cost * local_sel * retrieved_rows;
+
+	cpath->path.rows = local_sel * retrieved_rows;
+	cpath->path.startup_cost = startup_cost;
+	cpath->path.total_cost = total_cost;
+}
+
+/*
+ * postgresAddJoinPaths
+ *
+ * A callback routine of add_join_path_hook. It checks whether this join can
+ * be run on the remote server, and add a custom-scan path that launches
+ * a remote join instead of a pair of remote scan and local join.
+ */
+static void
+postgresAddJoinPaths(PlannerInfo *root,
+					 RelOptInfo *joinrel,
+					 RelOptInfo *outerrel,
+					 RelOptInfo *innerrel,
+					 JoinType jointype,
+					 SpecialJoinInfo *sjinfo,
+					 List *restrictlist,
+					 List *mergeclause_list,
+					 SemiAntiJoinFactors *semifactors,
+					 Relids param_source_rels,
+					 Relids extra_lateral_rels)
+{
+	Oid			o_server_oid;
+	Oid			o_user_oid;
+	Node	   *o_relinfo;
+	List	   *o_local_conds;
+	List	   *o_remote_conds;
+	Oid			i_server_oid;
+	Oid			i_user_oid;
+	Node	   *i_relinfo;
+	List	   *i_local_conds;
+	List	   *i_remote_conds;
+	List	   *j_local_conds;
+	List	   *j_remote_conds;
+	ListCell   *lc;
+	Relids		required_outer;
+	PgRemoteJoinInfo jinfo;
+	CustomPath *cpath;
+
+	if (add_join_path_next)
+		(*add_join_path_next)(root, joinrel, outerrel, innerrel,
+							  jointype, sjinfo, restrictlist,
+							  mergeclause_list, semifactors,
+							  param_source_rels, extra_lateral_rels);
+
+	/* only regular SQL JOIN syntax is supported */
+	if (jointype != JOIN_INNER && jointype != JOIN_LEFT &&
+		jointype != JOIN_FULL  && jointype != JOIN_RIGHT)
+		return;
+
+	/* outerrel is managed by this extension? */
+	if (!is_self_managed_relation(root, outerrel,
+								  &o_server_oid, &o_user_oid, &o_relinfo,
+								  &o_remote_conds, &o_local_conds))
+		return;
+
+	/* innerrel is managed by this extension? */
+	if (!is_self_managed_relation(root, innerrel,
+								  &i_server_oid, &i_user_oid, &i_relinfo,
+								  &i_remote_conds, &i_local_conds))
+		return;
+
+	/* Is remote query run with a common credential? */
+	if (o_server_oid != i_server_oid || o_user_oid != i_user_oid)
+		return;
+
+	/* unable to pull up local conditions any more */
+	if ((jointype == JOIN_LEFT && o_local_conds != NIL) ||
+		(jointype == JOIN_RIGHT && i_local_conds != NIL) ||
+		(jointype == JOIN_FULL && (o_local_conds != NIL ||
+								   i_local_conds != NIL)))
+		return;
+
+	classifyConditions(root, joinrel, restrictlist,
+					   &j_remote_conds, &j_local_conds);
+	/* pull-up local conditions, if any */
+	j_local_conds = list_concat(j_local_conds, o_local_conds);
+	j_local_conds = list_concat(j_local_conds, i_local_conds);
+
+	/*
+	 * Not supported to run remote join if whole-row reference is
+	 * included in either of target-list or local-conditions.
+	 *
+	 * XXX - Because we don't have reasonable way to reconstruct a RECORD
+	 * datum from individual columns once extracted. On the other hand, it
+	 * takes additional network bandwidth if we put whole-row reference on
+	 * the remote-join query.
+	 */
+	if (has_wholerow_reference((Node *)joinrel->reltargetlist, NULL) ||
+		has_wholerow_reference((Node *)j_local_conds, NULL))
+		return;
+
+	required_outer = pull_varnos((Node *) joinrel->reltargetlist);
+	foreach (lc, j_local_conds)
+	{
+		RestrictInfo   *rinfo = lfirst(lc);
+
+		required_outer = bms_union(required_outer,
+								   pull_varnos((Node *)rinfo->clause));
+	}
+	required_outer = bms_difference(required_outer, joinrel->relids);
+
+	/* OK, make a CustomScan node to run remote join */
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = joinrel;
+	cpath->path.param_info = get_baserel_parampathinfo(root, joinrel,
+													   required_outer);
+	cpath->custom_name = pstrdup("postgres-fdw");
+	cpath->custom_flags = 0;
+
+	memset(&jinfo, 0, sizeof(PgRemoteJoinInfo));
+	jinfo.fdw_server_oid = o_server_oid;
+	jinfo.fdw_user_oid = o_user_oid;
+	jinfo.relids = joinrel->relids;
+	jinfo.jointype = jointype;
+	jinfo.outer_rel = o_relinfo;
+	jinfo.inner_rel = i_relinfo;
+	jinfo.remote_conds = j_remote_conds;
+	jinfo.local_conds = j_local_conds;
+
+	cpath->custom_private = packPgRemoteJoinInfo(&jinfo);
+
+	estimate_remote_join_cost(root, cpath, &jinfo, sjinfo);
+
+	add_path(joinrel, &cpath->path);
+}
+
+/*
+ * postgresInitCustomScanPlan
+ *
+ * construction of CustomScan according to remote join path above.
+ */
+static void
+postgresInitCustomScanPlan(PlannerInfo *root,
+						   CustomScan *cscan_plan,
+						   CustomPath *cscan_path,
+						   List *tlist,
+						   List *scan_clauses)
+{
+	PgRemoteJoinInfo jinfo;
+	StringInfoData sql;
+	List	   *relinfo = cscan_path->custom_private;
+	List	   *local_conds = NIL;
+	List	   *remote_conds = NIL;
+	ListCell   *lc;
+
+	Assert(cscan_path->path.parent->reloptkind == RELOPT_JOINREL);
+	unpackPgRemoteJoinInfo(&jinfo, relinfo);
+
+	/* pulls expressions from RestrictInfo */
+	local_conds = extract_actual_clauses(jinfo.local_conds, false);
+	remote_conds = extract_actual_clauses(jinfo.remote_conds, false);
+
+	foreach (lc, scan_clauses)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		Assert(IsA(rinfo, RestrictInfo));
+
+		/* Ignore any pseudoconstants, they're dealt with elsewhere */
+		if (rinfo->pseudoconstant)
+			continue;
+
+		if (!list_member(remote_conds, rinfo->clause) &&
+			!list_member(local_conds, rinfo->clause))
+			local_conds = lappend(local_conds, rinfo->clause);
+	}
+
+	/* construct a remote join query */
+	initStringInfo(&sql);
+	deparseRemoteJoinSql(&sql, root, cscan_path->custom_private,
+						 tlist,
+						 local_conds,
+						 &jinfo.select_vars,
+						 &jinfo.select_params);
+	jinfo.local_conds = NIL;	/* never used any more */
+	jinfo.remote_conds = NIL;	/* never used any more */
+	jinfo.select_qry = sql.data;
+
+	cscan_plan->scan.plan.targetlist = tlist;
+	cscan_plan->scan.plan.qual = local_conds;
+	cscan_plan->custom_exprs = remote_conds;
+	cscan_plan->custom_private = packPgRemoteJoinInfo(&jinfo);
+}
+
+/*
+ * fixup_remote_join_expr
+ *
+ * Var nodes that reference a relation of remote join have varno of underlying
+ * foreign tables. It makes a problem because it shall be eventually replaced
+ * by references to outer or inner relation, however, result of remote join is
+ * stored on the scan-tuple-slot neither outer nor inner.
+ * So, we need to replace varno of Var nodes that reference a relation of
+ * remote join by CUSTOM_VAR; that is a pseudo varno to reference a tuple in
+ * the scan-tuple-slot.
+ */
+typedef struct {
+	PlannerInfo *root;
+	List   *select_vars;
+	int		rtoffset;
+} fixup_remote_join_context;
+
+static Node *
+fixup_remote_join_mutator(Node *node, fixup_remote_join_context *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+	{
+		Var		   *newvar = (Var *) copyObject(node);
+		ListCell   *lc;
+		AttrNumber	resno = 1;
+
+		/* remote columns are ordered according to the select_vars */
+		foreach (lc, context->select_vars)
+		{
+			Var	   *selvar = (Var *) lfirst(lc);
+
+			Assert(newvar->varlevelsup == 0);
+
+			if (newvar->varno == selvar->varno &&
+				newvar->varattno == selvar->varattno)
+			{
+				Assert(newvar->vartype == selvar->vartype);
+				Assert(newvar->vartypmod == selvar->vartypmod);
+				Assert(newvar->varcollid == selvar->varcollid);
+
+				newvar->varno = CUSTOM_VAR;
+				newvar->varattno = resno;
+
+				return (Node *) newvar;
+			}
+			resno++;
+		}
+		elog(ERROR, "referenced variable was not in select_vars");
+	}
+	if (IsA(node, CurrentOfExpr))
+	{
+		CurrentOfExpr *cexpr = (CurrentOfExpr *) copyObject(node);
+
+		Assert(cexpr->cvarno != INNER_VAR);
+		Assert(cexpr->cvarno != OUTER_VAR);
+		if (!IS_SPECIAL_VARNO(cexpr->cvarno))
+			cexpr->cvarno += context->rtoffset;
+		return (Node *) cexpr;
+	}
+	if (IsA(node, PlaceHolderVar))
+	{
+		/* At scan level, we should always just evaluate the contained expr */
+		PlaceHolderVar *phv = (PlaceHolderVar *) node;
+
+		return fixup_remote_join_mutator((Node *) phv->phexpr, context);
+	}
+	fix_expr_common(context->root, node);
+	return expression_tree_mutator(node, fixup_remote_join_mutator,
+								   (void *) context);
+}
+
+static Node *
+fixup_remote_join_expr(Node *node, PlannerInfo *root,
+					   List *select_vars, int rtoffset)
+{
+	fixup_remote_join_context context;
+
+	context.root = root;
+	context.select_vars = select_vars;
+	context.rtoffset = rtoffset;
+
+	return fixup_remote_join_mutator(node, &context);
+}
+
+/*
+ * postgresSetPlanRefCustomScan
+ *
+ * We need a special treatment of Var nodes to reference columns in remote
+ * join relation, because we replaces a join relation by a remote query that
+ * returns a result of join being executed remotely.
+ */
+static void
+postgresSetPlanRefCustomScan(PlannerInfo *root,
+							 CustomScan *csplan,
+							 int rtoffset)
+{
+	PgRemoteJoinInfo	jinfo;
+
+	Assert(csplan->scan.scanrelid == 0);
+
+	unpackPgRemoteJoinInfo(&jinfo, csplan->custom_private);
+
+	csplan->scan.plan.targetlist =
+		(List *) fixup_remote_join_expr((Node *)csplan->scan.plan.targetlist,
+										root, jinfo.select_vars, rtoffset);
+	csplan->scan.plan.qual =
+		(List *) fixup_remote_join_expr((Node *)csplan->scan.plan.qual,
+										root, jinfo.select_vars, rtoffset);
+
+	if (rtoffset > 0)
+	{
+		ListCell   *lc;
+
+		foreach (lc, jinfo.select_vars)
+		{
+			Var	*var = lfirst(lc);
+
+			var->varno += rtoffset;
+		}
+	}
+}
+
+/*
+ * postgresBeginCustomScan
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
+static void
+postgresBeginCustomScan(CustomScanState *node, int eflags)
+{
+	CustomScan	   *csplan = (CustomScan *) node->ss.ps.plan;
+	EState		   *estate = node->ss.ps.state;
+	PgRemoteJoinInfo jinfo;
+	PgFdwScanState *fsstate;
+	TupleDesc		tupdesc;
+	List		   *att_names = NIL;
+	List		   *att_types = NIL;
+	List		   *att_typmods = NIL;
+	List		   *att_collations = NIL;
+	List		   *retrieved_attrs = NIL;
+	ListCell	   *lc;
+    ForeignServer  *server;
+    UserMapping	   *user;
+	Oid				userid;
+	int				i, numParams;
+
+	unpackPgRemoteJoinInfo(&jinfo, csplan->custom_private);
+
+	/*
+	 * ss_ScanTupleSlot of ScanState has to be correctly initialized
+	 * even if this invocation is EXPLAIN (without ANALYZE), because
+	 * Var node with CUSTOM_VAR references its TupleDesc to get
+	 * virtual attribute name on the scanned slot.
+	 */
+	ExecInitScanTupleSlot(estate, &node->ss);
+	foreach (lc, jinfo.select_vars)
+	{
+		Oid		reloid;
+		char   *attname;
+		Var	   *var = lfirst(lc);
+
+		Assert(IsA(var, Var));
+		reloid = getrelid(var->varno, estate->es_range_table);
+		attname = get_relid_attribute_name(reloid, var->varattno);
+
+		att_names = lappend(att_names, makeString(attname));
+		att_types = lappend_oid(att_types, var->vartype);
+		att_typmods = lappend_int(att_typmods, var->vartypmod);
+		att_collations = lappend_oid(att_collations, var->varcollid);
+
+		retrieved_attrs = lappend_int(retrieved_attrs,
+									  list_length(retrieved_attrs) + 1);
+	}
+	tupdesc = BuildDescFromLists(att_names, att_types,
+								 att_typmods, att_collations);
+	ExecAssignScanType(&node->ss, tupdesc);
+
+	/*
+	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
+	 */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/*
+	 * CustomScan also uses PgFdwScanState to run remote join
+	 */
+	fsstate = (PgFdwScanState *) palloc0(sizeof(PgFdwScanState));
+	node->custom_state = fsstate;
+
+	/*
+	 * Needs to open underlying relations by itself
+	 */
+	while ((i = bms_first_member(jinfo.relids)) >= 0)
+	{
+		Relation	rel = ExecOpenScanRelation(estate, i, eflags);
+
+		fsstate->join_rels = lappend(fsstate->join_rels, rel);
+	}
+	fsstate->scan_tupdesc = tupdesc;
+
+	/* Get info about foreign server */
+	userid = OidIsValid(jinfo.fdw_user_oid) ? jinfo.fdw_user_oid : GetUserId();
+	user = GetUserMapping(userid, jinfo.fdw_server_oid);
+	server = GetForeignServer(jinfo.fdw_server_oid);
+
+	/*
+	 * Get connection to the foreign server.  Connection manager will
+	 * establish new connection if necessary.
+	 */
+	fsstate->conn = GetConnection(server, user, false);
+
+	/* Assign a unique ID for my cursor */
+	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
+	fsstate->cursor_exists = false;
+
+	/* Get private info created by planner functions. */
+	fsstate->query = jinfo.select_qry;
+	fsstate->retrieved_attrs = retrieved_attrs;
+
+	/* Create contexts for batches of tuples and per-tuple temp workspace. */
+	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											   "postgres_fdw tuple data",
+											   ALLOCSET_DEFAULT_MINSIZE,
+											   ALLOCSET_DEFAULT_INITSIZE,
+											   ALLOCSET_DEFAULT_MAXSIZE);
+	fsstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
+											  "postgres_fdw temporary data",
+											  ALLOCSET_SMALL_MINSIZE,
+											  ALLOCSET_SMALL_INITSIZE,
+											  ALLOCSET_SMALL_MAXSIZE);
+
+	/* Get info we'll need for input data conversion. */
+	fsstate->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+	/* Prepare for output conversion of parameters used in remote query. */
+	numParams = list_length(jinfo.select_params);
+	fsstate->numParams = numParams;
+	fsstate->param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * numParams);
+
+	i = 0;
+	foreach(lc, jinfo.select_params)
+	{
+		Node   *param_expr = (Node *) lfirst(lc);
+		Oid		typefnoid;
+		bool	isvarlena;
+
+		getTypeOutputInfo(exprType(param_expr), &typefnoid, &isvarlena);
+		fmgr_info(typefnoid, &fsstate->param_flinfo[i]);
+		i++;
+	}
+
+    /*
+     * Prepare remote-parameter expressions for evaluation.
+	 */
+    fsstate->param_exprs = (List *)ExecInitExpr((Expr *) jinfo.select_params,
+												(PlanState *) node);
+
+	/*
+     * Allocate buffer for text form of query parameters, if any.
+     */
+	if (numParams > 0)
+		fsstate->param_values = palloc0(numParams * sizeof(char *));
+	else
+		fsstate->param_values = NULL;
+}
+
+/*
+ * postgresExecCustomAccess
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
+static TupleTableSlot *
+postgresExecCustomAccess(CustomScanState *node)
+{
+	PgFdwScanState *fsstate = node->custom_state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	/* create a new cursor, if first call next to Begin or ReScan */
+	if (!fsstate->cursor_exists)
+		create_cursor(fsstate, node->ss.ps.ps_ExprContext);
+
+	/*
+	 * Get some more tuples, if we've run out.
+	 */
+	if (fsstate->next_tuple >= fsstate->num_tuples)
+	{
+		/* No point in another fetch if we already detected EOF, though. */
+		if (!fsstate->eof_reached)
+			fetch_more_data(fsstate);
+		/* If we didn't get any tuples, must be end of data. */
+		if (fsstate->next_tuple >= fsstate->num_tuples)
+			return ExecClearTuple(slot);
+	}
+
+	/*
+	 * Return the next tuple.
+	 */
+	ExecStoreTuple(fsstate->tuples[fsstate->next_tuple++],
+				   slot,
+				   InvalidBuffer,
+				   false);
+
+	return slot;
+}
+
+/*
+ * postgresExecCustomRecheck
+ *
+ * No need to recheck it again.
+ */
+static bool
+postgresExecCustomRecheck(CustomScanState *node, TupleTableSlot *slot)
+{
+	return true;
+}
+
+/*
+ * postgresExecCustomScan
+ *
+ * Just a wrapper of postgresExecCustomScan
+ */
+static TupleTableSlot *
+postgresExecCustomScan(CustomScanState *node)
+{
+	return ExecScan((ScanState *) node,
+					(ExecScanAccessMtd) postgresExecCustomAccess,
+					(ExecScanRecheckMtd) postgresExecCustomRecheck);
+}
+
+/*
+ * postgresEndCustomScan
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
+static void
+postgresEndCustomScan(CustomScanState *node)
+{
+	PgFdwScanState *fsstate = (PgFdwScanState *) node->custom_state;
+	ListCell   *lc;
+
+	if (!fsstate)
+		return;
+
+	/* XXX - logic copied from postgresReScanForeignScan */
+	/* needs reworking */
+
+	/* Close the cursor if open, to prevent accumulation of cursors */
+	if (fsstate->cursor_exists)
+		close_cursor(fsstate->conn, fsstate->cursor_number);
+
+	/* Release remote connection */
+	ReleaseConnection(fsstate->conn);
+	fsstate->conn = NULL;
+
+	/* Also, close the underlying foreign tables by ourselves */
+	foreach (lc, fsstate->join_rels)
+		ExecCloseScanRelation(lfirst(lc));
+}
+
+/*
+ * postgresReScanCustomScan
+ *
+ * XXX - most of logic was ported from existing FDW code. So, it needs to
+ * be reworked first, to use common routine for FDW and CustomScan.
+ */
+static void
+postgresReScanCustomScan(CustomScanState *node)
+{
+	PgFdwScanState *fsstate = node->custom_state;
+	char			sql[64];
+	PGresult	   *res;
+
+	/* XXX - logic copied from postgresReScanForeignScan */
+	/* needs reworking */
+
+	/* If we haven't created the cursor yet, nothing to do. */
+	if (!fsstate->cursor_exists)
+		return;
+
+	/*
+	 * If any internal parameters affecting this node have changed, we'd
+	 * better destroy and recreate the cursor.  Otherwise, rewinding it should
+	 * be good enough.  If we've only fetched zero or one batch, we needn't
+	 * even rewind the cursor, just rescan what we have.
+	 */
+	if (node->ss.ps.chgParam != NULL)
+	{
+		fsstate->cursor_exists = false;
+		snprintf(sql, sizeof(sql), "CLOSE c%u",
+				 fsstate->cursor_number);
+	}
+	else if (fsstate->fetch_ct_2 > 1)
+	{
+		snprintf(sql, sizeof(sql), "MOVE BACKWARD ALL IN c%u",
+				 fsstate->cursor_number);
+	}
+	else
+	{
+		/* Easy: just rescan what we already have in memory, if anything */
+		fsstate->next_tuple = 0;
+		return;
+	}
+
+	/*
+	 * We don't use a PG_TRY block here, so be careful not to throw error
+	 * without releasing the PGresult.
+	 */
+	res = PQexec(fsstate->conn, sql);
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		pgfdw_report_error(ERROR, res, true, sql);
+	PQclear(res);
+
+	/* Now force a fresh FETCH. */
+	fsstate->tuples = NULL;
+	fsstate->num_tuples = 0;
+	fsstate->next_tuple = 0;
+	fsstate->fetch_ct_2 = 0;
+	fsstate->eof_reached = false;
+}
+
+/*
+ * postgresExplainCustomScan
+ *
+ * Callback routine on EXPLAIN. It just adds remote query, if verbose mode.
+ */
+static void
+postgresExplainCustomScan(CustomScanState *csstate,
+						  ExplainState *es)
+{
+	if (es->verbose)
+	{
+		PgRemoteJoinInfo jinfo;
+		CustomScan *cscan = (CustomScan *)csstate->ss.ps.plan;
+
+		unpackPgRemoteJoinInfo(&jinfo, cscan->custom_private);
+
+		ExplainPropertyText("Remote SQL", jinfo.select_qry, es);
+	}
+}
+
+/*
+ * _PG_init
+ *
+ * Entrypoint of this module; registration of custom-scan provider, but
+ * no special registration is not needed for FDW portion.
+ */
+void
+_PG_init(void)
+{
+	CustomProvider	provider;
+
+	/* registration of hook on add_join_paths */
+	add_join_path_next = add_join_path_hook;
+	add_join_path_hook = postgresAddJoinPaths;
+
+	/* registration of custom scan provider */
+	memset(&provider, 0, sizeof(provider));
+	snprintf(provider.name, sizeof(provider.name), "postgres-fdw");
+	provider.InitCustomScanPlan   = postgresInitCustomScanPlan;
+	provider.SetPlanRefCustomScan = postgresSetPlanRefCustomScan;
+	provider.BeginCustomScan      = postgresBeginCustomScan;
+	provider.ExecCustomScan       = postgresExecCustomScan;
+	provider.EndCustomScan        = postgresEndCustomScan;
+	provider.ReScanCustomScan     = postgresReScanCustomScan;
+	provider.ExplainCustomScan    = postgresExplainCustomScan;
+
+	register_custom_provider(&provider);
 }

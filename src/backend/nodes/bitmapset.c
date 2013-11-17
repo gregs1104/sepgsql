@@ -865,3 +865,65 @@ bms_hash_value(const Bitmapset *a)
 	return DatumGetUInt32(hash_any((const unsigned char *) a->words,
 								   (lastword + 1) * sizeof(bitmapword)));
 }
+
+/*
+ * bms_to_string / bms_from_string - transform bitmapset to/from text
+ * representation for portability purpose.
+ */
+char *
+bms_to_string(Bitmapset *a)
+{
+	char   *result;
+	char   *pos;
+	int		i;
+
+	if (bms_is_empty(a))
+		return NULL;
+
+	result = palloc(a->nwords * (BITS_PER_BITMAPWORD / 4) + 1);
+	for (i = a->nwords, pos = result; i > 0; i--)
+		pos += sprintf(pos, "%08x", a->words[i - 1]);
+
+	return result;
+}
+
+Bitmapset *
+bms_from_string(const char *a)
+{
+	Bitmapset  *result;
+	Size		len;
+	int			nwords;
+	int			i, offset = 0;
+
+	if (a == NULL)
+		return NULL;
+
+	len = strlen(a);
+	if (len % (BITS_PER_BITMAPWORD / 4) != 0)
+		elog(WARNING, "strange bitmapset text representation: %s", a);
+
+	nwords = (len + BITS_PER_BITMAPWORD / 4 - 1) / (BITS_PER_BITMAPWORD / 4);
+	result = palloc(BITMAPSET_SIZE(nwords));
+	result->nwords = nwords;
+
+	for (i=result->nwords; i > 0; i--)
+	{
+		bitmapword	word = 0;
+
+		do {
+			int		c = a[offset++];
+			if (c >= '0' && c <= '9')
+				word = (word << 4) | (c - '0');
+			else if (c >= 'a' && c <= 'f')
+				word = (word << 4) | (c - 'a');
+			else if (c >= 'A' && c <= 'F')
+				word = (word << 4) | (c - 'A');
+			else
+				elog(ERROR, "invalid hexadecimal digit");
+		} while ((len - offset) % (BITS_PER_BITMAPWORD / 4) != 0);
+
+		result->words[i - 1] = word;
+	}
+
+	return result;
+}
