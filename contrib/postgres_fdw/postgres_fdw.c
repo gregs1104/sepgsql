@@ -822,85 +822,59 @@ postgresGetForeignPlan(PlannerInfo *root,
  * postgresBeginForeignScan
  *		Initiate an executor scan of a foreign PostgreSQL table.
  */
-static void
-postgresBeginForeignScan(ForeignScanState *node, int eflags)
+static PgFdwScanState *
+commonBeginForeignScan(PlanState *ps, TupleDesc tupdesc,
+					   Oid serverid, Oid userid,
+					   char *remote_query, List *retrieved_attrs,
+					   List *remote_exprs)
 {
-	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
-	EState	   *estate = node->ss.ps.state;
 	PgFdwScanState *fsstate;
-	RangeTblEntry *rte;
-	Oid			userid;
-	ForeignTable *table;
-	ForeignServer *server;
-	UserMapping *user;
-	int			numParams;
-	int			i;
-	ListCell   *lc;
+	ForeignServer  *server;
+	UserMapping	   *user;
+	int				numParams;
+	int				i;
+	ListCell	   *lc;
 
-	/*
-	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
-	 */
-	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
-		return;
-
-	/*
-	 * We'll save private state in node->fdw_state.
-	 */
+	/* Allocation of private state */
 	fsstate = (PgFdwScanState *) palloc0(sizeof(PgFdwScanState));
-	node->fdw_state = (void *) fsstate;
-
-	/*
-	 * Identify which user to do the remote access as.	This should match what
-	 * ExecCheckRTEPerms() does.
-	 */
-	rte = rt_fetch(fsplan->scan.scanrelid, estate->es_range_table);
-	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
-
-	/* Get info about foreign table. */
-	fsstate->rel = node->ss.ss_currentRelation;
-	fsstate->scan_tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
-	table = GetForeignTable(RelationGetRelid(fsstate->rel));
-	server = GetForeignServer(table->serverid);
-	user = GetUserMapping(userid, server->serverid);
+	fsstate->scan_tupdesc = tupdesc;
+	fsstate->query = remote_query;
+	fsstate->retrieved_attrs = retrieved_attrs;
 
 	/*
 	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
+	 * establish new connection on demand.
 	 */
+	server = GetForeignServer(serverid);
+	user = GetUserMapping(userid, serverid);
 	fsstate->conn = GetConnection(server, user, false);
 
 	/* Assign a unique ID for my cursor */
 	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
 	fsstate->cursor_exists = false;
 
-	/* Get private info created by planner functions. */
-	fsstate->query = strVal(list_nth(fsplan->fdw_private,
-									 FdwScanPrivateSelectSql));
-	fsstate->retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
-											   FdwScanPrivateRetrievedAttrs);
-
 	/* Create contexts for batches of tuples and per-tuple temp workspace. */
-	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
+	fsstate->batch_cxt = AllocSetContextCreate(ps->state->es_query_cxt,
 											   "postgres_fdw tuple data",
 											   ALLOCSET_DEFAULT_MINSIZE,
 											   ALLOCSET_DEFAULT_INITSIZE,
 											   ALLOCSET_DEFAULT_MAXSIZE);
-	fsstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
+	fsstate->temp_cxt = AllocSetContextCreate(ps->state->es_query_cxt,
 											  "postgres_fdw temporary data",
 											  ALLOCSET_SMALL_MINSIZE,
 											  ALLOCSET_SMALL_INITSIZE,
 											  ALLOCSET_SMALL_MAXSIZE);
 
 	/* Get info we'll need for input data conversion. */
-	fsstate->attinmeta = TupleDescGetAttInMetadata(RelationGetDescr(fsstate->rel));
+	fsstate->attinmeta = TupleDescGetAttInMetadata(fsstate->scan_tupdesc);
 
 	/* Prepare for output conversion of parameters used in remote query. */
-	numParams = list_length(fsplan->fdw_exprs);
+	numParams = list_length(remote_exprs);
 	fsstate->numParams = numParams;
 	fsstate->param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * numParams);
 
 	i = 0;
-	foreach(lc, fsplan->fdw_exprs)
+	foreach(lc, remote_exprs)
 	{
 		Node	   *param_expr = (Node *) lfirst(lc);
 		Oid			typefnoid;
@@ -919,17 +893,62 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	 * benefit, and it'd require postgres_fdw to know more than is desirable
 	 * about Param evaluation.)
 	 */
-	fsstate->param_exprs = (List *)
-		ExecInitExpr((Expr *) fsplan->fdw_exprs,
-					 (PlanState *) node);
+	fsstate->param_exprs = (List *) ExecInitExpr((Expr *) remote_exprs, ps);
 
 	/*
 	 * Allocate buffer for text form of query parameters, if any.
 	 */
 	if (numParams > 0)
-		fsstate->param_values = (const char **) palloc0(numParams * sizeof(char *));
+		fsstate->param_values = palloc0(numParams * sizeof(char *));
 	else
 		fsstate->param_values = NULL;
+
+	return fsstate;
+}
+
+static void
+postgresBeginForeignScan(ForeignScanState *node, int eflags)
+{
+	ForeignScan *fsplan = (ForeignScan *) node->ss.ps.plan;
+	PgFdwScanState *fsstate;
+	EState	   *estate = node->ss.ps.state;
+	Relation	rel;
+	char	   *remote_query;
+	List	   *retrieved_attrs;
+	RangeTblEntry *rte;
+	Oid			userid;
+	ForeignTable *table;
+
+	/*
+	 * Do nothing in EXPLAIN (no ANALYZE) case.  node->fdw_state stays NULL.
+	 */
+	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
+		return;
+
+	/*
+	 * Identify which user to do the remote access as.	This should match what
+	 * ExecCheckRTEPerms() does.
+	 */
+	rte = rt_fetch(fsplan->scan.scanrelid, estate->es_range_table);
+	userid = rte->checkAsUser ? rte->checkAsUser : GetUserId();
+
+	/* Get info about foreign table. */
+	rel = node->ss.ss_currentRelation;
+	table = GetForeignTable(RelationGetRelid(rel));
+
+	/* Get private info created by planner functions. */
+    remote_query = strVal(list_nth(fsplan->fdw_private,
+								   FdwScanPrivateSelectSql));
+	retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
+										FdwScanPrivateRetrievedAttrs);
+
+	fsstate = commonBeginForeignScan(&node->ss.ps, RelationGetDescr(rel),
+									 table->serverid, userid,
+									 remote_query, retrieved_attrs,
+									 fsplan->fdw_exprs);
+	fsstate->rel = rel;
+
+	node->fdw_state = fsstate;
 }
 
 /*
@@ -938,17 +957,15 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
  *		EOF.
  */
 static TupleTableSlot *
-postgresIterateForeignScan(ForeignScanState *node)
+commonIterateForeignScan(PgFdwScanState *fsstate, PlanState *ps,
+						 TupleTableSlot *slot)
 {
-	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
-	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
-
 	/*
 	 * If this is the first call after Begin or ReScan, we need to create the
 	 * cursor on the remote side.
 	 */
 	if (!fsstate->cursor_exists)
-		create_cursor(fsstate, node->ss.ps.ps_ExprContext);
+		create_cursor(fsstate, ps->ps_ExprContext);
 
 	/*
 	 * Get some more tuples, if we've run out.
@@ -974,14 +991,22 @@ postgresIterateForeignScan(ForeignScanState *node)
 	return slot;
 }
 
+static TupleTableSlot *
+postgresIterateForeignScan(ForeignScanState *node)
+{
+	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
+
+	return commonIterateForeignScan(fsstate, &node->ss.ps, slot);
+}
+
 /*
  * postgresReScanForeignScan
  *		Restart the scan.
  */
 static void
-postgresReScanForeignScan(ForeignScanState *node)
+commonReScanForeignScan(PgFdwScanState *fsstate, PlanState *ps)
 {
-	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
 	char		sql[64];
 	PGresult   *res;
 
@@ -995,7 +1020,7 @@ postgresReScanForeignScan(ForeignScanState *node)
 	 * be good enough.	If we've only fetched zero or one batch, we needn't
 	 * even rewind the cursor, just rescan what we have.
 	 */
-	if (node->ss.ps.chgParam != NULL)
+	if (ps->chgParam != NULL)
 	{
 		fsstate->cursor_exists = false;
 		snprintf(sql, sizeof(sql), "CLOSE c%u",
@@ -1030,19 +1055,21 @@ postgresReScanForeignScan(ForeignScanState *node)
 	fsstate->eof_reached = false;
 }
 
+static void
+postgresReScanForeignScan(ForeignScanState *node)
+{
+	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+
+	commonReScanForeignScan(fsstate, &node->ss.ps);
+}
+
 /*
  * postgresEndForeignScan
  *		Finish scanning foreign table and dispose objects used for this scan
  */
 static void
-postgresEndForeignScan(ForeignScanState *node)
+commonEndForeignScan(PgFdwScanState *fsstate)
 {
-	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
-
-	/* if fsstate is NULL, we are in EXPLAIN; nothing to do */
-	if (fsstate == NULL)
-		return;
-
 	/* Close the cursor if open, to prevent accumulation of cursors */
 	if (fsstate->cursor_exists)
 		close_cursor(fsstate->conn, fsstate->cursor_number);
@@ -1052,6 +1079,18 @@ postgresEndForeignScan(ForeignScanState *node)
 	fsstate->conn = NULL;
 
 	/* MemoryContexts will be deleted automatically. */
+}
+
+static void
+postgresEndForeignScan(ForeignScanState *node)
+{
+	PgFdwScanState *fsstate = (PgFdwScanState *) node->fdw_state;
+
+	/* if fsstate is NULL, we are in EXPLAIN; nothing to do */
+	if (fsstate == NULL)
+		return;
+
+	commonEndForeignScan(fsstate);
 }
 
 /*
@@ -3234,8 +3273,13 @@ postgresSetPlanRefCustomScan(PlannerInfo *root,
 /*
  * postgresBeginCustomScan
  *
- * XXX - most of logic was ported from existing FDW code. So, it needs to
- * be reworked first, to use common routine for FDW and CustomScan.
+ * Most of logic are equivalent to postgresBeginForeignScan, however,
+ * needs adjustment because of difference in the nature.
+ * The biggest one is, it has to open the underlying relation by itself
+ * and needs to construct tuple-descriptor from the var-list to be fetched,
+ * because custom-scan (in this case; a scan on remote join instead of
+ * local join) does not have a particular relation on its behaind, thus
+ * it needs to manage correctly.
  */
 static void
 postgresBeginCustomScan(CustomScanState *node, int eflags)
@@ -3245,16 +3289,15 @@ postgresBeginCustomScan(CustomScanState *node, int eflags)
 	PgRemoteJoinInfo jinfo;
 	PgFdwScanState *fsstate;
 	TupleDesc		tupdesc;
+	List		   *join_rels = NIL;
 	List		   *att_names = NIL;
 	List		   *att_types = NIL;
 	List		   *att_typmods = NIL;
 	List		   *att_collations = NIL;
 	List		   *retrieved_attrs = NIL;
 	ListCell	   *lc;
-    ForeignServer  *server;
-    UserMapping	   *user;
 	Oid				userid;
-	int				i, numParams;
+	int				i;
 
 	unpackPgRemoteJoinInfo(&jinfo, csplan->custom_private);
 
@@ -3294,93 +3337,39 @@ postgresBeginCustomScan(CustomScanState *node, int eflags)
 		return;
 
 	/*
-	 * CustomScan also uses PgFdwScanState to run remote join
-	 */
-	fsstate = (PgFdwScanState *) palloc0(sizeof(PgFdwScanState));
-	node->custom_state = fsstate;
-
-	/*
 	 * Needs to open underlying relations by itself
 	 */
 	while ((i = bms_first_member(jinfo.relids)) >= 0)
 	{
 		Relation	rel = ExecOpenScanRelation(estate, i, eflags);
 
-		fsstate->join_rels = lappend(fsstate->join_rels, rel);
+		join_rels = lappend(join_rels, rel);
 	}
-	fsstate->scan_tupdesc = tupdesc;
 
-	/* Get info about foreign server */
+	/*
+	 * Determine a user-id. Current user-id shall be applied without something
+	 * special configuration on the reference.
+	 */
 	userid = OidIsValid(jinfo.fdw_user_oid) ? jinfo.fdw_user_oid : GetUserId();
-	user = GetUserMapping(userid, jinfo.fdw_server_oid);
-	server = GetForeignServer(jinfo.fdw_server_oid);
 
-	/*
-	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
-	 */
-	fsstate->conn = GetConnection(server, user, false);
+	/* common part to begin remote query execution */
+	fsstate = commonBeginForeignScan(&node->ss.ps, tupdesc,
+									 jinfo.fdw_server_oid, userid,
+									 jinfo.select_qry,
+									 retrieved_attrs,
+									 jinfo.select_params);
+	/* also, underlying relations also have to be saved */
+	fsstate->join_rels = join_rels;
 
-	/* Assign a unique ID for my cursor */
-	fsstate->cursor_number = GetCursorNumber(fsstate->conn);
-	fsstate->cursor_exists = false;
-
-	/* Get private info created by planner functions. */
-	fsstate->query = jinfo.select_qry;
-	fsstate->retrieved_attrs = retrieved_attrs;
-
-	/* Create contexts for batches of tuples and per-tuple temp workspace. */
-	fsstate->batch_cxt = AllocSetContextCreate(estate->es_query_cxt,
-											   "postgres_fdw tuple data",
-											   ALLOCSET_DEFAULT_MINSIZE,
-											   ALLOCSET_DEFAULT_INITSIZE,
-											   ALLOCSET_DEFAULT_MAXSIZE);
-	fsstate->temp_cxt = AllocSetContextCreate(estate->es_query_cxt,
-											  "postgres_fdw temporary data",
-											  ALLOCSET_SMALL_MINSIZE,
-											  ALLOCSET_SMALL_INITSIZE,
-											  ALLOCSET_SMALL_MAXSIZE);
-
-	/* Get info we'll need for input data conversion. */
-	fsstate->attinmeta = TupleDescGetAttInMetadata(tupdesc);
-
-	/* Prepare for output conversion of parameters used in remote query. */
-	numParams = list_length(jinfo.select_params);
-	fsstate->numParams = numParams;
-	fsstate->param_flinfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo) * numParams);
-
-	i = 0;
-	foreach(lc, jinfo.select_params)
-	{
-		Node   *param_expr = (Node *) lfirst(lc);
-		Oid		typefnoid;
-		bool	isvarlena;
-
-		getTypeOutputInfo(exprType(param_expr), &typefnoid, &isvarlena);
-		fmgr_info(typefnoid, &fsstate->param_flinfo[i]);
-		i++;
-	}
-
-    /*
-     * Prepare remote-parameter expressions for evaluation.
-	 */
-    fsstate->param_exprs = (List *)ExecInitExpr((Expr *) jinfo.select_params,
-												(PlanState *) node);
-
-	/*
-     * Allocate buffer for text form of query parameters, if any.
-     */
-	if (numParams > 0)
-		fsstate->param_values = palloc0(numParams * sizeof(char *));
-	else
-		fsstate->param_values = NULL;
+	node->custom_state = fsstate;
 }
 
 /*
  * postgresExecCustomAccess
  *
- * XXX - most of logic was ported from existing FDW code. So, it needs to
- * be reworked first, to use common routine for FDW and CustomScan.
+ * Access method to fetch a tuple from the remote join query.
+ * It performs equivalent job as postgresIterateForeignScan() doing on
+ * queries to single relation.
  */
 static TupleTableSlot *
 postgresExecCustomAccess(CustomScanState *node)
@@ -3388,32 +3377,7 @@ postgresExecCustomAccess(CustomScanState *node)
 	PgFdwScanState *fsstate = node->custom_state;
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 
-	/* create a new cursor, if first call next to Begin or ReScan */
-	if (!fsstate->cursor_exists)
-		create_cursor(fsstate, node->ss.ps.ps_ExprContext);
-
-	/*
-	 * Get some more tuples, if we've run out.
-	 */
-	if (fsstate->next_tuple >= fsstate->num_tuples)
-	{
-		/* No point in another fetch if we already detected EOF, though. */
-		if (!fsstate->eof_reached)
-			fetch_more_data(fsstate);
-		/* If we didn't get any tuples, must be end of data. */
-		if (fsstate->next_tuple >= fsstate->num_tuples)
-			return ExecClearTuple(slot);
-	}
-
-	/*
-	 * Return the next tuple.
-	 */
-	ExecStoreTuple(fsstate->tuples[fsstate->next_tuple++],
-				   slot,
-				   InvalidBuffer,
-				   false);
-
-	return slot;
+	return commonIterateForeignScan(fsstate, &node->ss.ps, slot);
 }
 
 /*
@@ -3430,7 +3394,7 @@ postgresExecCustomRecheck(CustomScanState *node, TupleTableSlot *slot)
 /*
  * postgresExecCustomScan
  *
- * Just a wrapper of postgresExecCustomScan
+ * Just a wrapper of regular ExecScan
  */
 static TupleTableSlot *
 postgresExecCustomScan(CustomScanState *node)
@@ -3443,8 +3407,8 @@ postgresExecCustomScan(CustomScanState *node)
 /*
  * postgresEndCustomScan
  *
- * XXX - most of logic was ported from existing FDW code. So, it needs to
- * be reworked first, to use common routine for FDW and CustomScan.
+ * Nothing are different from postgresEndForeignScan, except for closing
+ * underlying relations by itself.
  */
 static void
 postgresEndCustomScan(CustomScanState *node)
@@ -3452,21 +3416,13 @@ postgresEndCustomScan(CustomScanState *node)
 	PgFdwScanState *fsstate = (PgFdwScanState *) node->custom_state;
 	ListCell   *lc;
 
-	if (!fsstate)
+	/* if fsstate is NULL, we are in EXPLAIN; nothing to do */
+	if (fsstate == NULL)
 		return;
 
-	/* XXX - logic copied from postgresReScanForeignScan */
-	/* needs reworking */
+	/* cleanup resources used in common portion */
+	commonEndForeignScan(fsstate);
 
-	/* Close the cursor if open, to prevent accumulation of cursors */
-	if (fsstate->cursor_exists)
-		close_cursor(fsstate->conn, fsstate->cursor_number);
-
-	/* Release remote connection */
-	ReleaseConnection(fsstate->conn);
-	fsstate->conn = NULL;
-
-	/* Also, close the underlying foreign tables by ourselves */
 	foreach (lc, fsstate->join_rels)
 		ExecCloseScanRelation(lfirst(lc));
 }
@@ -3474,62 +3430,14 @@ postgresEndCustomScan(CustomScanState *node)
 /*
  * postgresReScanCustomScan
  *
- * XXX - most of logic was ported from existing FDW code. So, it needs to
- * be reworked first, to use common routine for FDW and CustomScan.
+ * Same as postgresReScanForeignScan() doing.
  */
 static void
 postgresReScanCustomScan(CustomScanState *node)
 {
 	PgFdwScanState *fsstate = node->custom_state;
-	char			sql[64];
-	PGresult	   *res;
 
-	/* XXX - logic copied from postgresReScanForeignScan */
-	/* needs reworking */
-
-	/* If we haven't created the cursor yet, nothing to do. */
-	if (!fsstate->cursor_exists)
-		return;
-
-	/*
-	 * If any internal parameters affecting this node have changed, we'd
-	 * better destroy and recreate the cursor.  Otherwise, rewinding it should
-	 * be good enough.  If we've only fetched zero or one batch, we needn't
-	 * even rewind the cursor, just rescan what we have.
-	 */
-	if (node->ss.ps.chgParam != NULL)
-	{
-		fsstate->cursor_exists = false;
-		snprintf(sql, sizeof(sql), "CLOSE c%u",
-				 fsstate->cursor_number);
-	}
-	else if (fsstate->fetch_ct_2 > 1)
-	{
-		snprintf(sql, sizeof(sql), "MOVE BACKWARD ALL IN c%u",
-				 fsstate->cursor_number);
-	}
-	else
-	{
-		/* Easy: just rescan what we already have in memory, if anything */
-		fsstate->next_tuple = 0;
-		return;
-	}
-
-	/*
-	 * We don't use a PG_TRY block here, so be careful not to throw error
-	 * without releasing the PGresult.
-	 */
-	res = PQexec(fsstate->conn, sql);
-	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pgfdw_report_error(ERROR, res, true, sql);
-	PQclear(res);
-
-	/* Now force a fresh FETCH. */
-	fsstate->tuples = NULL;
-	fsstate->num_tuples = 0;
-	fsstate->next_tuple = 0;
-	fsstate->fetch_ct_2 = 0;
-	fsstate->eof_reached = false;
+	commonReScanForeignScan(fsstate, &node->ss.ps);
 }
 
 /*
