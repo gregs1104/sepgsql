@@ -109,6 +109,7 @@ CREATE EXTENSION <replaceable>module_name</> FROM unpackaged;
  &btree-gist;
  &chkpass;
  &citext;
+ &ctidscan;
  &cube;
  &dblink;
  &dict-int;

@@ -12,6 +12,7 @@ SUBDIRS = \
 		btree_gist	\
 		chkpass		\
 		citext		\
+		ctidscan	\
 		cube		\
 		dblink		\
 		dict_int	\
