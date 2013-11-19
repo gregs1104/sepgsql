@@ -105,7 +105,6 @@
 <!ENTITY btree-gist      SYSTEM "btree-gist.sgml">
 <!ENTITY chkpass         SYSTEM "chkpass.sgml">
 <!ENTITY citext          SYSTEM "citext.sgml">
-<!ENTITY ctidscan        SYSTEM "ctidscan.sgml">
 <!ENTITY cube            SYSTEM "cube.sgml">
 <!ENTITY dblink          SYSTEM "dblink.sgml">
 <!ENTITY dict-int        SYSTEM "dict-int.sgml">

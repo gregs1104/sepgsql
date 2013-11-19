@@ -90,7 +90,6 @@ regress_data_files = \
 
 install-tests: all install install-lib installdirs-tests
 	$(MAKE) -C $(top_builddir)/contrib/spi install
-	$(MAKE) -C $(top_builddir)/contrib/ctidscan install
 	for file in $(regress_data_files); do \
 	  $(INSTALL_DATA) $$file '$(DESTDIR)$(pkglibdir)/regress/'$$file || exit; \
 	done
@@ -99,9 +98,9 @@ installdirs-tests: installdirs
 	$(MKDIR_P)  $(patsubst $(srcdir)/%/,'$(DESTDIR)$(pkglibdir)/regress/%',$(sort $(dir $(regress_data_files))))
 
 
-# Get some extra C modules from contrib/spi, dummy_seclabel and ctidscan
+# Get some extra C modules from contrib/spi and contrib/dummy_seclabel...
 
-all: refint$(DLSUFFIX) autoinc$(DLSUFFIX) dummy_seclabel$(DLSUFFIX) ctidscan$(DLSUFFIX)
+all: refint$(DLSUFFIX) autoinc$(DLSUFFIX) dummy_seclabel$(DLSUFFIX)
 
 refint$(DLSUFFIX): $(top_builddir)/contrib/spi/refint$(DLSUFFIX)
 	cp $< $@
@@ -112,16 +111,11 @@ autoinc$(DLSUFFIX): $(top_builddir)/contrib/spi/autoinc$(DLSUFFIX)
 dummy_seclabel$(DLSUFFIX): $(top_builddir)/contrib/dummy_seclabel/dummy_seclabel$(DLSUFFIX)
 	cp $< $@
 
-ctidscan$(DLSUFFIX): $(top_builddir)/contrib/ctidscan/ctidscan$(DLSUFFIX)
-	cp $< $@
-
 $(top_builddir)/contrib/spi/refint$(DLSUFFIX): | submake-contrib-spi ;
 
 $(top_builddir)/contrib/spi/autoinc$(DLSUFFIX): | submake-contrib-spi ;
 
 $(top_builddir)/contrib/dummy_seclabel/dummy_seclabel$(DLSUFFIX): | submake-contrib-dummy_seclabel ;
-
-$(top_builddir)/contrib/ctidscan/ctidscan$(DLSUFFIX): | submake-contrib-ctidscan
 
 submake-contrib-spi:
 	$(MAKE) -C $(top_builddir)/contrib/spi
@@ -129,10 +123,7 @@ submake-contrib-spi:
 submake-contrib-dummy_seclabel:
 	$(MAKE) -C $(top_builddir)/contrib/dummy_seclabel
 
-submake-contrib-ctidscan:
-	$(MAKE) -C $(top_builddir)/contrib/ctidscan
-
-.PHONY: submake-contrib-spi submake-contrib-dummy_seclabel submake-contrib-ctidscan
+.PHONY: submake-contrib-spi submake-contrib-dummy_seclabel
 
 # Tablespace setup
 

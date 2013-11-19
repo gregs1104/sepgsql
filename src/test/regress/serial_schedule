@@ -91,7 +91,6 @@ test: btree_index
 test: hash_index
 test: update
 test: delete
-test: custom_scan
 test: namespace
 test: prepared_xacts
 test: privileges
