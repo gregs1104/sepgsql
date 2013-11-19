@@ -1084,7 +1084,7 @@ copyVar(Var *var)
  * We assume it's okay to update opcode info in-place.  So this could possibly
  * scribble on the planner's input data structures, but it's OK.
  */
-void
+static void
 fix_expr_common(PlannerInfo *root, Node *node)
 {
 	/* We assume callers won't call us on a NULL pointer */
