@@ -359,11 +359,10 @@ CTidInitCustomScanPlan(PlannerInfo *root,
 					   List *tlist,
 					   List *scan_clauses)
 {
-	Index		scan_relid = cscan_path->path.parent->relid;
 	List	   *ctidquals = cscan_path->custom_private;
 
 	/* should be a base relation */
-	Assert(scan_relid > 0);
+	Assert(cscan_path->path.parent->relid > 0);
 	Assert(cscan_path->path.parent->rtekind == RTE_RELATION);
 
 	/* Reduce RestrictInfo list to bare expressions; ignore pseudoconstants */

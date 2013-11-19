@@ -145,6 +145,9 @@ extern void final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 extern void cost_subplan(PlannerInfo *root, SubPlan *subplan, Plan *plan);
 extern void cost_qual_eval(QualCost *cost, List *quals, PlannerInfo *root);
 extern void cost_qual_eval_node(QualCost *cost, Node *qual, PlannerInfo *root);
+extern void get_restriction_qual_cost(PlannerInfo *root, RelOptInfo *baserel,
+						  ParamPathInfo *param_info,
+						  QualCost *qpqual_cost);
 extern void compute_semi_anti_join_factors(PlannerInfo *root,
 							   RelOptInfo *outerrel,
 							   RelOptInfo *innerrel,

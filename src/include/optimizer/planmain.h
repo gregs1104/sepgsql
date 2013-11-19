@@ -127,6 +127,7 @@ extern List *remove_useless_joins(PlannerInfo *root, List *joinlist);
  * prototypes for plan/setrefs.c
  */
 extern Plan *set_plan_references(PlannerInfo *root, Plan *plan);
+extern void fix_expr_common(PlannerInfo *root, Node *node);
 extern void fix_opfuncids(Node *node);
 extern void set_opfuncid(OpExpr *opexpr);
 extern void set_sa_opfuncid(ScalarArrayOpExpr *opexpr);
