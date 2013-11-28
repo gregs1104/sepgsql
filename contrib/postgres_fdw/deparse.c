@@ -1041,7 +1041,7 @@ deparseRemoteJoinRelation(StringInfo tlist_buf,
 			RelOptInfo *joinrel = find_join_rel(root, jinfo.relids);
 			appendWhereClause(from_buf, root, joinrel,
 							  jinfo.remote_conds,
-                              true, true, true, select_params);
+							  true, true, true, select_params);
 		}
 		else
 		{

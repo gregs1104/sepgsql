@@ -937,7 +937,7 @@ postgresBeginForeignScan(ForeignScanState *node, int eflags)
 	table = GetForeignTable(RelationGetRelid(rel));
 
 	/* Get private info created by planner functions. */
-    remote_query = strVal(list_nth(fsplan->fdw_private,
+	remote_query = strVal(list_nth(fsplan->fdw_private,
 								   FdwScanPrivateSelectSql));
 	retrieved_attrs = (List *) list_nth(fsplan->fdw_private,
 										FdwScanPrivateRetrievedAttrs);
