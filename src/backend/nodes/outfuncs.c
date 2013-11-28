@@ -576,7 +576,7 @@ _outCustomScan(StringInfo str, const CustomScan *node)
 	WRITE_NODE_FIELD(custom_exprs);
 
 	WRITE_NODE_FIELD(subqry_plan);
-	WRITE_NODE_FIELD(funcexpr);
+	WRITE_NODE_FIELD(functions);
 }
 
 static void
