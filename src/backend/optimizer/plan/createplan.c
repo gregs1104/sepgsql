@@ -2061,11 +2061,12 @@ create_customscan_plan(PlannerInfo *root,
 		}
 		else if (rte->rtekind == RTE_FUNCTION)
 		{
-			Node   *funcexpr = rte->funcexpr;
+			List   *functions = rte->functions;
 
 			if (best_path->path.param_info)
-				funcexpr = replace_nestloop_params(root, funcexpr);
-			scan_plan->funcexpr = funcexpr;
+				functions = (List *)
+					replace_nestloop_params(root, (Node *)functions);
+			scan_plan->functions = functions;
 		}
 	}
 	else if (reloptkind == RELOPT_JOINREL)

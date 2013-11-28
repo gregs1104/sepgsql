@@ -1323,10 +1323,22 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			show_foreignscan_info((ForeignScanState *) planstate, es);
 			break;
 		case T_CustomScan:
-			if (((CustomScan *)plan)->funcexpr != NULL && es->verbose)
-				show_expression(((CustomScan *)plan)->funcexpr,
+			if (((CustomScan *)plan)->functions != NIL && es->verbose)
+			{
+				List	   *fexprs = NIL;
+				ListCell   *lc;
+
+				foreach(lc, ((CustomScan *) plan)->functions)
+				{
+					RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
+
+					fexprs = lappend(fexprs, rtfunc->funcexpr);
+				}
+				/* We rely on show_expression to insert commas as needed */
+				show_expression((Node *) fexprs,
 								"Function Call", planstate, ancestors,
 								es->verbose, es);
+			}
 			show_scan_qual(plan->qual, "Filter", planstate, ancestors, es);
 			if (plan->qual)
 				show_instrumentation_count("Rows Removed by Filter", 1,
@@ -2101,16 +2113,22 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 			}
 			else if (rte->rtekind == RTE_FUNCTION)
 			{
-				Node	   *funcexpr = ((CustomScan *) plan)->funcexpr;
+				List	   *functions = ((CustomScan *) plan)->functions;
 
-				if (funcexpr && IsA(funcexpr, FuncExpr))
+				if (functions && list_length(functions) == 1)
 				{
-					Oid		funcid = ((FuncExpr *) funcexpr)->funcid;
+					RangeTblFunction *rtfunc = linitial(functions);
 
-					objectname = get_func_name(funcid);
-					if (es->verbose)
-						namespace =
-							get_namespace_name(get_func_namespace(funcid));
+					if (IsA(rtfunc->funcexpr, FuncExpr))
+					{
+						FuncExpr   *funcexpr = (FuncExpr *) rtfunc->funcexpr;
+						Oid			funcid = funcexpr->funcid;
+
+						objectname = get_func_name(funcid);
+						if (es->verbose)
+							namespace =
+								get_namespace_name(get_func_namespace(funcid));
+					}
 				}
 				objecttag = "Function Name";
 			}

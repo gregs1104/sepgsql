@@ -493,7 +493,7 @@ typedef struct CustomScan
 	List	   *custom_exprs;		/* expressions that CSP may execute */
 
 	Plan	   *subqry_plan;		/* valid, if RTE_SUBQUERY */
-	Node	   *funcexpr;			/* valid, if RTE_FUNCTION */
+	List	   *functions;			/* valid, if RTE_FUNCTION */
 } CustomScan;
 
 /*
