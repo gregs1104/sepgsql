@@ -2111,7 +2111,7 @@ ExplainTargetRel(Plan *plan, Index rti, ExplainState *es)
 					if (es->verbose)
 						namespace =
 							get_namespace_name(get_func_namespace(funcid));
-                }
+				}
 				objecttag = "Function Name";
 			}
 			else if (rte->rtekind == RTE_CTE)

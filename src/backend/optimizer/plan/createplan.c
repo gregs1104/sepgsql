@@ -2087,7 +2087,7 @@ create_customscan_plan(PlannerInfo *root,
 
 	/*
 	 * Let custom scan provider perform to set up this custom-scan plan
-	 * according to the given path information. 
+	 * according to the given path information.
 	 */
 	provider->InitCustomScanPlan(root, scan_plan,
 								 best_path, tlist, scan_clauses);
