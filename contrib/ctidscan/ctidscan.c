@@ -41,7 +41,7 @@ PG_MODULE_MAGIC;
 static add_scan_path_hook_type	add_scan_path_next;
 
 #define IsCTIDVar(node,rtindex)											\
-    ((node) != NULL &&													\
+	((node) != NULL &&													\
 	 IsA((node), Var) &&												\
 	 ((Var *) (node))->varno == (rtindex) &&							\
 	 ((Var *) (node))->varattno == SelfItemPointerAttributeNumber &&	\
@@ -247,7 +247,7 @@ CTidEstimateCosts(PlannerInfo *root,
 	 * The TID qual expressions will be computed once, any other baserestrict
 	 * quals once per retrived tuple.
 	 */
-    cost_qual_eval(&ctid_qual_cost, ctidquals, root);
+	cost_qual_eval(&ctid_qual_cost, ctidquals, root);
 
 	/* fetch estimated page cost for tablespace containing table */
 	get_tablespace_page_costs(baserel->reltablespace,
@@ -263,7 +263,7 @@ CTidEstimateCosts(PlannerInfo *root,
 							  &qpqual_cost);
 
 	/*
-	 * We don't decrease cost for the inequality operators, because 
+	 * We don't decrease cost for the inequality operators, because
 	 * it is subset of qpquals and still in.
 	 */
 	startup_cost += qpqual_cost.startup + ctid_qual_cost.per_tuple;
