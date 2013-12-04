@@ -1183,29 +1183,33 @@ archputs(const char *s, Archive *AH)
 int
 archprintf(Archive *AH, const char *fmt,...)
 {
-	char	   *p = NULL;
-	va_list		ap;
-	int			bSize = strlen(fmt) + 256;
-	int			cnt = -1;
+	char	   *p;
+	size_t		len = 128;		/* initial assumption about buffer size */
+	size_t		cnt;
 
-	/*
-	 * This is paranoid: deal with the possibility that vsnprintf is willing
-	 * to ignore trailing null or returns > 0 even if string does not fit. It
-	 * may be the case that it returns cnt = bufsize
-	 */
-	while (cnt < 0 || cnt >= (bSize - 1))
+	for (;;)
 	{
-		if (p != NULL)
-			free(p);
-		bSize *= 2;
-		p = (char *) pg_malloc(bSize);
-		va_start(ap, fmt);
-		cnt = vsnprintf(p, bSize, fmt, ap);
-		va_end(ap);
+		va_list		args;
+
+		/* Allocate work buffer. */
+		p = (char *) pg_malloc(len);
+
+		/* Try to format the data. */
+		va_start(args, fmt);
+		cnt = pvsnprintf(p, len, fmt, args);
+		va_end(args);
+
+		if (cnt < len)
+			break;				/* success */
+
+		/* Release buffer and loop around to try again with larger len. */
+		free(p);
+		len = cnt;
 	}
+
 	WriteData(AH, p, cnt);
 	free(p);
-	return cnt;
+	return (int) cnt;
 }
 
 
@@ -1312,29 +1316,33 @@ RestoreOutput(ArchiveHandle *AH, OutputContext savedContext)
 int
 ahprintf(ArchiveHandle *AH, const char *fmt,...)
 {
-	char	   *p = NULL;
-	va_list		ap;
-	int			bSize = strlen(fmt) + 256;		/* Usually enough */
-	int			cnt = -1;
+	char	   *p;
+	size_t		len = 128;		/* initial assumption about buffer size */
+	size_t		cnt;
 
-	/*
-	 * This is paranoid: deal with the possibility that vsnprintf is willing
-	 * to ignore trailing null or returns > 0 even if string does not fit. It
-	 * may be the case that it returns cnt = bufsize.
-	 */
-	while (cnt < 0 || cnt >= (bSize - 1))
+	for (;;)
 	{
-		if (p != NULL)
-			free(p);
-		bSize *= 2;
-		p = (char *) pg_malloc(bSize);
-		va_start(ap, fmt);
-		cnt = vsnprintf(p, bSize, fmt, ap);
-		va_end(ap);
+		va_list		args;
+
+		/* Allocate work buffer. */
+		p = (char *) pg_malloc(len);
+
+		/* Try to format the data. */
+		va_start(args, fmt);
+		cnt = pvsnprintf(p, len, fmt, args);
+		va_end(args);
+
+		if (cnt < len)
+			break;				/* success */
+
+		/* Release buffer and loop around to try again with larger len. */
+		free(p);
+		len = cnt;
 	}
+
 	ahwrite(p, 1, cnt, AH);
 	free(p);
-	return cnt;
+	return (int) cnt;
 }
 
 void
@@ -2611,7 +2619,7 @@ _doSetSessionAuth(ArchiveHandle *AH, const char *user)
 {
 	PQExpBuffer cmd = createPQExpBuffer();
 
-	appendPQExpBuffer(cmd, "SET SESSION AUTHORIZATION ");
+	appendPQExpBufferStr(cmd, "SET SESSION AUTHORIZATION ");
 
 	/*
 	 * SQL requires a string literal here.	Might as well be correct.
@@ -2619,8 +2627,8 @@ _doSetSessionAuth(ArchiveHandle *AH, const char *user)
 	if (user && *user)
 		appendStringLiteralAHX(cmd, user, AH);
 	else
-		appendPQExpBuffer(cmd, "DEFAULT");
-	appendPQExpBuffer(cmd, ";");
+		appendPQExpBufferStr(cmd, "DEFAULT");
+	appendPQExpBufferChar(cmd, ';');
 
 	if (RestoringToDB(AH))
 	{
@@ -2790,7 +2798,7 @@ _selectOutputSchema(ArchiveHandle *AH, const char *schemaName)
 	appendPQExpBuffer(qry, "SET search_path = %s",
 					  fmtId(schemaName));
 	if (strcmp(schemaName, "pg_catalog") != 0)
-		appendPQExpBuffer(qry, ", pg_catalog");
+		appendPQExpBufferStr(qry, ", pg_catalog");
 
 	if (RestoringToDB(AH))
 	{
@@ -2845,7 +2853,7 @@ _selectTablespace(ArchiveHandle *AH, const char *tablespace)
 	if (strcmp(want, "") == 0)
 	{
 		/* We want the tablespace to be the database's default */
-		appendPQExpBuffer(qry, "SET default_tablespace = ''");
+		appendPQExpBufferStr(qry, "SET default_tablespace = ''");
 	}
 	else
 	{
@@ -3111,7 +3119,7 @@ _printTocEntry(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt, bool isDat
 		{
 			PQExpBuffer temp = createPQExpBuffer();
 
-			appendPQExpBuffer(temp, "ALTER ");
+			appendPQExpBufferStr(temp, "ALTER ");
 			_getObjectDescription(temp, te, AH);
 			appendPQExpBuffer(temp, " OWNER TO %s;", fmtId(te->owner));
 			ahprintf(AH, "%s\n\n", temp->data);

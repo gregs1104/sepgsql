@@ -130,28 +130,12 @@
  * CppConcat
  *		Concatenate two arguments together, using the C preprocessor.
  *
- * Note: the standard Autoconf macro AC_C_STRINGIZE actually only checks
- * whether #identifier works, but if we have that we likely have ## too.
+ * Note: There used to be support here for pre-ANSI C compilers that didn't
+ * support # and ##.  Nowadays, these macros are just for clarity and/or
+ * backward compatibility with existing PostgreSQL code.
  */
-#if defined(HAVE_STRINGIZE)
-
 #define CppAsString(identifier) #identifier
 #define CppConcat(x, y)			x##y
-#else							/* !HAVE_STRINGIZE */
-
-#define CppAsString(identifier) "identifier"
-
-/*
- * CppIdentity -- On Reiser based cpp's this is used to concatenate
- *		two tokens.  That is
- *				CppIdentity(A)B ==> AB
- *		We renamed it to _private_CppIdentity because it should not
- *		be referenced outside this file.  On other cpp's it
- *		produces  A  B.
- */
-#define _priv_CppIdentity(x)x
-#define CppConcat(x, y)			_priv_CppIdentity(x)y
-#endif   /* !HAVE_STRINGIZE */
 
 /*
  * dummyret is used to set return values in macros that use ?: to make
@@ -486,7 +470,7 @@ typedef NameData *Name;
  *		True iff pointer is properly aligned to point to the given type.
  */
 #define PointerIsAligned(pointer, type) \
-		(((intptr_t)(pointer) % (sizeof (type))) == 0)
+		(((uintptr_t)(pointer) % (sizeof (type))) == 0)
 
 #define OidIsValid(objectId)  ((bool) ((objectId) != InvalidOid))
 
@@ -532,7 +516,7 @@ typedef NameData *Name;
  */
 
 #define TYPEALIGN(ALIGNVAL,LEN)  \
-	(((intptr_t) (LEN) + ((ALIGNVAL) - 1)) & ~((intptr_t) ((ALIGNVAL) - 1)))
+	(((uintptr_t) (LEN) + ((ALIGNVAL) - 1)) & ~((uintptr_t) ((ALIGNVAL) - 1)))
 
 #define SHORTALIGN(LEN)			TYPEALIGN(ALIGNOF_SHORT, (LEN))
 #define INTALIGN(LEN)			TYPEALIGN(ALIGNOF_INT, (LEN))
@@ -543,13 +527,25 @@ typedef NameData *Name;
 #define BUFFERALIGN(LEN)		TYPEALIGN(ALIGNOF_BUFFER, (LEN))
 
 #define TYPEALIGN_DOWN(ALIGNVAL,LEN)  \
-	(((intptr_t) (LEN)) & ~((intptr_t) ((ALIGNVAL) - 1)))
+	(((uintptr_t) (LEN)) & ~((uintptr_t) ((ALIGNVAL) - 1)))
 
 #define SHORTALIGN_DOWN(LEN)	TYPEALIGN_DOWN(ALIGNOF_SHORT, (LEN))
 #define INTALIGN_DOWN(LEN)		TYPEALIGN_DOWN(ALIGNOF_INT, (LEN))
 #define LONGALIGN_DOWN(LEN)		TYPEALIGN_DOWN(ALIGNOF_LONG, (LEN))
 #define DOUBLEALIGN_DOWN(LEN)	TYPEALIGN_DOWN(ALIGNOF_DOUBLE, (LEN))
 #define MAXALIGN_DOWN(LEN)		TYPEALIGN_DOWN(MAXIMUM_ALIGNOF, (LEN))
+
+/*
+ * The above macros will not work with types wider than uintptr_t, like with
+ * uint64 on 32-bit platforms.  That's not problem for the usual use where a
+ * pointer or a length is aligned, but for the odd case that you need to
+ * align something (potentially) wider, use TYPEALIGN64.
+ */
+#define TYPEALIGN64(ALIGNVAL,LEN)  \
+	(((uint64) (LEN) + ((ALIGNVAL) - 1)) & ~((uint64) ((ALIGNVAL) - 1)))
+
+/* we don't currently need wider versions of the other ALIGN macros */
+#define MAXALIGN64(LEN)			TYPEALIGN64(MAXIMUM_ALIGNOF, (LEN))
 
 /* ----------------------------------------------------------------
  *				Section 6:	assertions
@@ -751,7 +747,7 @@ typedef NameData *Name;
 		int		_val = (val); \
 		Size	_len = (len); \
 \
-		if ((((intptr_t) _vstart) & LONG_ALIGN_MASK) == 0 && \
+		if ((((uintptr_t) _vstart) & LONG_ALIGN_MASK) == 0 && \
 			(_len & LONG_ALIGN_MASK) == 0 && \
 			_val == 0 && \
 			_len <= MEMSET_LOOP_LIMIT && \

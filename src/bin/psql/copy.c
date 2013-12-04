@@ -79,9 +79,7 @@ xstrcat(char **var, const char *more)
 {
 	char	   *newvar;
 
-	newvar = pg_malloc(strlen(*var) + strlen(more) + 1);
-	strcpy(newvar, *var);
-	strcat(newvar, more);
+	newvar = psprintf("%s%s", *var, more);
 	free(*var);
 	*var = newvar;
 }
@@ -364,9 +362,9 @@ do_copy(const char *args)
 	printfPQExpBuffer(&query, "COPY ");
 	appendPQExpBufferStr(&query, options->before_tofrom);
 	if (options->from)
-		appendPQExpBuffer(&query, " FROM STDIN ");
+		appendPQExpBufferStr(&query, " FROM STDIN ");
 	else
-		appendPQExpBuffer(&query, " TO STDOUT ");
+		appendPQExpBufferStr(&query, " TO STDOUT ");
 	if (options->after_tofrom)
 		appendPQExpBufferStr(&query, options->after_tofrom);
 

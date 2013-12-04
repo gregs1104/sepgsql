@@ -66,6 +66,15 @@ typedef struct
  * so that we don't have to re-prepare simple expressions on each trip through
  * a function.	(We assume the case to optimize is many repetitions of a
  * function within a transaction.)
+ *
+ * However, there's no value in trying to amortize simple expression setup
+ * across multiple executions of a DO block (inline code block), since there
+ * can never be any.  If we use the shared EState for a DO block, the expr
+ * state trees are effectively leaked till end of transaction, and that can
+ * add up if the user keeps on submitting DO blocks.  Therefore, each DO block
+ * has its own simple-expression EState, which is cleaned up at exit from
+ * plpgsql_inline_handler().  DO blocks still use the simple_econtext_stack,
+ * though, so that subxact abort cleanup does the right thing.
  */
 typedef struct SimpleEcontextStackEntry
 {
@@ -74,7 +83,7 @@ typedef struct SimpleEcontextStackEntry
 	struct SimpleEcontextStackEntry *next;		/* next stack entry up */
 } SimpleEcontextStackEntry;
 
-static EState *simple_eval_estate = NULL;
+static EState *shared_simple_eval_estate = NULL;
 static SimpleEcontextStackEntry *simple_econtext_stack = NULL;
 
 /************************************************************
@@ -136,7 +145,8 @@ static int exec_stmt_dynfors(PLpgSQL_execstate *estate,
 
 static void plpgsql_estate_setup(PLpgSQL_execstate *estate,
 					 PLpgSQL_function *func,
-					 ReturnSetInfo *rsi);
+					 ReturnSetInfo *rsi,
+					 EState *simple_eval_estate);
 static void exec_eval_cleanup(PLpgSQL_execstate *estate);
 
 static void exec_prepare_plan(PLpgSQL_execstate *estate,
@@ -221,14 +231,26 @@ static Portal exec_dynquery_with_params(PLpgSQL_execstate *estate,
 						  PLpgSQL_expr *dynquery, List *params,
 						  const char *portalname, int cursorOptions);
 
+static char *format_expr_params(PLpgSQL_execstate *estate,
+								const PLpgSQL_expr *expr);
+static char *format_preparedparamsdata(PLpgSQL_execstate *estate,
+									   const PreparedParamsData *ppd);
+
 
 /* ----------
  * plpgsql_exec_function	Called by the call handler for
  *				function execution.
+ *
+ * This is also used to execute inline code blocks (DO blocks).  The only
+ * difference that this code is aware of is that for a DO block, we want
+ * to use a private simple_eval_estate, which is created and passed in by
+ * the caller.  For regular functions, pass NULL, which implies using
+ * shared_simple_eval_estate.
  * ----------
  */
 Datum
-plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo)
+plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
+					  EState *simple_eval_estate)
 {
 	PLpgSQL_execstate estate;
 	ErrorContextCallback plerrcontext;
@@ -238,7 +260,8 @@ plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo)
 	/*
 	 * Setup the execution state
 	 */
-	plpgsql_estate_setup(&estate, func, (ReturnSetInfo *) fcinfo->resultinfo);
+	plpgsql_estate_setup(&estate, func, (ReturnSetInfo *) fcinfo->resultinfo,
+						 simple_eval_estate);
 
 	/*
 	 * Setup error traceback support for ereport()
@@ -498,7 +521,7 @@ plpgsql_exec_trigger(PLpgSQL_function *func,
 	/*
 	 * Setup the execution state
 	 */
-	plpgsql_estate_setup(&estate, func, NULL);
+	plpgsql_estate_setup(&estate, func, NULL, NULL);
 
 	/*
 	 * Setup error traceback support for ereport()
@@ -777,7 +800,7 @@ plpgsql_exec_event_trigger(PLpgSQL_function *func, EventTriggerData *trigdata)
 	/*
 	 * Setup the execution state
 	 */
-	plpgsql_estate_setup(&estate, func, NULL);
+	plpgsql_estate_setup(&estate, func, NULL, NULL);
 
 	/*
 	 * Setup error traceback support for ereport()
@@ -3082,7 +3105,8 @@ exec_stmt_raise(PLpgSQL_execstate *estate, PLpgSQL_stmt_raise *stmt)
 static void
 plpgsql_estate_setup(PLpgSQL_execstate *estate,
 					 PLpgSQL_function *func,
-					 ReturnSetInfo *rsi)
+					 ReturnSetInfo *rsi,
+					 EState *simple_eval_estate)
 {
 	/* this link will be restored at exit from plpgsql_call_handler */
 	func->cur_estate = estate;
@@ -3120,6 +3144,12 @@ plpgsql_estate_setup(PLpgSQL_execstate *estate,
 	estate->ndatums = func->ndatums;
 	estate->datums = palloc(sizeof(PLpgSQL_datum *) * estate->ndatums);
 	/* caller is expected to fill the datums array */
+
+	/* set up for use of appropriate simple-expression EState */
+	if (simple_eval_estate)
+		estate->simple_eval_estate = simple_eval_estate;
+	else
+		estate->simple_eval_estate = shared_simple_eval_estate;
 
 	estate->eval_tuptable = NULL;
 	estate->eval_processed = 0;
@@ -3391,18 +3421,38 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 		if (n == 0)
 		{
 			if (stmt->strict)
+			{
+				char *errdetail;
+
+				if (estate->func->print_strict_params)
+					errdetail = format_expr_params(estate, expr);
+				else
+					errdetail = NULL;
+
 				ereport(ERROR,
 						(errcode(ERRCODE_NO_DATA_FOUND),
-						 errmsg("query returned no rows")));
+						 errmsg("query returned no rows"),
+						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0));
+			}
 			/* set the target to NULL(s) */
 			exec_move_row(estate, rec, row, NULL, tuptab->tupdesc);
 		}
 		else
 		{
 			if (n > 1 && (stmt->strict || stmt->mod_stmt))
+			{
+				char *errdetail;
+
+				if (estate->func->print_strict_params)
+					errdetail = format_expr_params(estate, expr);
+				else
+					errdetail = NULL;
+
 				ereport(ERROR,
 						(errcode(ERRCODE_TOO_MANY_ROWS),
-						 errmsg("query returned more than one row")));
+						 errmsg("query returned more than one row"),
+						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0));
+			}
 			/* Put the first result row into the target */
 			exec_move_row(estate, rec, row, tuptab->vals[0], tuptab->tupdesc);
 		}
@@ -3442,6 +3492,7 @@ exec_stmt_dynexecute(PLpgSQL_execstate *estate,
 	Oid			restype;
 	char	   *querystr;
 	int			exec_res;
+	PreparedParamsData *ppd = NULL;
 
 	/*
 	 * First we evaluate the string expression after the EXECUTE keyword. Its
@@ -3466,14 +3517,11 @@ exec_stmt_dynexecute(PLpgSQL_execstate *estate,
 	 */
 	if (stmt->params)
 	{
-		PreparedParamsData *ppd;
-
 		ppd = exec_eval_using_params(estate, stmt->params);
 		exec_res = SPI_execute_with_args(querystr,
 										 ppd->nargs, ppd->types,
 										 ppd->values, ppd->nulls,
 										 estate->readonly_func, 0);
-		free_params_data(ppd);
 	}
 	else
 		exec_res = SPI_execute(querystr, estate->readonly_func, 0);
@@ -3565,18 +3613,39 @@ exec_stmt_dynexecute(PLpgSQL_execstate *estate,
 		if (n == 0)
 		{
 			if (stmt->strict)
+			{
+				char *errdetail;
+
+				if (estate->func->print_strict_params)
+					errdetail = format_preparedparamsdata(estate, ppd);
+				else
+					errdetail = NULL;
+
 				ereport(ERROR,
 						(errcode(ERRCODE_NO_DATA_FOUND),
-						 errmsg("query returned no rows")));
+						 errmsg("query returned no rows"),
+						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0));
+			}
 			/* set the target to NULL(s) */
 			exec_move_row(estate, rec, row, NULL, tuptab->tupdesc);
 		}
 		else
 		{
 			if (n > 1 && stmt->strict)
+			{
+				char *errdetail;
+
+				if (estate->func->print_strict_params)
+					errdetail = format_preparedparamsdata(estate, ppd);
+				else
+					errdetail = NULL;
+
 				ereport(ERROR,
 						(errcode(ERRCODE_TOO_MANY_ROWS),
-						 errmsg("query returned more than one row")));
+						 errmsg("query returned more than one row"),
+						 errdetail ? errdetail_internal("parameters: %s", errdetail) : 0));
+			}
+
 			/* Put the first result row into the target */
 			exec_move_row(estate, rec, row, tuptab->vals[0], tuptab->tupdesc);
 		}
@@ -3591,6 +3660,9 @@ exec_stmt_dynexecute(PLpgSQL_execstate *estate,
 		 * that.
 		 */
 	}
+
+	if (ppd)
+		free_params_data(ppd);
 
 	/* Release any result from SPI_execute, as well as the querystring */
 	SPI_freetuptable(SPI_tuptable);
@@ -5101,7 +5173,7 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 	 */
 	if (expr->expr_simple_lxid != curlxid)
 	{
-		oldcontext = MemoryContextSwitchTo(simple_eval_estate->es_query_cxt);
+		oldcontext = MemoryContextSwitchTo(estate->simple_eval_estate->es_query_cxt);
 		expr->expr_simple_state = ExecInitExpr(expr->expr_simple_expr, NULL);
 		expr->expr_simple_in_use = false;
 		expr->expr_simple_lxid = curlxid;
@@ -6143,8 +6215,8 @@ exec_set_found(PLpgSQL_execstate *estate, bool state)
 /*
  * plpgsql_create_econtext --- create an eval_econtext for the current function
  *
- * We may need to create a new simple_eval_estate too, if there's not one
- * already for the current transaction.  The EState will be cleaned up at
+ * We may need to create a new shared_simple_eval_estate too, if there's not
+ * one already for the current transaction.  The EState will be cleaned up at
  * transaction end.
  */
 static void
@@ -6156,20 +6228,25 @@ plpgsql_create_econtext(PLpgSQL_execstate *estate)
 	 * Create an EState for evaluation of simple expressions, if there's not
 	 * one already in the current transaction.	The EState is made a child of
 	 * TopTransactionContext so it will have the right lifespan.
+	 *
+	 * Note that this path is never taken when executing a DO block; the
+	 * required EState was already made by plpgsql_inline_handler.
 	 */
-	if (simple_eval_estate == NULL)
+	if (estate->simple_eval_estate == NULL)
 	{
 		MemoryContext oldcontext;
 
+		Assert(shared_simple_eval_estate == NULL);
 		oldcontext = MemoryContextSwitchTo(TopTransactionContext);
-		simple_eval_estate = CreateExecutorState();
+		shared_simple_eval_estate = CreateExecutorState();
+		estate->simple_eval_estate = shared_simple_eval_estate;
 		MemoryContextSwitchTo(oldcontext);
 	}
 
 	/*
 	 * Create a child econtext for the current function.
 	 */
-	estate->eval_econtext = CreateExprContext(simple_eval_estate);
+	estate->eval_econtext = CreateExprContext(estate->simple_eval_estate);
 
 	/*
 	 * Make a stack entry so we can clean up the econtext at subxact end.
@@ -6228,14 +6305,14 @@ plpgsql_xact_cb(XactEvent event, void *arg)
 		/* Shouldn't be any econtext stack entries left at commit */
 		Assert(simple_econtext_stack == NULL);
 
-		if (simple_eval_estate)
-			FreeExecutorState(simple_eval_estate);
-		simple_eval_estate = NULL;
+		if (shared_simple_eval_estate)
+			FreeExecutorState(shared_simple_eval_estate);
+		shared_simple_eval_estate = NULL;
 	}
 	else if (event == XACT_EVENT_ABORT)
 	{
 		simple_econtext_stack = NULL;
-		simple_eval_estate = NULL;
+		shared_simple_eval_estate = NULL;
 	}
 }
 
@@ -6244,8 +6321,7 @@ plpgsql_xact_cb(XactEvent event, void *arg)
  *
  * Make sure any simple-expression econtexts created in the current
  * subtransaction get cleaned up.  We have to do this explicitly because
- * no other code knows which child econtexts of simple_eval_estate belong
- * to which level of subxact.
+ * no other code knows which econtexts belong to which level of subxact.
  */
 void
 plpgsql_subxact_cb(SubXactEvent event, SubTransactionId mySubid,
@@ -6455,4 +6531,104 @@ exec_dynquery_with_params(PLpgSQL_execstate *estate,
 	pfree(querystr);
 
 	return portal;
+}
+
+/*
+ * Return a formatted string with information about an expression's parameters,
+ * or NULL if the expression does not take any parameters.
+ */
+static char *
+format_expr_params(PLpgSQL_execstate *estate,
+				   const PLpgSQL_expr *expr)
+{
+	int paramno;
+	int dno;
+	StringInfoData paramstr;
+	Bitmapset *tmpset;
+
+	if (!expr->paramnos)
+		return NULL;
+
+	initStringInfo(&paramstr);
+	tmpset = bms_copy(expr->paramnos);
+	paramno = 0;
+	while ((dno = bms_first_member(tmpset)) >= 0)
+	{
+		Datum paramdatum;
+		Oid paramtypeid;
+		bool paramisnull;
+		int32 paramtypmod;
+		PLpgSQL_var *curvar;
+
+		curvar = (PLpgSQL_var *) estate->datums[dno];
+
+		exec_eval_datum(estate, (PLpgSQL_datum *) curvar, &paramtypeid,
+						&paramtypmod, &paramdatum, &paramisnull);
+
+		appendStringInfo(&paramstr, "%s%s = ",
+						 paramno > 0 ? ", " : "",
+						 curvar->refname);
+
+		if (paramisnull)
+			appendStringInfoString(&paramstr, "NULL");
+		else
+		{
+			char *value = convert_value_to_string(estate, paramdatum, paramtypeid);
+			char *p;
+			appendStringInfoCharMacro(&paramstr, '\'');
+			for (p = value; *p; p++)
+			{
+				if (*p == '\'') /* double single quotes */
+					appendStringInfoCharMacro(&paramstr, *p);
+				appendStringInfoCharMacro(&paramstr, *p);
+			}
+			appendStringInfoCharMacro(&paramstr, '\'');
+		}
+
+		paramno++;
+	}
+	bms_free(tmpset);
+
+	return paramstr.data;
+}
+
+/*
+ * Return a formatted string with information about PreparedParamsData, or NULL
+ * if the there are no parameters.
+ */
+static char *
+format_preparedparamsdata(PLpgSQL_execstate *estate,
+						  const PreparedParamsData *ppd)
+{
+	int paramno;
+	StringInfoData paramstr;
+
+	if (!ppd)
+		return NULL;
+
+	initStringInfo(&paramstr);
+	for (paramno = 0; paramno < ppd->nargs; paramno++)
+	{
+		appendStringInfo(&paramstr, "%s$%d = ",
+						 paramno > 0 ? ", " : "",
+						 paramno + 1);
+
+		if (ppd->nulls[paramno] == 'n')
+			appendStringInfoString(&paramstr, "NULL");
+		else
+		{
+			char *value = convert_value_to_string(estate, ppd->values[paramno], ppd->types[paramno]);
+			char *p;
+			appendStringInfoCharMacro(&paramstr, '\'');
+			for (p = value; *p; p++)
+			{
+				if (*p == '\'') /* double single quotes */
+					appendStringInfoCharMacro(&paramstr, *p);
+				appendStringInfoCharMacro(&paramstr, *p);
+			}
+			appendStringInfoCharMacro(&paramstr, '\'');
+		}
+	}
+
+	return paramstr.data;
 }

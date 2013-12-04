@@ -67,6 +67,7 @@ CATALOG(pg_class,1259) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83) BKI_SCHEMA_MACRO
 	bool		relhasrowsecurity;	/* has (or has had) row-security policy */
 	bool		relhassubclass; /* has (or has had) derived classes */
 	bool		relispopulated; /* matview currently holds query results */
+	char		relreplident;	/* see REPLICA_IDENTITY_xxx constants  */
 	TransactionId relfrozenxid; /* all Xids < this are frozen in this rel */
 	TransactionId relminmxid;	/* all multixacts in this rel are >= this.
 								 * this is really a MultiXactId */
@@ -117,13 +118,14 @@ typedef FormData_pg_class *Form_pg_class;
 #define Anum_pg_class_relhaspkey		20
 #define Anum_pg_class_relhasrules		21
 #define Anum_pg_class_relhastriggers	22
-#define Anum_pg_class_relhasrowsecurity	23
-#define Anum_pg_class_relhassubclass	24
-#define Anum_pg_class_relispopulated	25
+#define Anum_pg_class_relhassubclass	23
+#define Anum_pg_class_relispopulated	24
+#define Anum_pg_class_relreplident		25
 #define Anum_pg_class_relfrozenxid		26
 #define Anum_pg_class_relminmxid		27
 #define Anum_pg_class_relacl			28
 #define Anum_pg_class_reloptions		29
+#define Anum_pg_class_relhasrowsecurity	30
 
 /* ----------------
  *		initial contents of pg_class
@@ -138,13 +140,14 @@ typedef FormData_pg_class *Form_pg_class;
  * Note: "3" in the relfrozenxid column stands for FirstNormalTransactionId;
  * similarly, "1" in relminmxid stands for FirstMultiXactId
  */
-DATA(insert OID = 1247 (  pg_type		PGNSP 71 0 PGUID 0 0 0 0 0 0 0 f f p r 30 0 t f f f f f t 3 1 _null_ _null_ ));
+
+DATA(insert OID = 1247 (  pg_type		PGNSP 71 0 PGUID 0 0 0 0 0 0 0 f f p r 30 0 t f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1249 (  pg_attribute	PGNSP 75 0 PGUID 0 0 0 0 0 0 0 f f p r 21 0 f f f f f f t 3 1 _null_ _null_ ));
+DATA(insert OID = 1249 (  pg_attribute	PGNSP 75 0 PGUID 0 0 0 0 0 0 0 f f p r 21 0 f f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1255 (  pg_proc		PGNSP 81 0 PGUID 0 0 0 0 0 0 0 f f p r 27 0 t f f f f f t 3 1 _null_ _null_ ));
+DATA(insert OID = 1255 (  pg_proc		PGNSP 81 0 PGUID 0 0 0 0 0 0 0 f f p r 27 0 t f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
-DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 f f p r 29 0 t f f f f f t 3 1 _null_ _null_ ));
+DATA(insert OID = 1259 (  pg_class		PGNSP 83 0 PGUID 0 0 0 0 0 0 0 f f p r 29 0 t f f f f t n 3 1 _null_ _null_ ));
 DESCR("");
 
 
@@ -161,4 +164,16 @@ DESCR("");
 #define		  RELPERSISTENCE_UNLOGGED	'u'		/* unlogged permanent table */
 #define		  RELPERSISTENCE_TEMP		't'		/* temporary table */
 
+/* default selection for replica identity (primary key or nothing) */
+#define		  REPLICA_IDENTITY_DEFAULT	'd'
+/* no replica identity is logged for this relation */
+#define		  REPLICA_IDENTITY_NOTHING	'n'
+/* all columns are loged as replica identity */
+#define		  REPLICA_IDENTITY_FULL		'f'
+/*
+ * an explicitly chosen candidate key's columns are used as identity;
+ * will still be set if the index has been dropped, in that case it
+ * has the same meaning as 'd'
+ */
+#define		  REPLICA_IDENTITY_INDEX	'i'
 #endif   /* PG_CLASS_H */

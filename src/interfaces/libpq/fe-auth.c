@@ -443,6 +443,12 @@ pg_GSS_startup(PGconn *conn)
 	 */
 	maxlen = NI_MAXHOST + strlen(conn->krbsrvname) + 2;
 	temp_gbuf.value = (char *) malloc(maxlen);
+	if (!temp_gbuf.value)
+	{
+		printfPQExpBuffer(&conn->errorMessage,
+						  libpq_gettext("out of memory\n"));
+		return STATUS_ERROR;
+	}
 	snprintf(temp_gbuf.value, maxlen, "%s@%s",
 			 conn->krbsrvname, conn->pghost);
 	temp_gbuf.length = strlen(temp_gbuf.value);
@@ -970,13 +976,13 @@ pg_fe_sendauth(AuthRequest areq, PGconn *conn)
 
 
 /*
- * pg_fe_getauthname -- returns a pointer to dynamic space containing whatever
- *					 name the user has authenticated to the system
+ * pg_fe_getauthname
  *
- * if there is an error, return NULL with an error message in errorMessage
+ * Returns a pointer to dynamic space containing whatever name the user
+ * has authenticated to the system.  If there is an error, return NULL.
  */
 char *
-pg_fe_getauthname(PQExpBuffer errorMessage)
+pg_fe_getauthname(void)
 {
 	const char *name = NULL;
 	char	   *authn;

@@ -61,6 +61,7 @@
 #include "replication/walreceiver.h"
 #include "replication/walsender.h"
 #include "storage/bufmgr.h"
+#include "storage/dsm_impl.h"
 #include "storage/standby.h"
 #include "storage/fd.h"
 #include "storage/proc.h"
@@ -125,7 +126,6 @@ extern char *default_tablespace;
 extern char *temp_tablespaces;
 extern bool ignore_checksum_failure;
 extern bool synchronize_seqscans;
-extern int	ssl_renegotiation_limit;
 extern char *SSLCipherSuites;
 
 #ifdef TRACE_SORT
@@ -385,6 +385,7 @@ static const struct config_enum_entry synchronous_commit_options[] = {
  */
 extern const struct config_enum_entry wal_level_options[];
 extern const struct config_enum_entry sync_method_options[];
+extern const struct config_enum_entry dynamic_shared_memory_options[];
 
 /*
  * GUC option variables that are exported from this module
@@ -2410,8 +2411,8 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_BLOCKS,
 		},
 		&effective_cache_size,
-		DEFAULT_EFFECTIVE_CACHE_SIZE, 1, INT_MAX,
-		NULL, NULL, NULL
+		-1, -1, INT_MAX,
+		check_effective_cache_size, NULL, NULL
 	},
 
 	{
@@ -3336,6 +3337,16 @@ static struct config_enum ConfigureNamesEnum[] =
 	},
 
 	{
+		{"dynamic_shared_memory_type", PGC_POSTMASTER, RESOURCES_MEM,
+			gettext_noop("Selects the dynamic shared memory implementation used."),
+			NULL
+		},
+		&dynamic_shared_memory_type,
+		DEFAULT_DYNAMIC_SHARED_MEMORY_TYPE, dynamic_shared_memory_options,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"wal_sync_method", PGC_SIGHUP, WAL_SETTINGS,
 			gettext_noop("Selects the method used for forcing WAL updates to disk."),
 			NULL
@@ -4237,6 +4248,8 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 	 * be the real desired default.
 	 */
 	pg_timezone_abbrev_initialize();
+
+	set_default_effective_cache_size();
 
 	/*
 	 * Figure out where pg_hba.conf is, and make sure the path is absolute.
@@ -6174,7 +6187,7 @@ flatten_set_variable_args(const char *name, List *args)
 		A_Const    *con;
 
 		if (l != list_head(args))
-			appendStringInfo(&buf, ", ");
+			appendStringInfoString(&buf, ", ");
 
 		if (IsA(arg, TypeCast))
 		{
@@ -6252,7 +6265,7 @@ flatten_set_variable_args(const char *name, List *args)
  * SET command
  */
 void
-ExecSetVariableStmt(VariableSetStmt *stmt)
+ExecSetVariableStmt(VariableSetStmt *stmt, bool isTopLevel)
 {
 	GucAction	action = stmt->is_local ? GUC_ACTION_LOCAL : GUC_ACTION_SET;
 
@@ -6260,6 +6273,8 @@ ExecSetVariableStmt(VariableSetStmt *stmt)
 	{
 		case VAR_SET_VALUE:
 		case VAR_SET_CURRENT:
+			if (stmt->is_local)
+				WarnNoTransactionChain(isTopLevel, "SET LOCAL");
 			(void) set_config_option(stmt->name,
 									 ExtractSetVariableArgs(stmt),
 									 (superuser() ? PGC_SUSET : PGC_USERSET),
@@ -6269,7 +6284,6 @@ ExecSetVariableStmt(VariableSetStmt *stmt)
 									 0);
 			break;
 		case VAR_SET_MULTI:
-
 			/*
 			 * Special-case SQL syntaxes.  The TRANSACTION and SESSION
 			 * CHARACTERISTICS cases effectively set more than one variable
@@ -6280,6 +6294,8 @@ ExecSetVariableStmt(VariableSetStmt *stmt)
 			if (strcmp(stmt->name, "TRANSACTION") == 0)
 			{
 				ListCell   *head;
+
+				WarnNoTransactionChain(isTopLevel, "SET TRANSACTION");
 
 				foreach(head, stmt->args)
 				{
@@ -6329,6 +6345,8 @@ ExecSetVariableStmt(VariableSetStmt *stmt)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("SET LOCAL TRANSACTION SNAPSHOT is not implemented")));
+
+				WarnNoTransactionChain(isTopLevel, "SET TRANSACTION");
 				Assert(IsA(con, A_Const));
 				Assert(nodeTag(&con->val) == T_String);
 				ImportSnapshot(strVal(&con->val));
@@ -6338,7 +6356,13 @@ ExecSetVariableStmt(VariableSetStmt *stmt)
 					 stmt->name);
 			break;
 		case VAR_SET_DEFAULT:
+			if (stmt->is_local)
+				WarnNoTransactionChain(isTopLevel, "SET LOCAL");
+			/* fall through */
 		case VAR_RESET:
+			if (strcmp(stmt->name, "transaction_isolation") == 0)
+				WarnNoTransactionChain(isTopLevel, "RESET TRANSACTION");
+
 			(void) set_config_option(stmt->name,
 									 NULL,
 									 (superuser() ? PGC_SUSET : PGC_USERSET),
@@ -7914,8 +7938,7 @@ GUCArrayAdd(ArrayType *array, const char *name, const char *value)
 		name = record->name;
 
 	/* build new item for array */
-	newval = palloc(strlen(name) + 1 + strlen(value) + 1);
-	sprintf(newval, "%s=%s", name, value);
+	newval = psprintf("%s=%s", name, value);
 	datum = CStringGetTextDatum(newval);
 
 	if (array)
