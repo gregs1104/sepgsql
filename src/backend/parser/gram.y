@@ -2200,6 +2200,7 @@ alter_table_cmd:
 					n->subtype = AT_ResetRowSecurity;
 					n->name = $5;
 					n->def = NULL;
+				}
 			/* ALTER TABLE <name> REPLICA IDENTITY  */
 			| REPLICA IDENTITY_P replica_identity
 				{
