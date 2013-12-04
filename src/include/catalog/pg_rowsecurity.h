@@ -19,9 +19,9 @@
  *		typedef struct FormData_pg_rowlevelsec
  * ----------------
  */
-#define RowSecurityRelationId	3838
+#define RowSecurityRelationId	5000
 
-CATALOG(pg_rowsecurity,3838)
+CATALOG(pg_rowsecurity,5000)
 {
 	/* Oid of the relation that has row-security policy */
 	Oid				rsecrelid;
